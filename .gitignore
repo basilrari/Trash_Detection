@@ -2,14 +2,44 @@
 node_modules/
 backend-js/node_modules/
 
-# Python
+# Python caches
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Env files
+# Environment variables
 .env
 *.env
+.env.local
 
-# OS/editor
+# OS / editor garbage
 .DS_Store
 Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Jupyter Notebook checkpoints (in every folder)
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Project-specific
+worker-python/weights/
+worker-python/weights/**
+!/worker-python/weights/.gitkeep    # optional: keep the folder itself if you want it to exist when cloning
+
+# Other common large/generated folders you probably also want to ignore
+worker-python/runs/
+worker-python/logs/
+worker-python/output/
+worker-python/results/
+worker-python/data/
+worker-python/datasets/
+worker-python/__pycache__/
+worker-python/*.pth
+worker-python/*.pt
+worker-python/*.onnx
+worker-python/*.engine
+worker-python/*.bin
