@@ -1,136 +1,250 @@
-This system processes long CCTV-style videos with multiple computer vision tasks in a **single, coordinated pipeline**, while remaining modular so individual models can be swapped without breaking the overall flow. The codebase is split into a JS API service and a Python GPU worker, connected via a job + queue mechanism, and the architecture description is written so an LLM can reason about structure, responsibilities, and contracts.[1][2][3]
+Trash Detection, Behavior Detection & License Plate Analysis System
 
-## High-level behavior of the system
+A modular, GPU-accelerated, multi-model video analysis pipeline
 
-For each input video (e.g., 24-hour CCTV footage hosted on Dropbox/Drive), the system treats it as **one job**. That job is created by the JS backend and executed by the Python worker. The Python worker runs a **full analysis pipeline**:
+This repository contains a two-service system for analyzing long CCTV-style videos using multiple computer-vision models.
+The design is intentionally LLM-friendly: folders, modules, and abstractions are structured so models and pipelines can be swapped or extended safely.
 
-1. **Stream the video in chunks** (e.g., by time window or frame batch) instead of loading everything at once.[4][5]
-2. On each chunk, run **YOLO** to detect persons and vehicles. This acts as an “activity gate”:  
-   - If no people or vehicles are found in a chunk, the system records that nothing relevant happened for that time and **skips heavier models** for that chunk.  
-   - If people or vehicles are detected, the system marks that chunk as interesting and then runs additional analyses.  
-3. For **chunks with activity**, the worker runs:  
-   - License plate detection on vehicle regions (custom fine‑tuned model).  
-   - **OCR (PaddleOCR)** on license plate crops to extract plate text.  
-   - **Pose estimation (MediaPipe)** and custom logic to detect urination events around those persons/vehicles.  
-   - **RFDETR** to detect trash/litter in the same region/time window.  
-4. All results from these steps are aggregated into a **single CSV per video**. Each row describes an event or detection (e.g., vehicle sighting with plate, urination event, litter detection), with a schema that includes timestamp, location/camera, type of event, bounding boxes, confidence, and any extra data (like plate text).  
+1. High-Level Overview
 
-This design ensures the GPU-heavy models are only used where there is likely to be relevant activity, while still giving you a unified output file per video.  
+The system analyzes long videos (hours, even full-day CCTV files) by streaming them in chunks and applying a sequence of detectors and classifiers.
+It answers questions like:
 
-## JS backend (backend-js) – intent and structure
+Were there people or vehicles present?
 
-The JS backend is responsible for **receiving job requests, tracking job state, and exposing HTTP APIs**. It does not run any GPU models itself.[3][6]
+Which vehicles were seen, and what license plates did they have?
 
-Key responsibilities:  
+Did any person urinate in the camera’s view (pose + custom logic)?
 
-- Accept links or IDs of long videos (Dropbox/Drive) from clients.  
-- Create a **job record** in a database with status, timestamps, and references to input and output.  
-- Send a **job message** to a queue that the Python worker consumes.  
-- Provide endpoints for clients to check job status and fetch the CSV result.  
+Was any trash/litter present?
 
-Important folders and their intent:  
+What is the timeline of these events?
 
-- `backend-js/src/app.js`: Builds the Express app, attaches JSON parsing, CORS, and mounts routers under `/api`. This is the composition root for routes and middlewares.  
-- `backend-js/src/server.js`: Starts the HTTP server with a configurable port and environment; this is the only file that calls `app.listen`.  
-- `routes/`:  
-  - `routes/index.js`: Mounts feature-specific routers, such as `/api/jobs`.  
-  - `routes/jobs.routes.js`: Defines endpoints like  
-    - `POST /api/jobs` (create a video-processing job), and  
-    - `GET /api/jobs/:id` (retrieve job status and output CSV URL).[7]
-- `controllers/`:  
-  - `jobs.controller.js`: Translates HTTP requests to service calls. It reads the video link and other metadata from the request, calls `jobs.service.createJob`, then returns a response containing a `jobId`. It also handles reading a job by ID.  
-- `services/`:  
-  - `jobs.service.js`: Core job lifecycle logic. It validates inputs, creates job records through models/DB helpers, and calls `queue.service.enqueue(jobPayload)` to send a message to the worker queue. It also provides methods to fetch jobs and update job status if needed.  
-  - `queue.service.js`: Abstracts away the concrete queue implementation (e.g., Redis + Bull/bee-queue, RabbitMQ, or SQS). It exposes functions like `enqueue(jobPayload)` so the rest of the backend does not depend on the specific queue library.[8][9]
-  - `db.service.js`: Manages database connections and higher-level helpers for executing queries or transactions.  
-- `models/`:  
-  - `job.model.js`: Encapsulates the job table and DB queries. A job record contains fields like `id`, `inputSourceType` (Dropbox/Drive), `inputSourceIdOrUrl`, `status` (QUEUED/PROCESSING/DONE/FAILED), `progress`, `outputCsvUrl`, `errorMessage`, timestamps, and possibly metadata like `cameraId` and `date`.  
-- `middlewares/` and `utils/`:  
-  - `auth.middleware.js`: Optionally attach user identity to requests (if you have an authenticated multi‑user system).  
-  - `error.middleware.js`: Centralized HTTP error handling.  
-  - `validate.middleware.js`: Request validation using a schema library.  
-  - `utils/logger.js`: Logging abstraction.  
-  - `utils/config.js`: Loads environment variables and config constants (DB URL, queue URL, etc.).[2][1]
+Output is a single CSV file per video, containing timestamps, detections, and all associated metadata.
 
-The intent is to keep HTTP concerns, business logic, persistence, and infrastructure cleanly separated so that the JS code remains easy to extend and reason about.  
+The stack consists of:
 
-## Python worker (worker-python) – intent and structure
+JS Backend (Express)
 
-The Python worker is a **long‑running GPU service** that reads job messages from a queue, fetches video content, runs the full multi-model analysis, and writes results back (CSV + status updates).[10][4]
+Receives video-processing requests
 
-Key responsibilities:  
+Creates job records
 
-- Consume jobs from a message queue.  
-- For each job:  
-  - Download/stream video from Dropbox/Drive in chunks.  
-  - Run the conditional YOLO‑gated pipeline (traffic + behavior + litter).  
-  - Write a single CSV per input video.  
-  - Update job status and progress in the database or via the JS API.  
+Dispatches jobs to a queue
 
-Important package areas and their intent:  
+Exposes APIs to fetch job status + results
 
-- `worker/config/settings.py`: Central configuration (e.g., queue endpoints, DB/API URLs, model paths, thresholds for detection, chunk sizes).  
-- `worker/core/`:  
-  - `types.py`: Defines structured types like `FrameData` (frame index, timestamp, image data reference), `Detection` (bbox, label, confidence), `LicensePlate`, `PoseResult`, and other common entities used across models and pipelines.  
-  - `video_reader.py`: Responsible for streaming or chunked reading of videos from a URL or storage ID (Dropbox/Drive). It hides I/O details and ensures that a 24‑hour video is processed in memory-safe segments.[5][4]
-  - `writer.py`: Handles CSV writing and potentially uploading the final CSV to object storage. It provides consistent formatting so pipelines just send structured data to it.  
-  - `utils.py`: General utilities (timing, GPU device selection, batching helpers, error wrappers).  
-- `worker/models/`:  
-  - `base.py`: Defines abstract interfaces for model wrappers, such as:  
-    - `Detector.detect(frames)` for YOLO‑style detectors (returning persons/vehicles).  
-    - `LicensePlateDetector.detect_plates(frames)` for plate bounding boxes.  
-    - `OCRModel.recognize(crops)` for text extraction from plate crops.  
-    - `PoseEstimator.estimate(frames)` for pose keypoints.  
-    - `TrashDetector.detect_trash(frames)` for RFDETR‑style trash detection.  
-    The intent is that pipelines depend only on these interfaces, not on YOLO, PaddleOCR, or RFDETR directly.  
-  - `yolo_detector.py`: Implements `Detector` using YOLO for people and vehicles.  
-  - `lp_detector.py`: Implements `LicensePlateDetector` using the custom fine‑tuned plate model.  
-  - `ocr.py`: Implements `OCRModel` via PaddleOCR.  
-  - `pose.py`: Implements `PoseEstimator` using MediaPipe.  
-  - `trash_detector.py`: Implements `TrashDetector` using RFDETR.  
-- `worker/pipelines/`:  
-  - `base.py`: Defines a general `Pipeline` interface with methods like `process_video(video_iterable, writer)` which accept streamed frames and use `writer` to persist results.  
-  - `traffic_pipeline.py`: Handles the first stage of the flow. For each video chunk, it:  
-    - Runs YOLO to find people and vehicles.  
-    - On vehicles, runs license plate detection and OCR.  
-    - Marks chunks as “activity present” or not and forwards relevant information to the coordinating entity (either the JobProcessor or a higher‑level pipeline).  
-    - Writes traffic‑related detections (vehicles, plates) into the CSV via `writer`.  
-  - `behavior_pipeline.py`: For frames/chunks where YOLO found people/vehicles, it runs pose estimation and your urination-logic to detect behavior events, and appends those entries to the same CSV.  
-  - `litter_pipeline.py`: For those same “interesting” chunks, it runs RFDETR to detect trash and appends litter events to the CSV.  
+Python Worker (GPU)
 
-In practice, you can wrap these three as a single `FullAnalysisPipeline` or have the `JobProcessor` orchestrate them in sequence over the same stream of frames. The key intent is that:  
+Streams video
 
-- **YOLO is the gate**: it decides where to run more expensive models.  
-- All results from traffic, behavior, and litter analysis end up in **one CSV** per job.  
+Runs YOLO-based activity gating
 
-- `worker/jobs/processor.py`:  
-  - Contains `JobProcessor`, which is the core orchestrator for one job.  
-  - Given a job payload (`jobId`, video link, metadata), it:  
-    - Updates job status to `PROCESSING`.  
-    - Uses `video_reader` to iterate over the video in chunks.  
-    - For each chunk, calls the traffic pipeline (YOLO + LP + OCR) to get detections.  
-    - For chunks with detected persons/vehicles, calls behavior and litter pipelines on the same frames or a subset.  
-    - Uses `writer` to append all events into a single CSV file.  
-    - When finished, uploads CSV if needed, updates job status to `DONE` and sets `outputCsvUrl`.  
-    - On error, logs and sets job status to `FAILED` with an error message.  
-- `worker/services/queue_consumer.py`:  
-  - The long-running loop that connects to the queue, pulls job messages, and invokes `JobProcessor` for each. It may handle retries and backoff.[3]
-- `worker/services/db_client.py` / `status_client.py`:  
-  - DB or HTTP client logic for updating job status and progress in the JS backend or directly in the database.  
-- `worker/scripts/run_worker.py`:  
-  - CLI entry point to start a worker process. It loads settings, initializes model wrappers (YOLO, LP detector, OCR, pose, RFDETR) once, constructs pipelines and a `JobProcessor` factory, and starts `queue_consumer`.  
+Runs license-plate detector + OCR
 
-## Contract and communication intent
+Runs pose estimation for behavior analysis
 
-The JS and Python sides communicate through **clear contracts** documented under `docs/`:
+Runs RFDETR for litter detection
 
-- `api-contracts.md`: defines REST shapes (for `POST /api/jobs`, `GET /api/jobs/:id`, etc.), so both frontend and backend agree on JSON.  
-- `queue-schema.md`: defines the job message format sent from JS to Python (fields like `jobId`, `sourceType`, `sourceIdOrUrl`, `metadata`) and the meaning of each status (QUEUED, PROCESSING, DONE, FAILED).[3]
-- `architecture.md`: explains the full flow (client → backend-js → DB/queue → worker-python → CSV/storage → backend-js) using diagrams and text for humans and LLMs.  
+Writes unified CSV results
 
-The intent is that any tool or LLM reading this repo can infer:  
+Updates backend with job progress
 
-- Where to add or modify endpoints (in `backend-js/routes` and `controllers`).  
-- Where to add or swap models (in `worker-python/worker/models`).  
-- Where to change how different analyses are combined (in `pipelines` and `jobs/processor.py`).  
-- How to safely extend the system with new event types or new models without breaking existing contracts.  
+The worker uses CUDA, PyTorch, PaddleOCR, MediaPipe, RFDETR, and custom models.
+
+2. System Architecture
+Client
+  ↓
+backend-js (Express API)
+  - Receives video link
+  - Creates job record (DB)
+  - Pushes job to queue
+  ↓
+Queue  (Redis / SQS / etc.)
+  ↓
+worker-python (GPU)
+  - Downloads/streams video in chunks
+  - YOLO → LP detector → OCR
+  - Pose estimation (urination detection)
+  - Litter detector (RFDETR)
+  - Writes CSV
+  - Uploads CSV / updates job
+  ↓
+backend-js
+  - exposes /api/jobs/:id for results
+
+
+The Python worker performs all GPU tasks; the JS backend handles HTTP + DB + queue coordination.
+
+3. Folder Structure Overview
+📁 backend-js/
+  ├── src/
+  │   ├── app.js                # Express composition root
+  │   ├── server.js             # Starts HTTP server
+  │   ├── routes/               # API routes (/api/jobs)
+  │   ├── controllers/          # Job controller logic
+  │   ├── services/             # queue.service, db access
+  │   └── db/                   # DB connection/config
+  ├── models/                   # job model schema + queries
+  ├── config/                   # env, database configs
+  ├── migrations/               # DB migrations
+  └── package.json
+
+📁 worker-python/
+  ├── worker.py                 # Worker entrypoint (starts queue consumer)
+  ├── settings.py               # Configurable paths, weights, thresholds
+  ├── services/
+  │   └── queue_consumer.py     # Pulls jobs from queue, launches job processor
+  ├── jobs/
+  │   └── processor.py          # Orchestrates full video analysis for one job
+  ├── pipelines/
+  │   ├── test_pipeline.py      # Manual test runner
+  │   └── ...                   # future: traffic/behavior/litter pipelines
+  ├── models/
+  │   ├── yolo_detector.py      # People/vehicle detector (YOLO)
+  │   ├── lp_detector.py        # License plate detector
+  │   ├── ocr.py                # PaddleOCR wrapper (GPU/CPU fallbacks)
+  │   ├── base.py               # Model interfaces (Detector, OCRModel, etc.)
+  │   └── ...
+  ├── core/
+  │   ├── types.py              # Structured entities (FrameData, Detection…)
+  ├── weights/                  # yolo11x.pt, bestlicense.pt
+  └── output_with_boxes.mp4     # sample output
+
+
+This layout is intentionally stable so an LLM or developer can navigate and extend safely.
+
+4. Video Processing Pipeline (Python)
+
+The worker processes each job using a chunked streaming pipeline:
+
+1. Video Streaming
+
+The worker never loads a long video fully.
+Chunks may be sequential frame batches or time-sliced windows.
+
+2. Activity Gating (YOLO)
+
+YOLO detects people and vehicles.
+If no activity, the chunk is skipped to save GPU time.
+
+3. License Plate Processing (only for vehicle chunks)
+
+Custom license plate detector isolates plate regions
+
+Each plate crop is passed to PaddleOCR
+
+OCR returns the best text candidate (robust fallback logic included)
+
+4. Behavior Analysis (only for chunks with people/vehicles)
+
+Pose estimation (MediaPipe)
+
+Custom event detection (e.g., urination logic)
+
+5. Litter Detection (only for relevant chunks)
+
+RFDETR detects trash/litter around subjects
+
+6. CSV Output
+
+The worker aggregates everything into one CSV per job:
+
+Columns may include:
+
+timestamp
+
+chunk frame indices
+
+bounding boxes
+
+labels (person/vehicle/plate/trash)
+
+OCR result
+
+pose analysis result
+
+confidence scores
+
+event identifiers (e.g., urination event)
+
+5. Backend-JS Responsibilities
+
+POST /api/jobs → create job, queue it
+
+GET /api/jobs/:id → return job status & result CSV URL
+
+Maintains DB records for:
+
+QUEUED
+
+PROCESSING
+
+DONE
+
+FAILED
+
+Queue service provides enqueue(jobPayload)
+
+DB service provides basic CRUD helpers
+
+Clean separation of controllers vs services vs models
+
+6. Communication Contract
+
+The JS backend sends a job payload to the queue:
+
+{
+  jobId: "...",
+  videoUrl: "...",
+  cameraId: "...",
+  date: "...",
+  options: { ... }
+}
+
+
+The Python worker must:
+
+Set status → PROCESSING
+
+Stream+analyze video
+
+Produce CSV
+
+Upload CSV or save locally
+
+Set status → DONE with outputCsvUrl
+
+On errors, set status → FAILED with errorMessage
+
+These contracts are intentionally simple so they can be expanded easily.
+
+7. Running the System
+1. Start JS backend
+cd backend-js
+npm install
+npm run start  # or node src/server.js
+
+2. Start Python worker (GPU environment)
+conda activate paddle-gpu
+python worker-python/worker.py
+
+3. Run test pipeline manually
+python worker-python/pipelines/test_pipeline.py
+
+4. Create a job (example)
+curl -X POST http://localhost:3000/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"videoUrl":"https://dropbox.com/yourvideo.mp4"}'
+
+8. Model Weights and GPU Notes
+
+YOLO: worker-python/weights/yolo11x.pt
+
+License Plates: worker-python/weights/bestlicense.pt
+
+PaddleOCR automatically selects GPU if device="gpu"
+
+PyTorch must show cuda_available: True in logs
+
+Worker prints GPU diagnostics at startup (if enabled)
