@@ -1,176 +1,223 @@
+#!/usr/bin/env python3
 # worker-python/scripts/test_pipeline.py
+"""
+Test pipeline: runs YOLO -> LP -> OCR on a local video, writes:
+video_name, timestamp, crime, vehicle_number
 
+Usage:
+    cd worker-python
+    python -m scripts.test_pipeline
+"""
+
+import os
+import sys
 import cv2
-import numpy as np
 from tqdm import tqdm
 from rich.console import Console
+import traceback  # for full error traces
 
 from models.yolo_detector import YoloDetector
 from models.lp_detector import LpDetector
-from models.ocr import Ocr
+from models.ocr import Ocr  # must return List[Tuple[str, float]] per crop
 from core.types import FrameData
-from settings import CHUNK_SECONDS, YOLO_CONFIDENCE  # adjust path if needed
+from core.writer import CsvWriter
+from settings import CHUNK_SECONDS, YOLO_CONFIDENCE, PLATE_CONFIDENCE
 
 console = Console()
 
+# Config — edit if needed
 VIDEO_PATH = "Test.mp4"
+OUTPUT_CSV = "output_events.csv"
+OUTPUT_VIDEO = "output_with_boxes.mp4"
+
+VEHICLE_LABELS = ("vehicle", "car", "truck", "bus", "motorbike", "motorcycle")
+
+
+def clamp_bbox(bbox, w, h):
+    x1, y1, x2, y2 = map(int, bbox)
+    x1 = max(0, min(w - 1, x1))
+    x2 = max(0, min(w - 1, x2))
+    y1 = max(0, min(h - 1, y1))
+    y2 = max(0, min(h - 1, y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
 
 def main() -> None:
-    # Initialize models (adjust constructor args to your actual signatures)
+    if not os.path.exists(VIDEO_PATH):
+        console.print(f"[red]Video not found:[/] {VIDEO_PATH}")
+        sys.exit(2)
+
+    video_name = os.path.basename(VIDEO_PATH)
+
+    # Initialize models
     yolo = YoloDetector(conf_threshold=YOLO_CONFIDENCE)
     lp_detector = LpDetector()
-    ocr = Ocr()
+    ocr = Ocr()  # GPU-based Ocr implementation as requested
 
     # Open video
     cap = cv2.VideoCapture(VIDEO_PATH)
     if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video: {VIDEO_PATH}")
+        console.print(f"[red]Failed to open video:[/] {VIDEO_PATH}")
+        sys.exit(3)
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
-        raise RuntimeError(f"Invalid FPS ({fps}) for video: {VIDEO_PATH}")
+        console.print(f"[red]Invalid FPS:[/] {fps}")
+        sys.exit(4)
 
-    chunk_size = max(1, int(CHUNK_SECONDS * fps))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    chunk_frames = max(1, int(CHUNK_SECONDS * fps))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
     console.print(
-        f"[cyan]Loaded video[/] {VIDEO_PATH} "
-        f"({width}x{height} @ {fps:.2f} FPS, {total_frames} frames, "
-        f"chunk_size={chunk_size})"
+        f"[cyan]Loaded video[/] {VIDEO_PATH} ({width}x{height} @ {fps:.2f} FPS, {total_frames} frames);"
+        f" chunk={CHUNK_SECONDS}s -> {chunk_frames} frames"
     )
 
-    # Output video writer
+    # Output video writer (annotated visualization)
     out = cv2.VideoWriter(
-        "output_with_boxes.mp4",
+        OUTPUT_VIDEO,
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
         (width, height),
     )
 
-    progress = tqdm(total=total_frames, desc="Processing video")
+    # CSV writer using the simple schema (video_name, timestamp, crime, vehicle_number)
+    writer = CsvWriter(OUTPUT_CSV, video_name=video_name)
 
+    # Clear debug file at start
+    open("ocr_debug.txt", "w").close()
+
+    pbar = tqdm(total=total_frames, desc="Processing video")
     frame_idx = 0
-    while cap.isOpened():
-        chunk_frames: list[FrameData] = []
+    plate_counter = 0  # for unique debug image names
 
-        # Read a chunk of frames
-        for _ in range(chunk_size):
-            ret, frame = cap.read()
-            if not ret:
+    try:
+        while True:
+            # Read a chunk of frames
+            chunk_frames_list = []
+            for _ in range(chunk_frames):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                timestamp = frame_idx / fps
+                chunk_frames_list.append(FrameData(index=frame_idx, timestamp=timestamp, image=frame))
+                frame_idx += 1
+                pbar.update(1)
+
+            if not chunk_frames_list:
                 break
 
-            timestamp = frame_idx / fps
-            chunk_frames.append(FrameData(index=frame_idx, timestamp=timestamp, image=frame))
-            frame_idx += 1
-            progress.update(1)
+            # Run YOLO on the chunk
+            detections_per_frame = yolo.detect(chunk_frames_list)
 
-        if not chunk_frames:
-            break
+            # Align safety
+            n = min(len(chunk_frames_list), len(detections_per_frame))
+            if n == 0:
+                continue
 
-        # Run YOLO (people + vehicles)
-        # Assumes yolo.detect returns list[list[Detection]] aligned with chunk_frames
-        detections_per_frame = yolo.detect(chunk_frames)
+            for i in range(n):
+                frame_data = chunk_frames_list[i]
+                frame = frame_data.image
+                h, w = frame.shape[:2]
+                detections = detections_per_frame[i]
 
-        # Safety check: lengths should match
-        if len(detections_per_frame) != len(chunk_frames):
-            console.print(
-                f"[yellow]Warning:[/] detections_per_frame length "
-                f"({len(detections_per_frame)}) != chunk_frames length "
-                f"({len(chunk_frames)}). Check YoloDetector implementation."
-            )
+                # Draw YOLO detections
+                for det in detections:
+                    try:
+                        x1, y1, x2, y2 = map(int, det.bbox)
+                    except Exception:
+                        continue
+                    bbox = clamp_bbox((x1, y1, x2, y2), w, h)
+                    if bbox is None:
+                        continue
+                    x1, y1, x2, y2 = bbox
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, f"{det.label} {det.confidence:.2f}", (x1, max(0, y1 - 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-        for idx, frame_detections in enumerate(detections_per_frame):
-            frame_data = chunk_frames[idx]
-            frame = frame_data.image
-            h, w = frame.shape[:2]
+                # Handle vehicles
+                vehicles = [d for d in detections if d.label in VEHICLE_LABELS and d.confidence >= YOLO_CONFIDENCE]
+                for v in vehicles:
+                    vb = clamp_bbox(v.bbox, w, h)
+                    if vb is None:
+                        continue
+                    vx1, vy1, vx2, vy2 = vb
 
-            for det in frame_detections:
-                x1, y1, x2, y2 = map(int, det.bbox)
+                    # record vehicle presence (no plate number)
+                    writer.write_event(timestamp=frame_data.timestamp, crime="vehicle_presence", vehicle_number="")
 
-                # Clamp to frame bounds
-                x1 = max(0, min(w, x1))
-                x2 = max(0, min(w, x2))
-                y1 = max(0, min(h, y1))
-                y2 = max(0, min(h, y2))
-                if x2 <= x1 or y2 <= y1:
-                    continue
-
-                # Draw YOLO bbox
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(
-                    frame,
-                    f"{det.label} {det.confidence:.2f}",
-                    (x1, max(0, y1 - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 0),
-                    2,
-                )
-
-                # If this detection is a vehicle, run LP + OCR
-                # Adjust labels per your model (e.g., "car", "truck", etc.)
-                if det.label in ("vehicle", "car", "truck", "bus", "motorbike", "motorcycle"):
-                    vehicle_crop = frame[y1:y2, x1:x2]
+                    # crop vehicle and detect plates
+                    vehicle_crop = frame[vy1:vy2, vx1:vx2]
                     if vehicle_crop.size == 0:
                         continue
 
-                    # LP detector expects list[FrameData], here we wrap one crop
-                    lp_frame = FrameData(index=0, timestamp=0.0, image=vehicle_crop)
-                    plate_detections_per_frame = lp_detector.detect_plates([lp_frame])
-                    if not plate_detections_per_frame:
+                    plates_per_frame = lp_detector.detect_plates([FrameData(0, 0.0, vehicle_crop)])
+                    if not plates_per_frame:
                         continue
+                    plates = plates_per_frame[0]
 
-                    plate_detections = plate_detections_per_frame[0]
-
-                    for plate in plate_detections:
-                        px1, py1, px2, py2 = map(int, plate.bbox)
-
-                        # Clamp to crop bounds
-                        ph, pw = vehicle_crop.shape[:2]
-                        px1 = max(0, min(pw, px1))
-                        px2 = max(0, min(pw, px2))
-                        py1 = max(0, min(ph, py1))
-                        py2 = max(0, min(ph, py2))
-                        if px2 <= px1 or py2 <= py1:
+                    for plate in plates:
+                        pbox = clamp_bbox(plate.bbox, vehicle_crop.shape[1], vehicle_crop.shape[0])
+                        if pbox is None:
                             continue
-
+                        px1, py1, px2, py2 = pbox
                         plate_crop = vehicle_crop[py1:py2, px1:px2]
                         if plate_crop.size == 0:
                             continue
 
-                        # OCR expects list[np.ndarray]
-                        ocr_results = ocr.recognize([plate_crop])
-                        # Adjust based on your Ocr API (string vs. (text, conf) etc.)
-                        plate_text = ocr_results[0] if ocr_results else ""
+                        # Save plate crop image for inspection
+                        debug_img_path = f"debug_plate_{plate_counter}.jpg"
+                        cv2.imwrite(debug_img_path, plate_crop)
+                        console.print(f"[yellow]Saved debug plate image:[/] {debug_img_path}")
+                        plate_counter += 1
 
-                        # Draw plate box and text back in the original frame coordinates
-                        cv2.rectangle(
-                            frame,
-                            (x1 + px1, y1 + py1),
-                            (x1 + px2, y1 + py2),
-                            (255, 0, 0),
-                            2,
-                        )
-                        if plate_text:
-                            cv2.putText(
-                                frame,
-                                plate_text,
-                                (x1 + px1, max(0, y1 + py1 - 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5,
-                                (255, 0, 0),
-                                2,
-                            )
+                        # OCR — expects list of crops, returns list of (text, conf)
+                        try:
+                            ocr_out = ocr.recognize([plate_crop])
+                        except Exception as e:
+                            console.print(f"[yellow]OCR error:[/] {str(e)}")
+                            with open("ocr_debug.txt", "a") as debug_file:
+                                debug_file.write(f"OCR exception: {str(e)}\n{traceback.format_exc()}\n")
+                            ocr_out = [("", 0.0)]
 
-            # Write annotated frame
-            out.write(frame)
+                        plate_text, plate_conf = ocr_out[0] if ocr_out else ("", 0.0)
 
-    cap.release()
-    out.release()
-    progress.close()
-    console.print("[green]Test complete — output video saved as 'output_with_boxes.mp4'[/]")
+                        # Optional: filter low confidence
+                        if plate_conf < PLATE_CONFIDENCE:
+                            continue
+
+                        # write plate_detected row (vehicle_number may be empty)
+                        writer.write_event(timestamp=frame_data.timestamp, crime="plate_detected", vehicle_number=plate_text)
+
+                        # draw plate box + text+confidence on frame (convert plate coords to full-frame)
+                        cv2.rectangle(frame, (vx1 + px1, vy1 + py1), (vx1 + px2, vy1 + py2), (255, 0, 0), 2)
+                        label_str = f"{plate_text} {plate_conf:.2f}" if plate_text else f"{plate_conf:.2f}"
+                        cv2.putText(frame, label_str, (vx1 + px1, max(0, vy1 + py1 - 10)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+
+                # Write annotated frame
+                out.write(frame)
+
+        # finalize
+        writer.close()
+        pbar.close()
+        console.print(f"[green]Done — CSV written to:[/] {OUTPUT_CSV}")
+        console.print(f"[green]Annotated video saved:[/] {OUTPUT_VIDEO}")
+        console.print(f"[green]OCR debug log saved to:[/] ocr_debug.txt")
+
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            pass
+        try:
+            out.release()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
