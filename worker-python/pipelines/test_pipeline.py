@@ -14,20 +14,17 @@ import sys
 import cv2
 from tqdm import tqdm
 from rich.console import Console
-import traceback  # for full error traces
 
 from models.yolo_detector import YoloDetector
 from models.lp_detector import LpDetector
 from models.ocr import Ocr  # must return List[Tuple[str, float]] per crop
 from core.types import FrameData
-from core.writer import CsvWriter
 from settings import CHUNK_SECONDS, YOLO_CONFIDENCE, PLATE_CONFIDENCE
 
 console = Console()
 
 # Config — edit if needed
 VIDEO_PATH = "Test.mp4"
-OUTPUT_CSV = "output_events.csv"
 OUTPUT_VIDEO = "output_with_boxes.mp4"
 
 VEHICLE_LABELS = ("vehicle", "car", "truck", "bus", "motorbike", "motorcycle")
@@ -85,15 +82,8 @@ def main() -> None:
         (width, height),
     )
 
-    # CSV writer using the simple schema (video_name, timestamp, crime, vehicle_number)
-    writer = CsvWriter(OUTPUT_CSV, video_name=video_name)
-
-    # Clear debug file at start
-    open("ocr_debug.txt", "w").close()
-
     pbar = tqdm(total=total_frames, desc="Processing video")
     frame_idx = 0
-    plate_counter = 0  # for unique debug image names
 
     try:
         while True:
@@ -147,9 +137,6 @@ def main() -> None:
                         continue
                     vx1, vy1, vx2, vy2 = vb
 
-                    # record vehicle presence (no plate number)
-                    writer.write_event(timestamp=frame_data.timestamp, crime="vehicle_presence", vehicle_number="")
-
                     # crop vehicle and detect plates
                     vehicle_crop = frame[vy1:vy2, vx1:vx2]
                     if vehicle_crop.size == 0:
@@ -169,19 +156,11 @@ def main() -> None:
                         if plate_crop.size == 0:
                             continue
 
-                        # Save plate crop image for inspection
-                        debug_img_path = f"debug_plate_{plate_counter}.jpg"
-                        cv2.imwrite(debug_img_path, plate_crop)
-                        console.print(f"[yellow]Saved debug plate image:[/] {debug_img_path}")
-                        plate_counter += 1
-
                         # OCR — expects list of crops, returns list of (text, conf)
                         try:
                             ocr_out = ocr.recognize([plate_crop])
                         except Exception as e:
                             console.print(f"[yellow]OCR error:[/] {str(e)}")
-                            with open("ocr_debug.txt", "a") as debug_file:
-                                debug_file.write(f"OCR exception: {str(e)}\n{traceback.format_exc()}\n")
                             ocr_out = [("", 0.0)]
 
                         plate_text, plate_conf = ocr_out[0] if ocr_out else ("", 0.0)
@@ -189,9 +168,6 @@ def main() -> None:
                         # Optional: filter low confidence
                         if plate_conf < PLATE_CONFIDENCE:
                             continue
-
-                        # write plate_detected row (vehicle_number may be empty)
-                        writer.write_event(timestamp=frame_data.timestamp, crime="plate_detected", vehicle_number=plate_text)
 
                         # draw plate box + text+confidence on frame (convert plate coords to full-frame)
                         cv2.rectangle(frame, (vx1 + px1, vy1 + py1), (vx1 + px2, vy1 + py2), (255, 0, 0), 2)
@@ -203,11 +179,8 @@ def main() -> None:
                 out.write(frame)
 
         # finalize
-        writer.close()
         pbar.close()
-        console.print(f"[green]Done — CSV written to:[/] {OUTPUT_CSV}")
         console.print(f"[green]Annotated video saved:[/] {OUTPUT_VIDEO}")
-        console.print(f"[green]OCR debug log saved to:[/] ocr_debug.txt")
 
     finally:
         try:
