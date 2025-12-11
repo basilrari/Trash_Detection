@@ -14,12 +14,14 @@ import sys
 import cv2
 from tqdm import tqdm
 from rich.console import Console
-
+import supervision as sv
 from models.yolo_detector import YoloDetector
 from models.lp_detector import LpDetector
 from models.ocr import Ocr  # must return List[Tuple[str, float]] per crop
 from core.types import FrameData
+from models.trash_detector import RfDetrTrashDetector
 from settings import CHUNK_SECONDS, YOLO_CONFIDENCE, PLATE_CONFIDENCE
+import numpy as np
 
 console = Console()
 
@@ -52,6 +54,11 @@ def main() -> None:
     yolo = YoloDetector(conf_threshold=YOLO_CONFIDENCE)
     lp_detector = LpDetector()
     ocr = Ocr()  # GPU-based Ocr implementation as requested
+    trash_detector = RfDetrTrashDetector(
+    weights_path="weights/trash.pth",   # <-- update with your file
+    class_names={1: "trash"},  # optional
+    conf_threshold=0.40
+    )
 
     # Open video
     cap = cv2.VideoCapture(VIDEO_PATH)
@@ -103,6 +110,8 @@ def main() -> None:
 
             # Run YOLO on the chunk
             detections_per_frame = yolo.detect(chunk_frames_list)
+            # Run RF-DETR trash detection on the same chunk
+            trash_detections_per_frame = trash_detector.detect_trash(chunk_frames_list)
 
             # Align safety
             n = min(len(chunk_frames_list), len(detections_per_frame))
@@ -113,71 +122,145 @@ def main() -> None:
                 frame_data = chunk_frames_list[i]
                 frame = frame_data.image
                 h, w = frame.shape[:2]
+            
+                ##########################################
+                # SUPER VISION VISUALIZATION SETUP
+                ##########################################
+                text_scale = sv.calculate_optimal_text_scale(resolution_wh=(w, h))
+                thickness = sv.calculate_optimal_line_thickness(resolution_wh=(w, h))
+            
+                trash_box_annotator = sv.BoxAnnotator(color=sv.Color.RED, thickness=thickness)
+                yolo_box_annotator  = sv.BoxAnnotator(color=sv.Color.GREEN, thickness=thickness)
+                plate_box_annotator = sv.BoxAnnotator(color=sv.Color.BLUE, thickness=thickness)
+
+            
+                label_annotator = sv.LabelAnnotator(
+                    text_color=sv.Color.BLACK,
+                    text_scale=text_scale,
+                    text_thickness=thickness,
+                    smart_position=True
+                )
+            
+                # Supervision expects a detections object
+                # We will build *three* supervision detections:
+                # 1. trash_dets_s (RED)
+                # 2. yolo_dets_s  (GREEN)
+                # 3. plate_dets_s (BLUE)
+            
+                ##########################################
+                # TRASH DETECTIONS (RED)
+                ##########################################
+                trash_detections = trash_detections_per_frame[i]
+
+                if len(trash_detections) > 0:
+                    trash_xyxy = []
+                    trash_conf = []
+                    trash_class = []
+                
+                    for t in trash_detections:
+                        x1, y1, x2, y2 = map(int, t.bbox)
+                        trash_xyxy.append([x1, y1, x2, y2])
+                        trash_conf.append(t.confidence)
+                        trash_class.append(0)
+                
+                    trash_dets_s = sv.Detections(
+                        xyxy=np.array(trash_xyxy),
+                        confidence=np.array(trash_conf),
+                        class_id=np.array(trash_class)
+                    )
+                
+                    trash_labels = [f"{t.label} {t.confidence:.2f}" for t in trash_detections]
+                
+                    frame = trash_box_annotator.annotate(frame, trash_dets_s)
+
+                    frame = label_annotator.annotate(
+                        scene=frame,
+                        detections=trash_dets_s,
+                        labels=trash_labels
+                    )
+            
+                ##########################################
+                # YOLO DETECTIONS (GREEN)
+                ##########################################
+                ##########################################
+
                 detections = detections_per_frame[i]
+                
+                if len(detections) > 0:
+                    yolo_xyxy, yolo_conf, yolo_class, yolo_labels = [], [], [], []
+                
+                    for d in detections:
+                        x1, y1, x2, y2 = map(int, d.bbox)
+                        yolo_xyxy.append([x1, y1, x2, y2])
+                        yolo_conf.append(d.confidence)
+                        yolo_class.append(0)
+                        yolo_labels.append(f"{d.label} {d.confidence:.2f}")
+                
+                    yolo_dets_s = sv.Detections(
+                        xyxy=np.array(yolo_xyxy),
+                        confidence=np.array(yolo_conf),
+                        class_id=np.array(yolo_class)
+                    )
+                
+                    frame = yolo_box_annotator.annotate(frame, yolo_dets_s)
 
-                # Draw YOLO detections
-                for det in detections:
-                    try:
-                        x1, y1, x2, y2 = map(int, det.bbox)
-                    except Exception:
-                        continue
-                    bbox = clamp_bbox((x1, y1, x2, y2), w, h)
-                    if bbox is None:
-                        continue
-                    x1, y1, x2, y2 = bbox
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(frame, f"{det.label} {det.confidence:.2f}", (x1, max(0, y1 - 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                    frame = label_annotator.annotate(frame, yolo_dets_s, yolo_labels)
 
-                # Handle vehicles
-                vehicles = [d for d in detections if d.label in VEHICLE_LABELS and d.confidence >= YOLO_CONFIDENCE]
+            
+                ##########################################
+                # LICENSE PLATE DETECTIONS (BLUE)
+                ##########################################
+                plate_xyxy = []
+                plate_conf = []
+                plate_class = []
+                plate_labels = []
+                
+                vehicles = [d for d in detections if d.label in VEHICLE_LABELS]
+                
                 for v in vehicles:
-                    vb = clamp_bbox(v.bbox, w, h)
-                    if vb is None:
-                        continue
-                    vx1, vy1, vx2, vy2 = vb
-
-                    # crop vehicle and detect plates
+                    vx1, vy1, vx2, vy2 = map(int, v.bbox)
+                
+                    # Crop the vehicle area
                     vehicle_crop = frame[vy1:vy2, vx1:vx2]
                     if vehicle_crop.size == 0:
                         continue
-
-                    plates_per_frame = lp_detector.detect_plates([FrameData(0, 0.0, vehicle_crop)])
-                    if not plates_per_frame:
+                
+                    plates_list = lp_detector.detect_plates(
+                        [FrameData(0, 0.0, vehicle_crop)]
+                    )
+                
+                    if not plates_list:
                         continue
-                    plates = plates_per_frame[0]
-
+                
+                    plates = plates_list[0]
+                
                     for plate in plates:
-                        pbox = clamp_bbox(plate.bbox, vehicle_crop.shape[1], vehicle_crop.shape[0])
-                        if pbox is None:
-                            continue
-                        px1, py1, px2, py2 = pbox
-                        plate_crop = vehicle_crop[py1:py2, px1:px2]
-                        if plate_crop.size == 0:
-                            continue
+                        px1, py1, px2, py2 = map(int, plate.bbox)
+                        full_x1 = vx1 + px1
+                        full_y1 = vy1 + py1
+                        full_x2 = vx1 + px2
+                        full_y2 = vy1 + py2
+                
+                        plate_xyxy.append([full_x1, full_y1, full_x2, full_y2])
+                        plate_conf.append(plate.confidence)
+                        plate_class.append(0)
+                        plate_labels.append(f"plate {plate.confidence:.2f}")
+                
+                # Only annotate if we detected plates
+                if len(plate_xyxy) > 0:
+                    plate_dets_s = sv.Detections(
+                        xyxy=np.array(plate_xyxy),
+                        confidence=np.array(plate_conf),
+                        class_id=np.array(plate_class)
+                    )
+                
+                    frame = plate_box_annotator.annotate(frame, plate_dets_s)
+                    frame = label_annotator.annotate(frame, plate_dets_s, plate_labels)
 
-                        # OCR — expects list of crops, returns list of (text, conf)
-                        try:
-                            ocr_out = ocr.recognize([plate_crop])
-                        except Exception as e:
-                            console.print(f"[yellow]OCR error:[/] {str(e)}")
-                            ocr_out = [("", 0.0)]
-
-                        plate_text, plate_conf = ocr_out[0] if ocr_out else ("", 0.0)
-
-                        # Optional: filter low confidence
-                        if plate_conf < PLATE_CONFIDENCE:
-                            continue
-
-                        # draw plate box + text+confidence on frame (convert plate coords to full-frame)
-                        cv2.rectangle(frame, (vx1 + px1, vy1 + py1), (vx1 + px2, vy1 + py2), (255, 0, 0), 2)
-                        label_str = f"{plate_text} {plate_conf:.2f}" if plate_text else f"{plate_conf:.2f}"
-                        cv2.putText(frame, label_str, (vx1 + px1, max(0, vy1 + py1 - 10)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-
-                # Write annotated frame
+                ##########################################
+                # WRITE FRAME
+                ##########################################
                 out.write(frame)
-
         # finalize
         pbar.close()
         console.print(f"[green]Annotated video saved:[/] {OUTPUT_VIDEO}")
