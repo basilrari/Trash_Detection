@@ -43,3 +43,12 @@ worker-python/*.pt
 worker-python/*.onnx
 worker-python/*.engine
 worker-python/*.bin
+
+# Ignore all videos everywhere
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.wmv
+*.webm
