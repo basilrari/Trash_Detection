@@ -53,32 +53,70 @@ class RfDetrTrashDetector(TrashDetector):
 
     def _convert_rfdetr_results(self, results, default_label="trash"):
         """
-        Helper: Convert RF-DETR model outputs into Detection objects.
+        Convert RF-DETR outputs into Detection objects.
+    
+        Supports:
+        - object-style outputs (det.xyxy, det.confidence, det.class_id)
+        - tuple-style outputs with variable length
         """
         frame_outputs = []
-
+    
         for det in results:
-            xyxy = det.xyxy
-            confs = det.confidence
-            class_ids = det.class_id
-
-            frame_det_list: List[Detection] = []
-
-            for i in range(len(xyxy)):
+            # -------------------------------------------------
+            # CASE 1: Newer RF-DETR object-style output
+            # -------------------------------------------------
+            if hasattr(det, "xyxy"):
+                xyxy = det.xyxy
+                confs = det.confidence
+                class_ids = det.class_id
+    
+            # -------------------------------------------------
+            # CASE 2: Tuple-style output (older / variant RF-DETR)
+            # -------------------------------------------------
+            elif isinstance(det, (tuple, list)):
+                xyxy = None
+                confs = None
+                class_ids = None
+    
+                for item in det:
+                    # xyxy: Nx4
+                    if hasattr(item, "shape") and len(item.shape) == 2 and item.shape[1] == 4:
+                        xyxy = item
+                    # confidence or class_id: Nx1 or Nx
+                    elif hasattr(item, "shape") and len(item.shape) == 1:
+                        if confs is None:
+                            confs = item
+                        else:
+                            class_ids = item
+    
+                if xyxy is None or confs is None or class_ids is None:
+                    # Cannot parse this RF-DETR output safely
+                    frame_outputs.append([])
+                    continue
+    
+            else:
+                frame_outputs.append([])
+                continue
+    
+            # -------------------------------------------------
+            # Build Detection objects
+            # -------------------------------------------------
+            frame_det_list = []
+    
+            num = min(len(xyxy), len(confs), len(class_ids))
+            for i in range(num):
                 score = float(confs[i])
                 cid = int(class_ids[i])
-
+    
                 if score < self.conf_threshold:
                     continue
-
+    
                 if self.allowed_classes and cid not in self.allowed_classes:
                     continue
-
+    
                 x1, y1, x2, y2 = map(float, xyxy[i])
-
-                # Pick label → either from class_names or fallback
                 label = self.class_names.get(cid, default_label)
-
+    
                 frame_det_list.append(
                     Detection(
                         bbox=(x1, y1, x2, y2),
@@ -86,9 +124,9 @@ class RfDetrTrashDetector(TrashDetector):
                         confidence=score,
                     )
                 )
-
+    
             frame_outputs.append(frame_det_list)
-
+    
         return frame_outputs
 
     def detect_trash(self, frames: List[FrameData]) -> List[List[Detection]]:
