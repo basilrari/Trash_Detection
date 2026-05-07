@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 YOLO → RF-DETR trash → LP → OCR on a local video; writes an annotated MP4.
+Labels only (no bounding boxes) for trash, YOLO, and plates; YOLO is person + road vehicles.
 
 Run from worker-python/ (put source videos in inputs/, results under outputs/ by default):
 
@@ -33,6 +34,7 @@ from rich.console import Console
 from models.yolo_detector import YoloDetector
 from models.lp_detector import LpDetector
 from models.ocr import Ocr
+from models.peeing_detector import PeeingDetector, PeeingState
 from core.types import Detection, FrameData
 from core.yolo_stride_gate import YoloStrideGate, YoloStrideGateConfig
 from settings import (
@@ -40,6 +42,25 @@ from settings import (
     CIGARETTE_WEIGHTS_PATH,
     GATE_MODE,
     OUTPUT_VIDEO,
+    PEEING_ACTIVE_THRESHOLD,
+    PEEING_CROP_MARGIN,
+    PEEING_DECAY_NO_PERSON,
+    PEEING_DECAY_NO_YOLO,
+    PEEING_EMA_ALPHA,
+    PEEING_EMA_RELEASE_THRESHOLD,
+    PEEING_GROIN_DIST_MAX,
+    PEEING_GROIN_LOOSE_FACTOR,
+    PEEING_MIN_ACTIVE_DURATION_SEC,
+    PEEING_MIN_VISIBILITY,
+    PEEING_PELVIC_BAND_Y_ABOVE,
+    PEEING_PELVIC_BAND_Y_BELOW,
+    PEEING_POSE_MODEL_PATH,
+    PEEING_POSE_MODEL_URL,
+    PEEING_POSE_STRIDE,
+    PEEING_SQUAT_DEPTH_SCALE,
+    PEEING_SQUAT_HIP_KNEE_GAP_MAX,
+    PEEING_STANDING_Y_MARGIN,
+    PEEING_WRIST_BAND_MIN_VISIBILITY,
     PLATE_CONFIDENCE,
     TRASH_CONFIDENCE,
     TRASH_WEIGHTS_PATH,
@@ -63,57 +84,60 @@ class PipelineStepTimes:
     init_sec: float = 0.0
     yolo_sec: float = 0.0
     trash_sec: float = 0.0
+    peeing_sec: float = 0.0
     annotate_sec: float = 0.0
     video_write_sec: float = 0.0
     other_sec: float = 0.0  # open video, build writer, gate setup, chunk assembly
 
     def print_summary(self, *, wall_total_sec: float) -> None:
-        inf = self.yolo_sec + self.trash_sec + self.annotate_sec + self.video_write_sec
+        inf = self.yolo_sec + self.trash_sec + self.peeing_sec + self.annotate_sec + self.video_write_sec
         console.print("[bold]Step timings (cumulative)[/]")
         console.print(f"  Model init:           {self.init_sec:8.2f} s")
         console.print(f"  Other (I/O, chunks):  {self.other_sec:8.2f} s")
         console.print(f"  YOLO:                 {self.yolo_sec:8.2f} s")
         console.print(f"  RF-DETR (trash):      {self.trash_sec:8.2f} s")
+        console.print(f"  Peeing (MediaPipe):   {self.peeing_sec:8.2f} s")
         console.print(f"  Annotate + LP + OCR: {self.annotate_sec:8.2f} s")
         console.print(f"  Video write:          {self.video_write_sec:8.2f} s")
         console.print(f"  [dim]Sum (inference): {inf:8.2f} s[/]")
         console.print(f"  [bold]Wall clock total:   {wall_total_sec:8.2f} s[/]")
 
 
-VEHICLE_LABELS = ("vehicle", "car", "truck", "bus", "motorbike", "motorcycle")
+# Match Ultralytics COCO names for YOLO ``classes=[0,2,3,5,7]`` (person + road vehicles).
+VEHICLE_LABELS = ("car", "truck", "bus", "motorcycle", "motorbike", "vehicle")
 PERSON_LABELS = ("person",)
+
+
+def _is_scene_detection(d: Detection) -> bool:
+    """YOLO is restricted to person + vehicles; keep this aligned with ``YoloDetector.classes``."""
+    return d.label in PERSON_LABELS or d.label in VEHICLE_LABELS
+
+
+def _filter_scene_detections(detections: Sequence[Detection]) -> List[Detection]:
+    return [d for d in detections if _is_scene_detection(d)]
 
 
 @dataclass(frozen=True)
 class FrameAnnotators:
-    """Supervision draw stack for one video resolution (BGR OpenCV frames)."""
+    """Supervision label stack (text only; boxes are not drawn)."""
 
-    trash_box: Any
-    yolo_box: Any
-    plate_box: Any
     trash_label: Any
     yolo_label: Any
     plate_label: Any
 
 
 def _make_frame_annotators(width: int, height: int) -> FrameAnnotators:
-    """Box / label sizing from supervision heuristics; trash head style (red) for trash + cigarette."""
+    """Label sizing from supervision heuristics; trash head style (red) for trash + cigarette."""
     wh = (int(width), int(height))
     base_thickness = int(sv.calculate_optimal_line_thickness(resolution_wh=wh))
-    # Slightly thicker than half of the optimal line (still lighter than full default).
     line_thickness = max(2, (base_thickness * 2 + 2) // 3)
 
     base_text_scale = float(sv.calculate_optimal_text_scale(resolution_wh=wh))
-    # A bit smaller than the previous 2× bump; stroke below makes labels read bolder.
-    text_scale = max(0.45, base_text_scale * 1.4)
+    text_scale = 0.5 * max(0.45, base_text_scale * 1.4)
+    text_scale = max(0.22, float(text_scale))
 
-    # Bolder glyph stroke than the box lines (independent of line_thickness).
-    text_thickness = max(2, line_thickness + 1)
+    text_thickness = max(3, line_thickness + 2)
     lookup = sv.ColorLookup.INDEX
-
-    trash_box = sv.BoxAnnotator(color=sv.Color.RED, thickness=line_thickness, color_lookup=lookup)
-    yolo_box = sv.BoxAnnotator(color=sv.Color.GREEN, thickness=line_thickness, color_lookup=lookup)
-    plate_box = sv.BoxAnnotator(color=sv.Color.BLUE, thickness=line_thickness, color_lookup=lookup)
 
     trash_label = sv.LabelAnnotator(
         color=sv.Color.RED,
@@ -140,9 +164,6 @@ def _make_frame_annotators(width: int, height: int) -> FrameAnnotators:
         color_lookup=lookup,
     )
     return FrameAnnotators(
-        trash_box=trash_box,
-        yolo_box=yolo_box,
-        plate_box=plate_box,
         trash_label=trash_label,
         yolo_label=yolo_label,
         plate_label=plate_label,
@@ -219,11 +240,11 @@ def _load_trash_detector_required() -> "RfDetrTrashDetector":
 
 
 def _scene_has_activity(detections: Sequence[Detection], min_conf: float) -> bool:
-    """True if any person or vehicle-like detection meets confidence."""
+    """True if any person or vehicle detection meets confidence (YOLO class subset)."""
     for d in detections:
         if d.confidence < min_conf:
             continue
-        if d.label in VEHICLE_LABELS or d.label in PERSON_LABELS:
+        if _is_scene_detection(d):
             return True
     return False
 
@@ -239,6 +260,25 @@ def clamp_bbox(bbox, w, h):
     return x1, y1, x2, y2
 
 
+def iou_xyxy(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> float:
+    ax1, ay1, ax2, ay2 = map(float, a)
+    bx1, by1, bx2, by2 = map(float, b)
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    aa = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    ba = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = aa + ba - inter + 1e-9
+    return float(inter / union)
+
+
 def _draw_trash_detections(
     frame,
     trash_detections: Sequence[Detection],
@@ -249,7 +289,6 @@ def _draw_trash_detections(
     sv_dets, labels = _detections_to_sv(trash_detections, w, h)
     if not labels:
         return
-    annots.trash_box.annotate(frame, sv_dets)
     annots.trash_label.annotate(frame, sv_dets, labels=labels)
 
 
@@ -261,15 +300,15 @@ def _annotate_yolo_lp_ocr(
     ocr: Ocr,
     annots: FrameAnnotators,
 ) -> None:
-    """Draw YOLO boxes, then LP + OCR on vehicle crops (mutates ``frame`` in place)."""
+    """Draw YOLO labels (no boxes), then LP + OCR on vehicle crops (mutates ``frame`` in place)."""
     h, w = frame.shape[:2]
+    scene = _filter_scene_detections(detections)
 
-    yolo_dets, yolo_labels = _detections_to_sv(detections, w, h)
+    yolo_dets, yolo_labels = _detections_to_sv(scene, w, h)
     if yolo_labels:
-        annots.yolo_box.annotate(frame, yolo_dets)
         annots.yolo_label.annotate(frame, yolo_dets, labels=yolo_labels)
 
-    vehicles = [d for d in detections if d.label in VEHICLE_LABELS and d.confidence >= YOLO_CONFIDENCE]
+    vehicles = [d for d in scene if d.label in VEHICLE_LABELS and d.confidence >= YOLO_CONFIDENCE]
     for v in vehicles:
         vb = clamp_bbox(v.bbox, w, h)
         if vb is None:
@@ -323,8 +362,78 @@ def _annotate_yolo_lp_ocr(
             p_conf = np.asarray(plate_confs, dtype=np.float32)
             p_cls = np.zeros(len(plate_rows), dtype=np.int64)
             p_dets = sv.Detections(xyxy=p_xyxy, confidence=p_conf, class_id=p_cls)
-            annots.plate_box.annotate(frame, p_dets)
             annots.plate_label.annotate(frame, p_dets, labels=plate_label_strs)
+
+
+def _draw_peeing_on_persons(
+    frame: np.ndarray,
+    yolo_detections: Sequence[Detection],
+    state: PeeingState,
+) -> None:
+    """When peeing heuristic is active, tag only persons who match the pose focus boxes."""
+    if not state.active:
+        return
+    if not state.mark_bboxes:
+        return
+    h, w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.38
+    thickness = 3
+    text = "PEEING"
+    (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+    pad = 5
+    iou_thr = 0.2
+    for det in yolo_detections:
+        if det.label not in PERSON_LABELS or det.confidence < YOLO_CONFIDENCE:
+            continue
+        bbox = clamp_bbox(tuple(map(int, det.bbox)), w, h)
+        if bbox is None:
+            continue
+        db = tuple(map(float, det.bbox))
+        if max(iou_xyxy(db, mb) for mb in state.mark_bboxes) < iou_thr:
+            continue
+        x1, y1, x2, y2 = bbox
+        cx = (x1 + x2) // 2
+        tx = int(cx - tw // 2)
+        ty = int(y1 - pad)
+        if ty < th + pad + 2:
+            ty = min(h - 2, y2 + th + pad)
+        tx = max(2, min(w - tw - pad - 2, tx))
+        bg_x1, bg_y1 = tx - pad, ty - th - pad
+        bg_x2, bg_y2 = tx + tw + pad, ty + baseline + pad
+        cv2.rectangle(frame, (bg_x1, bg_y1), (bg_x2, bg_y2), (180, 0, 220), -1)
+        cv2.rectangle(frame, (bg_x1, bg_y1), (bg_x2, bg_y2), (255, 255, 255), 1)
+        cv2.putText(frame, text, (tx, ty), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+
+def _draw_peeing_overlay(frame: np.ndarray, state: PeeingState) -> None:
+    """Debug banner for the peeing heuristic (top-left, yellow)."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thick = 3
+    tag = "PEEING (active)" if state.active else "peeing"
+    extra = f" hit={state.frame_match:.2f}" if state.sampled else ""
+    line1 = f"{tag} score={state.score:.2f}{extra}"
+    cv2.putText(
+        frame,
+        line1,
+        (10, 22),
+        font,
+        0.38,
+        (0, 255, 255),
+        thick,
+        cv2.LINE_AA,
+    )
+    if state.active:
+        cv2.putText(
+            frame,
+            "Heuristic ON — terminal for edge logs",
+            (10, 44),
+            font,
+            0.28,
+            (0, 255, 255),
+            thick,
+            cv2.LINE_AA,
+        )
 
 
 def _annotate_frame(
@@ -335,9 +444,12 @@ def _annotate_frame(
     lp_detector: LpDetector,
     ocr: Ocr,
     annots: FrameAnnotators,
+    peeing_state: PeeingState,
 ) -> None:
     _draw_trash_detections(frame, trash_detections, annots)
     _annotate_yolo_lp_ocr(frame, yolo_detections, lp_detector=lp_detector, ocr=ocr, annots=annots)
+    _draw_peeing_on_persons(frame, yolo_detections, peeing_state)
+    _draw_peeing_overlay(frame, peeing_state)
 
 
 def _run_pipeline_chunked(
@@ -353,6 +465,7 @@ def _run_pipeline_chunked(
     trash: "RfDetrTrashDetector",
     times: PipelineStepTimes,
     annots: FrameAnnotators,
+    peeing: PeeingDetector,
 ) -> None:
     pbar = tqdm(total=total_frames, desc="Processing video")
     frame_idx = 0
@@ -387,14 +500,34 @@ def _run_pipeline_chunked(
             for i in range(n):
                 frame_data = chunk_frames_list[i]
                 frame = frame_data.image
+                scene_dets = _filter_scene_detections(detections_per_frame[i])
+                t_p = time.perf_counter()
+                pstate = peeing.update(
+                    frame,
+                    scene_dets,
+                    run_yolo=True,
+                    yolo_conf=YOLO_CONFIDENCE,
+                    timestamp_sec=frame_data.timestamp,
+                )
+                times.peeing_sec += time.perf_counter() - t_p
+                if pstate.edge_enter:
+                    console.print(
+                        f"[bold magenta]PEEING heuristic ON[/] frame={frame_data.index} "
+                        f"score={pstate.score:.2f} instant={pstate.frame_match:.2f}"
+                    )
+                if pstate.edge_exit:
+                    console.print(
+                        f"[dim]PEEING heuristic OFF[/] frame={frame_data.index} score={pstate.score:.2f}"
+                    )
                 t0 = time.perf_counter()
                 _annotate_frame(
                     frame,
                     trash_per_frame[i],
-                    detections_per_frame[i],
+                    scene_dets,
                     lp_detector=lp_detector,
                     ocr=ocr,
                     annots=annots,
+                    peeing_state=pstate,
                 )
                 times.annotate_sec += time.perf_counter() - t0
                 t0 = time.perf_counter()
@@ -422,6 +555,7 @@ def _run_pipeline_yolo_gated(
     trash: "RfDetrTrashDetector",
     times: PipelineStepTimes,
     annots: FrameAnnotators,
+    peeing: PeeingDetector,
 ) -> None:
     pbar = tqdm(total=total_frames, desc="Processing video (YOLO stride gate)")
     frame_idx = 0
@@ -435,22 +569,48 @@ def _run_pipeline_yolo_gated(
 
             run_yolo = gate.should_run_yolo(frame_idx)
             trash_dets: List[Detection] = []
+            scene_dets: List[Detection] = []
             if run_yolo:
                 fd = FrameData(index=frame_idx, timestamp=frame_idx / fps, image=frame)
                 t0 = time.perf_counter()
                 dets_list = yolo.detect([fd])
                 times.yolo_sec += time.perf_counter() - t0
                 detections = dets_list[0] if dets_list else []
-                gate.observe(frame_idx, _scene_has_activity(detections, YOLO_CONFIDENCE))
+                scene_dets = _filter_scene_detections(detections)
+                gate.observe(frame_idx, _scene_has_activity(scene_dets, YOLO_CONFIDENCE))
                 t0 = time.perf_counter()
                 tlist = trash.detect_trash([fd])
                 times.trash_sec += time.perf_counter() - t0
                 trash_dets = list(tlist[0]) if tlist else []
-            else:
-                detections = []
+
+            t_p = time.perf_counter()
+            ts = frame_idx / fps
+            pstate = peeing.update(
+                frame,
+                scene_dets,
+                run_yolo=run_yolo,
+                yolo_conf=YOLO_CONFIDENCE,
+                timestamp_sec=ts,
+            )
+            times.peeing_sec += time.perf_counter() - t_p
+            if pstate.edge_enter:
+                console.print(
+                    f"[bold magenta]PEEING heuristic ON[/] frame={frame_idx} "
+                    f"score={pstate.score:.2f} instant={pstate.frame_match:.2f}"
+                )
+            if pstate.edge_exit:
+                console.print(f"[dim]PEEING heuristic OFF[/] frame={frame_idx} score={pstate.score:.2f}")
 
             t0 = time.perf_counter()
-            _annotate_frame(frame, trash_dets, detections, lp_detector=lp_detector, ocr=ocr, annots=annots)
+            _annotate_frame(
+                frame,
+                trash_dets,
+                scene_dets,
+                lp_detector=lp_detector,
+                ocr=ocr,
+                annots=annots,
+                peeing_state=pstate,
+            )
             times.annotate_sec += time.perf_counter() - t0
             t0 = time.perf_counter()
             out.write(frame)
@@ -516,6 +676,41 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         )
     console.print("[cyan]RF-DETR trash/cigarette[/] loaded (required)")
 
+    try:
+        peeing = PeeingDetector(
+            pose_stride=PEEING_POSE_STRIDE,
+            crop_margin=PEEING_CROP_MARGIN,
+            min_visibility=PEEING_MIN_VISIBILITY,
+            groin_dist_max=PEEING_GROIN_DIST_MAX,
+            groin_loose_factor=PEEING_GROIN_LOOSE_FACTOR,
+            wrist_band_min_visibility=PEEING_WRIST_BAND_MIN_VISIBILITY,
+            pelvic_band_y_above=PEEING_PELVIC_BAND_Y_ABOVE,
+            pelvic_band_y_below=PEEING_PELVIC_BAND_Y_BELOW,
+            standing_y_margin=PEEING_STANDING_Y_MARGIN,
+            ema_alpha=PEEING_EMA_ALPHA,
+            active_threshold=PEEING_ACTIVE_THRESHOLD,
+            ema_release_threshold=PEEING_EMA_RELEASE_THRESHOLD,
+            min_active_duration_sec=PEEING_MIN_ACTIVE_DURATION_SEC,
+            decay_no_yolo=PEEING_DECAY_NO_YOLO,
+            decay_no_person=PEEING_DECAY_NO_PERSON,
+            squat_hip_knee_gap_max=PEEING_SQUAT_HIP_KNEE_GAP_MAX,
+            squat_depth_scale=PEEING_SQUAT_DEPTH_SCALE,
+            model_path=PEEING_POSE_MODEL_PATH,
+            model_url=PEEING_POSE_MODEL_URL,
+        )
+    except Exception as exc:
+        console.print(
+            "[red]PeeingDetector failed to initialize (required).[/]\n"
+            "Install MediaPipe in this environment, e.g. [bold]pip install mediapipe[/].\n"
+            f"[dim]{exc}[/]"
+        )
+        raise SystemExit(2) from exc
+    console.print(
+        "[cyan]Peeing hint:[/] standing + squat cues; straddle penalty; "
+        f"alarm after {PEEING_MIN_ACTIVE_DURATION_SEC:.0f}s sustained above threshold "
+        f"(release EMA<{PEEING_EMA_RELEASE_THRESHOLD})."
+    )
+
     annots = _make_frame_annotators(width, height)
 
     out_dir = os.path.dirname(os.path.abspath(output_video))
@@ -553,6 +748,7 @@ def run_pipeline(video_path: str, output_video: str) -> None:
                 trash=trash,
                 times=times,
                 annots=annots,
+                peeing=peeing,
             )
         else:
             _run_pipeline_chunked(
@@ -567,11 +763,16 @@ def run_pipeline(video_path: str, output_video: str) -> None:
                 trash=trash,
                 times=times,
                 annots=annots,
+                peeing=peeing,
             )
 
         console.print(f"[green]Annotated video saved:[/] {output_video}")
 
     finally:
+        try:
+            peeing.close()
+        except Exception:
+            pass
         try:
             cap.release()
         except Exception:

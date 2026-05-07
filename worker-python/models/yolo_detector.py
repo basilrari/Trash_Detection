@@ -24,8 +24,9 @@ class YoloDetector(Detector):
         self.model = YOLO(str(weights_path))
         self.conf_threshold = conf_threshold
 
-        # Person + vehicle-like classes. Make sure these match your model.
-        self.classes = [0, 2, 3, 5, 6, 7, 8]
+        # COCO subset: person + road vehicles only (no train/boat/bicycle/etc.).
+        # 0 person, 2 car, 3 motorcycle, 5 bus, 7 truck
+        self.classes = [0, 2, 3, 5, 7]
 
     def detect(self, frames: List[FrameData]) -> List[List[Detection]]:
         """

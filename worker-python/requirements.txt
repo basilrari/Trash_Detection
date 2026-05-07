@@ -8,3 +8,4 @@ paddleocr>=2.7.0
 torch  # install wheel matching your CUDA from https://pytorch.org/get-started/locally/
 rfdetr>=1.6.0
 supervision>=0.24.0
+mediapipe>=0.10.0
