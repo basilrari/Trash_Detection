@@ -1,16 +1,29 @@
 #!/usr/bin/env python3
 """
-YOLO → LP detector → OCR on a local video; writes an annotated MP4.
+YOLO → (optional RF-DETR trash) → LP → OCR on a local video; writes an annotated MP4.
 
-Run from worker-python/:
+Run from worker-python/ (put source videos in inputs/, results under outputs/ by default):
 
   python worker.py
-  python worker.py myvideo.mp4 -o out.mp4
+  python worker.py inputs/myvideo.mp4
+  python worker.py inputs/myvideo.mp4 -o outputs/custom.mp4
   python -m pipelines.test_pipeline   # uses paths from settings.py
+
+**Gate (``GATE_MODE``)** — see ``settings.py`` module docstring and ``Readme.md`` § Gating.
+
+**Trash (RF-DETR)** — optional; ``TRASH_ENABLED`` + ``weights/trash.pth`` (and optionally
+``cigarette.pth``). Requires ``pip install rfdetr``. See ``models/trash_detector.py``.
 """
+
+from __future__ import annotations
 
 import os
 import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, List, Sequence
+
 import cv2
 from tqdm import tqdm
 from rich.console import Console
@@ -18,12 +31,95 @@ from rich.console import Console
 from models.yolo_detector import YoloDetector
 from models.lp_detector import LpDetector
 from models.ocr import Ocr
-from core.types import FrameData
-from settings import CHUNK_SECONDS, OUTPUT_VIDEO, PLATE_CONFIDENCE, VIDEO_PATH, YOLO_CONFIDENCE
+from core.types import Detection, FrameData
+from core.yolo_stride_gate import YoloStrideGate, YoloStrideGateConfig
+from settings import (
+    CHUNK_SECONDS,
+    CIGARETTE_WEIGHTS_PATH,
+    GATE_MODE,
+    OUTPUT_VIDEO,
+    PLATE_CONFIDENCE,
+    RF_DETR_SIZE,
+    TRASH_CONFIDENCE,
+    TRASH_ENABLED,
+    TRASH_WEIGHTS_PATH,
+    VIDEO_PATH,
+    YOLO_COARSE_STRIDE,
+    YOLO_CONFIDENCE,
+    YOLO_DENSE_STRIDE,
+    YOLO_DENSE_WINDOW_SEC,
+)
+
+if TYPE_CHECKING:
+    from models.trash_detector import RfDetrTrashDetector
 
 console = Console()
 
+
+@dataclass
+class PipelineStepTimes:
+    """Cumulative seconds spent in each stage (wall-clock, ``perf_counter``)."""
+
+    init_sec: float = 0.0
+    yolo_sec: float = 0.0
+    trash_sec: float = 0.0
+    annotate_sec: float = 0.0
+    video_write_sec: float = 0.0
+    other_sec: float = 0.0  # open video, build writer, gate setup, chunk assembly
+
+    def print_summary(self, *, wall_total_sec: float) -> None:
+        inf = self.yolo_sec + self.trash_sec + self.annotate_sec + self.video_write_sec
+        console.print("[bold]Step timings (cumulative)[/]")
+        console.print(f"  Model init:           {self.init_sec:8.2f} s")
+        console.print(f"  Other (I/O, chunks):  {self.other_sec:8.2f} s")
+        console.print(f"  YOLO:                 {self.yolo_sec:8.2f} s")
+        console.print(f"  RF-DETR (trash):      {self.trash_sec:8.2f} s")
+        console.print(f"  Annotate + LP + OCR: {self.annotate_sec:8.2f} s")
+        console.print(f"  Video write:          {self.video_write_sec:8.2f} s")
+        console.print(f"  [dim]Sum (inference): {inf:8.2f} s[/]")
+        console.print(f"  [bold]Wall clock total:   {wall_total_sec:8.2f} s[/]")
+
+
 VEHICLE_LABELS = ("vehicle", "car", "truck", "bus", "motorbike", "motorcycle")
+PERSON_LABELS = ("person",)
+
+
+def _try_load_trash_detector() -> RfDetrTrashDetector | None:
+    """Load RF-DETR trash heads when enabled and weights exist; otherwise log and skip."""
+    if not TRASH_ENABLED:
+        return None
+    tw = Path(TRASH_WEIGHTS_PATH)
+    if not tw.is_file():
+        console.print(
+            f"[yellow]TRASH_ENABLED but weights missing ({tw}); "
+            f"skipping RF-DETR. Set TRASH_ENABLED=0 or add weights.[/]"
+        )
+        return None
+    try:
+        from models.trash_detector import RfDetrTrashDetector
+
+        cig = Path(CIGARETTE_WEIGHTS_PATH)
+        cig_path: str | None = str(cig) if cig.is_file() else None
+        return RfDetrTrashDetector(
+            tw,
+            cigarette_weights_path=cig_path,
+            class_names=None,
+            conf_threshold=TRASH_CONFIDENCE,
+            model_size=RF_DETR_SIZE,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface any import / CUDA / checkpoint issue
+        console.print(f"[yellow]RF-DETR trash disabled:[/] {exc}")
+        return None
+
+
+def _scene_has_activity(detections: Sequence[Detection], min_conf: float) -> bool:
+    """True if any person or vehicle-like detection meets confidence."""
+    for d in detections:
+        if d.confidence < min_conf:
+            continue
+        if d.label in VEHICLE_LABELS or d.label in PERSON_LABELS:
+            return True
+    return False
 
 
 def clamp_bbox(bbox, w, h):
@@ -37,16 +133,270 @@ def clamp_bbox(bbox, w, h):
     return x1, y1, x2, y2
 
 
+def _draw_trash_detections(frame, trash_detections: Sequence[Detection]) -> None:
+    """Draw RF-DETR boxes in red (BGR) under YOLO."""
+    h, w = frame.shape[:2]
+    for det in trash_detections:
+        try:
+            x1, y1, x2, y2 = map(int, det.bbox)
+        except Exception:
+            continue
+        bbox = clamp_bbox((x1, y1, x2, y2), w, h)
+        if bbox is None:
+            continue
+        x1, y1, x2, y2 = bbox
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+        cv2.putText(
+            frame,
+            f"{det.label} {det.confidence:.2f}",
+            (x1, max(0, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 255),
+            2,
+        )
+
+
+def _annotate_yolo_lp_ocr(
+    frame,
+    detections: Sequence[Detection],
+    *,
+    lp_detector: LpDetector,
+    ocr: Ocr,
+) -> None:
+    """Draw YOLO boxes, then LP + OCR on vehicle crops (mutates ``frame`` in place)."""
+    h, w = frame.shape[:2]
+
+    for det in detections:
+        try:
+            x1, y1, x2, y2 = map(int, det.bbox)
+        except Exception:
+            continue
+        bbox = clamp_bbox((x1, y1, x2, y2), w, h)
+        if bbox is None:
+            continue
+        x1, y1, x2, y2 = bbox
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(
+            frame,
+            f"{det.label} {det.confidence:.2f}",
+            (x1, max(0, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 255, 0),
+            2,
+        )
+
+    vehicles = [d for d in detections if d.label in VEHICLE_LABELS and d.confidence >= YOLO_CONFIDENCE]
+    for v in vehicles:
+        vb = clamp_bbox(v.bbox, w, h)
+        if vb is None:
+            continue
+        vx1, vy1, vx2, vy2 = vb
+
+        vehicle_crop = frame[vy1:vy2, vx1:vx2]
+        if vehicle_crop.size == 0:
+            continue
+
+        plates_per_frame = lp_detector.detect_plates([FrameData(0, 0.0, vehicle_crop)])
+        if not plates_per_frame:
+            continue
+        plates = plates_per_frame[0]
+
+        for plate in plates:
+            pbox = clamp_bbox(plate.bbox, vehicle_crop.shape[1], vehicle_crop.shape[0])
+            if pbox is None:
+                continue
+            px1, py1, px2, py2 = pbox
+            plate_crop = vehicle_crop[py1:py2, px1:px2]
+            if plate_crop.size == 0:
+                continue
+
+            try:
+                ocr_out = ocr.recognize([plate_crop])
+            except Exception as e:
+                console.print(f"[yellow]OCR error:[/] {str(e)}")
+                ocr_out = [("", 0.0)]
+
+            plate_text, plate_conf = ocr_out[0] if ocr_out else ("", 0.0)
+
+            if plate_conf < PLATE_CONFIDENCE:
+                continue
+
+            cv2.rectangle(frame, (vx1 + px1, vy1 + py1), (vx1 + px2, vy1 + py2), (255, 0, 0), 2)
+            label_str = f"{plate_text} {plate_conf:.2f}" if plate_text else f"{plate_conf:.2f}"
+            cv2.putText(
+                frame,
+                label_str,
+                (vx1 + px1, max(0, vy1 + py1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 0, 0),
+                2,
+            )
+
+
+def _annotate_frame(
+    frame,
+    trash_detections: Sequence[Detection],
+    yolo_detections: Sequence[Detection],
+    *,
+    lp_detector: LpDetector,
+    ocr: Ocr,
+) -> None:
+    _draw_trash_detections(frame, trash_detections)
+    _annotate_yolo_lp_ocr(frame, yolo_detections, lp_detector=lp_detector, ocr=ocr)
+
+
+def _run_pipeline_chunked(
+    *,
+    cap: cv2.VideoCapture,
+    out: cv2.VideoWriter,
+    fps: float,
+    total_frames: int,
+    chunk_frames: int,
+    yolo: YoloDetector,
+    lp_detector: LpDetector,
+    ocr: Ocr,
+    trash: RfDetrTrashDetector | None,
+    times: PipelineStepTimes,
+) -> None:
+    pbar = tqdm(total=total_frames, desc="Processing video")
+    frame_idx = 0
+    try:
+        while True:
+            chunk_frames_list: List[FrameData] = []
+            t_read = time.perf_counter()
+            for _ in range(chunk_frames):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                timestamp = frame_idx / fps
+                chunk_frames_list.append(FrameData(index=frame_idx, timestamp=timestamp, image=frame))
+                frame_idx += 1
+                pbar.update(1)
+            times.other_sec += time.perf_counter() - t_read
+
+            if not chunk_frames_list:
+                break
+
+            t0 = time.perf_counter()
+            detections_per_frame = yolo.detect(chunk_frames_list)
+            times.yolo_sec += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            if trash:
+                trash_per_frame = trash.detect_trash(chunk_frames_list)
+            else:
+                trash_per_frame = [[] for _ in chunk_frames_list]
+            times.trash_sec += time.perf_counter() - t0
+
+            n = min(len(chunk_frames_list), len(detections_per_frame), len(trash_per_frame))
+            if n == 0:
+                continue
+
+            for i in range(n):
+                frame_data = chunk_frames_list[i]
+                frame = frame_data.image
+                t0 = time.perf_counter()
+                _annotate_frame(
+                    frame,
+                    trash_per_frame[i],
+                    detections_per_frame[i],
+                    lp_detector=lp_detector,
+                    ocr=ocr,
+                )
+                times.annotate_sec += time.perf_counter() - t0
+                t0 = time.perf_counter()
+                out.write(frame)
+                times.video_write_sec += time.perf_counter() - t0
+
+        pbar.close()
+    finally:
+        try:
+            pbar.close()
+        except Exception:
+            pass
+
+
+def _run_pipeline_yolo_gated(
+    *,
+    cap: cv2.VideoCapture,
+    out: cv2.VideoWriter,
+    fps: float,
+    total_frames: int,
+    yolo: YoloDetector,
+    lp_detector: LpDetector,
+    ocr: Ocr,
+    gate: YoloStrideGate,
+    trash: RfDetrTrashDetector | None,
+    times: PipelineStepTimes,
+) -> None:
+    pbar = tqdm(total=total_frames, desc="Processing video (YOLO stride gate)")
+    frame_idx = 0
+    try:
+        while True:
+            t_read = time.perf_counter()
+            ret, frame = cap.read()
+            times.other_sec += time.perf_counter() - t_read
+            if not ret:
+                break
+
+            run_yolo = gate.should_run_yolo(frame_idx)
+            trash_dets: List[Detection] = []
+            if run_yolo:
+                fd = FrameData(index=frame_idx, timestamp=frame_idx / fps, image=frame)
+                t0 = time.perf_counter()
+                dets_list = yolo.detect([fd])
+                times.yolo_sec += time.perf_counter() - t0
+                detections = dets_list[0] if dets_list else []
+                gate.observe(frame_idx, _scene_has_activity(detections, YOLO_CONFIDENCE))
+                if trash:
+                    t0 = time.perf_counter()
+                    tlist = trash.detect_trash([fd])
+                    times.trash_sec += time.perf_counter() - t0
+                    trash_dets = list(tlist[0]) if tlist else []
+            else:
+                detections = []
+
+            t0 = time.perf_counter()
+            _annotate_frame(frame, trash_dets, detections, lp_detector=lp_detector, ocr=ocr)
+            times.annotate_sec += time.perf_counter() - t0
+            t0 = time.perf_counter()
+            out.write(frame)
+            times.video_write_sec += time.perf_counter() - t0
+
+            frame_idx += 1
+            pbar.update(1)
+
+        pbar.close()
+    finally:
+        try:
+            pbar.close()
+        except Exception:
+            pass
+
+
 def run_pipeline(video_path: str, output_video: str) -> None:
     """Process ``video_path`` and write annotated video to ``output_video``."""
+    wall_start = time.perf_counter()
+    times = PipelineStepTimes()
+
     if not os.path.exists(video_path):
         console.print(f"[red]Video not found:[/] {video_path}")
         sys.exit(2)
 
+    mode = GATE_MODE if GATE_MODE in ("off", "yolo") else "off"
+    if mode != GATE_MODE:
+        console.print(f"[yellow]Unknown GATE_MODE={GATE_MODE!r}; using 'off'[/]")
+
+    t0 = time.perf_counter()
     yolo = YoloDetector(conf_threshold=YOLO_CONFIDENCE)
     lp_detector = LpDetector()
     ocr = Ocr()
+    trash = _try_load_trash_detector()
+    times.init_sec = time.perf_counter() - t0
 
+    t_io = time.perf_counter()
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         console.print(f"[red]Failed to open video:[/] {video_path}")
@@ -62,10 +412,26 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
-    console.print(
-        f"[cyan]Loaded video[/] {video_path} ({width}x{height} @ {fps:.2f} FPS, {total_frames} frames);"
-        f" chunk={CHUNK_SECONDS}s -> {chunk_frames} frames"
-    )
+    if mode == "yolo":
+        dense_window_frames = max(1, int(fps * YOLO_DENSE_WINDOW_SEC))
+        console.print(
+            f"[cyan]Loaded video[/] {video_path} ({width}x{height} @ {fps:.2f} FPS, {total_frames} frames); "
+            f"GATE_MODE=yolo | coarse_stride={YOLO_COARSE_STRIDE} dense_stride={YOLO_DENSE_STRIDE} "
+            f"dense_window={dense_window_frames}f (~{YOLO_DENSE_WINDOW_SEC}s)"
+        )
+    else:
+        console.print(
+            f"[cyan]Loaded video[/] {video_path} ({width}x{height} @ {fps:.2f} FPS, {total_frames} frames); "
+            f"chunk={CHUNK_SECONDS}s -> {chunk_frames} frames | GATE_MODE=off"
+        )
+    if trash:
+        console.print("[cyan]RF-DETR trash/cigarette[/] enabled")
+    else:
+        console.print("[dim]RF-DETR trash[/] off (disabled or weights missing)")
+
+    out_dir = os.path.dirname(os.path.abspath(output_video))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     out = cv2.VideoWriter(
         output_video,
@@ -73,94 +439,46 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         fps,
         (width, height),
     )
-
-    pbar = tqdm(total=total_frames, desc="Processing video")
-    frame_idx = 0
+    times.other_sec += time.perf_counter() - t_io
 
     try:
-        while True:
-            chunk_frames_list = []
-            for _ in range(chunk_frames):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                timestamp = frame_idx / fps
-                chunk_frames_list.append(FrameData(index=frame_idx, timestamp=timestamp, image=frame))
-                frame_idx += 1
-                pbar.update(1)
+        if mode == "yolo":
+            t_gate = time.perf_counter()
+            dense_window_frames = max(1, int(fps * YOLO_DENSE_WINDOW_SEC))
+            stride_gate = YoloStrideGate(
+                YoloStrideGateConfig(
+                    coarse_stride=YOLO_COARSE_STRIDE,
+                    dense_stride=YOLO_DENSE_STRIDE,
+                    dense_window_frames=dense_window_frames,
+                )
+            )
+            times.other_sec += time.perf_counter() - t_gate
+            _run_pipeline_yolo_gated(
+                cap=cap,
+                out=out,
+                fps=float(fps),
+                total_frames=total_frames,
+                yolo=yolo,
+                lp_detector=lp_detector,
+                ocr=ocr,
+                gate=stride_gate,
+                trash=trash,
+                times=times,
+            )
+        else:
+            _run_pipeline_chunked(
+                cap=cap,
+                out=out,
+                fps=float(fps),
+                total_frames=total_frames,
+                chunk_frames=chunk_frames,
+                yolo=yolo,
+                lp_detector=lp_detector,
+                ocr=ocr,
+                trash=trash,
+                times=times,
+            )
 
-            if not chunk_frames_list:
-                break
-
-            detections_per_frame = yolo.detect(chunk_frames_list)
-
-            n = min(len(chunk_frames_list), len(detections_per_frame))
-            if n == 0:
-                continue
-
-            for i in range(n):
-                frame_data = chunk_frames_list[i]
-                frame = frame_data.image
-                h, w = frame.shape[:2]
-                detections = detections_per_frame[i]
-
-                for det in detections:
-                    try:
-                        x1, y1, x2, y2 = map(int, det.bbox)
-                    except Exception:
-                        continue
-                    bbox = clamp_bbox((x1, y1, x2, y2), w, h)
-                    if bbox is None:
-                        continue
-                    x1, y1, x2, y2 = bbox
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    cv2.putText(frame, f"{det.label} {det.confidence:.2f}", (x1, max(0, y1 - 10)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-                vehicles = [d for d in detections if d.label in VEHICLE_LABELS and d.confidence >= YOLO_CONFIDENCE]
-                for v in vehicles:
-                    vb = clamp_bbox(v.bbox, w, h)
-                    if vb is None:
-                        continue
-                    vx1, vy1, vx2, vy2 = vb
-
-                    vehicle_crop = frame[vy1:vy2, vx1:vx2]
-                    if vehicle_crop.size == 0:
-                        continue
-
-                    plates_per_frame = lp_detector.detect_plates([FrameData(0, 0.0, vehicle_crop)])
-                    if not plates_per_frame:
-                        continue
-                    plates = plates_per_frame[0]
-
-                    for plate in plates:
-                        pbox = clamp_bbox(plate.bbox, vehicle_crop.shape[1], vehicle_crop.shape[0])
-                        if pbox is None:
-                            continue
-                        px1, py1, px2, py2 = pbox
-                        plate_crop = vehicle_crop[py1:py2, px1:px2]
-                        if plate_crop.size == 0:
-                            continue
-
-                        try:
-                            ocr_out = ocr.recognize([plate_crop])
-                        except Exception as e:
-                            console.print(f"[yellow]OCR error:[/] {str(e)}")
-                            ocr_out = [("", 0.0)]
-
-                        plate_text, plate_conf = ocr_out[0] if ocr_out else ("", 0.0)
-
-                        if plate_conf < PLATE_CONFIDENCE:
-                            continue
-
-                        cv2.rectangle(frame, (vx1 + px1, vy1 + py1), (vx1 + px2, vy1 + py2), (255, 0, 0), 2)
-                        label_str = f"{plate_text} {plate_conf:.2f}" if plate_text else f"{plate_conf:.2f}"
-                        cv2.putText(frame, label_str, (vx1 + px1, max(0, vy1 + py1 - 10)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-
-                out.write(frame)
-
-        pbar.close()
         console.print(f"[green]Annotated video saved:[/] {output_video}")
 
     finally:
@@ -172,6 +490,9 @@ def run_pipeline(video_path: str, output_video: str) -> None:
             out.release()
         except Exception:
             pass
+
+    wall_total = time.perf_counter() - wall_start
+    times.print_summary(wall_total_sec=wall_total)
 
 
 if __name__ == "__main__":

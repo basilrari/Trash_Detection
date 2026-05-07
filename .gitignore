@@ -29,6 +29,12 @@ worker-python/weights/
 worker-python/weights/**
 !/worker-python/weights/.gitkeep    # optional: keep the folder itself if you want it to exist when cloning
 
+# Local media in inputs/ and generated videos in outputs/ (folders tracked via .gitkeep)
+worker-python/inputs/*
+!worker-python/inputs/.gitkeep
+worker-python/outputs/*
+!worker-python/outputs/.gitkeep
+
 # Other common large/generated folders you probably also want to ignore
 worker-python/runs/
 worker-python/logs/
@@ -51,3 +57,6 @@ worker-python/*.bin
 *.flv
 *.wmv
 *.webm
+
+# Nested reference project (not tracked in this repository)
+EnvironmentalLitterDetection/

@@ -8,19 +8,68 @@ This repository analyzes CCTV-style videos in chunks using computer-vision model
 
 The **Python** package under `worker-python/` streams a video, runs **YOLO** (people/vehicles), **license-plate YOLO** on vehicle crops, **PaddleOCR** on plate crops, and writes an **annotated MP4**.
 
-Planned extensions (from the original design): pose/behavior, litter (e.g. RFDETR), CSV export — not all are wired yet.
+Planned extensions (from the original design): pose/behavior, CSV export — not all are wired yet. **RF-DETR litter** is wired in `pipelines/test_pipeline.py` (red boxes) when weights and `rfdetr` are available.
 
 ## Running
 
-From `worker-python/` (with your GPU conda/env and weights in `worker-python/weights/`):
+From `worker-python/` (with your GPU conda/env and weights in `worker-python/weights/`).
+
+Put source videos in **`worker-python/inputs/`** (for example `inputs/Test.mp4`). Annotated results are written under **`worker-python/outputs/`** by default (`outputs/annotated.mp4`, or `outputs/<name>_annotated.mp4` when you pass a file on the CLI).
 
 ```bash
-# Defaults: VIDEO_PATH and OUTPUT_VIDEO in settings.py (or env VIDEO_PATH / OUTPUT_VIDEO)
+# Defaults: VIDEO_PATH / OUTPUT_VIDEO in settings.py (default inputs/Test.mp4 → outputs/annotated.mp4)
 python worker.py
 
-# Or pass paths on the command line
-python worker.py /path/to/video.mp4 -o /path/to/annotated.mp4
+# Or pass paths (still use inputs/ and outputs/ as a convention)
+python worker.py inputs/myvideo.mp4
+python worker.py inputs/myvideo.mp4 -o outputs/custom.mp4
+
+# CLI help includes gating flags (--gate, --yolo-coarse-stride, …)
+python worker.py --help
 ```
+
+### Gating (`GATE_MODE`)
+
+The **gate** is the rule that decides **how often** we run **YOLO** (and therefore LP/OCR, which need YOLO boxes). It keeps the default path simple while allowing a cheaper schedule.
+
+| Setting / env | Meaning |
+|---------------|--------|
+| **`GATE_MODE`** | **`off`** (default): no stride gate — within each time **chunk** (`CHUNK_SECONDS` in `settings.py`), YOLO runs on **every** frame in that chunk. **`yolo`**: use a **coarse / dense** schedule (YOLO-only; no MOG2). |
+| **`YOLO_COARSE_STRIDE`** | When we are **not** in a “dense attention” window, run YOLO only on frames where the index is a multiple of this value (e.g. **8** → frames 0, 8, 16, …). Larger = cheaper idle sampling; typical range **5–10**. |
+| **`YOLO_DENSE_STRIDE`** | After YOLO sees a **person** or **vehicle** (above `YOLO_CONFIDENCE`), we open a **dense window**: run YOLO every **this many** frames while that window is active. **`2`** = every **other** frame. |
+| **`YOLO_DENSE_WINDOW_SEC`** | How many **seconds** of video (timeline) the dense schedule stays on after a hit; converted to frames with FPS. New hits **extend** the window. |
+
+```bash
+# Turn on YOLO stride gating for this run (inline comments explain each export)
+export GATE_MODE=yolo                                    # use coarse/dense schedule, not full chunk YOLO
+export YOLO_COARSE_STRIDE=10                             # idle: YOLO at most every 10th frame
+export YOLO_DENSE_STRIDE=2                              # when busy: YOLO every 2nd frame (0,2,4,…)
+export YOLO_DENSE_WINDOW_SEC=5                           # stay “dense” for ~5s after a person/vehicle hit
+python worker.py inputs/myvideo.mp4 -o outputs/out.mp4
+
+# Same tuning via CLI flags (no exports); overrides apply before settings are read
+python worker.py --gate yolo \
+  --yolo-coarse-stride 10 \
+  --yolo-dense-stride 2 \
+  --yolo-dense-window-sec 5 \
+  inputs/myvideo.mp4 -o outputs/out.mp4
+```
+
+In code, see the module docstring at the top of **`worker-python/settings.py`**, **`worker-python/core/yolo_stride_gate.py`**, and the docstring at the top of **`worker-python/pipelines/test_pipeline.py`**.
+
+### RF-DETR trash (`TRASH_*`)
+
+Optional second detector (install `rfdetr`; see `worker-python/requirements.txt`). Place checkpoints under `worker-python/weights/` (`trash.pth`, optional `cigarette.pth`). **`RF_DETR_SIZE`** must match how those weights were trained (`nano` \| `small` \| `medium` \| `large`).
+
+| Setting / env | Meaning |
+|---------------|--------|
+| **`TRASH_ENABLED`** | **`1`** (default): try to load RF-DETR when weights exist. **`0`**: skip trash entirely. |
+| **`TRASH_WEIGHTS_PATH`** | Path to `trash.pth` (default: `weights/trash.pth`). |
+| **`CIGARETTE_WEIGHTS_PATH`** | Optional second head; merged if the file exists and differs from trash weights. |
+| **`TRASH_CONFIDENCE`** | Confidence threshold for trash boxes (default **0.4**). |
+| **`RF_DETR_SIZE`** | Model backbone size; must match checkpoints. |
+
+With **`GATE_MODE=yolo`**, trash runs on the same cadence as YOLO (coarse/dense). With **`GATE_MODE=off`**, trash runs on every frame in each chunk.
 
 Alternatively, using defaults from `settings.py` only:
 
@@ -32,12 +81,14 @@ python -m pipelines.test_pipeline
 
 ## Layout
 
+- `inputs/` — drop test / production clips here (tracked empty via `.gitkeep`; media files are gitignored)
+- `outputs/` — annotated videos written here by default
 - `worker.py` — CLI entrypoint
 - `settings.py` — default video paths, chunk size, confidence thresholds, optional `.env` via `python-dotenv` if installed
 - `pipelines/test_pipeline.py` — `run_pipeline(video_path, output_video)`
-- `models/` — YOLO, LP detector, OCR wrappers; `base.py` interfaces
-- `core/` — shared types and CSV helper (`writer.py`) for future use
-- `weights/` — place `yolo11x.pt`, `bestlicense.pt` here (see `.gitignore`)
+- `models/` — YOLO, LP detector, OCR, RF-DETR trash (`trash_detector.py`); `base.py` interfaces
+- `core/` — `types.py`, `writer.py`, `yolo_stride_gate.py` (optional YOLO coarse/dense scheduling)
+- `weights/` — place `yolo11x.pt`, `bestlicense.pt`, optional `trash.pth` / `cigarette.pth` (see `.gitignore`)
 
 ## Model weights and GPU
 
