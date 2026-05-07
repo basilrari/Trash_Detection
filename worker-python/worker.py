@@ -1,97 +1,55 @@
-# worker.py
+#!/usr/bin/env python3
+"""
+Local video pipeline entrypoint (YOLO → license plate → OCR → annotated video).
+
+  python worker.py                    # uses VIDEO_PATH / OUTPUT_VIDEO in settings.py
+  python worker.py clip.mp4           # input only; output name derived from input
+  python worker.py clip.mp4 -o out.mp4
+"""
+from __future__ import annotations
+
+import argparse
 import os
-import time
-import asyncio
-import signal
-from dotenv import load_dotenv
-from bullmq import Worker
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
-from rich.console import Console
-import torch
+from pathlib import Path
 
-load_dotenv()
+from settings import OUTPUT_VIDEO, VIDEO_PATH
 
-DATABASE_URL = os.getenv('DATABASE_URL')
-REDIS_URL = os.getenv('REDIS_URL')
 
-console = Console()
+def default_output_path(video_path: str) -> str:
+    p = Path(video_path)
+    return str(p.with_name(f"{p.stem}_annotated{p.suffix}"))
 
-# DB connection
-engine = create_engine(DATABASE_URL, connect_args={"sslmode": "require"})
-Session = sessionmaker(bind=engine)
 
-with Session() as session:
-    session.execute(text("SELECT 1"))
-console.print("Supabase connected")
-
-for i in range(torch.cuda.device_count()):
-    console.print(f"GPU {i}:", torch.cuda.get_device_name(i))
-
-# -------------------------------------------------
-async def process_job(job):
-    job_id = job.data["jobId"]
-    source_url = job.data["sourceUrl"]
-    console.print(f"[bold blue]Worker {os.getpid()} processing job {job_id}[/] → {source_url}")
-
-    # Mark as PROCESSING
-    with Session() as session:
-        session.execute(
-            text('UPDATE "Jobs" SET status = \'PROCESSING\', progress = 10 WHERE id = :id'),
-            {"id": job_id}
-        )
-        session.commit()
-
-    # Simulate heavy GPU work (replace with YOLO, etc.)
-    for i in range(1, 11):
-        time.sleep(2)
-        progress = 10 + i * 9
-        with Session() as session:
-            session.execute(
-                text('UPDATE "Jobs" SET progress = :p WHERE id = :id'),
-                {"p": progress, "id": job_id}
-            )
-            session.commit()
-
-    # Mark as DONE
-    fake_csv = f"https://example.com/results/{job_id}.csv"
-    with Session() as session:
-        session.execute(
-            text('UPDATE "Jobs" SET status = \'DONE\', progress = 100, "outputCsvUrl" = :csv WHERE id = :id'),
-            {"id": job_id, "csv": fake_csv}
-        )
-        session.commit()
-
-    console.print(f"[bold green]Job {job_id} DONE → {fake_csv}[/]")
-
-# -------------------------------------------------
-async def main():
-    # Create an event that will be triggered for shutdown
-    shutdown_event = asyncio.Event()
-
-    def signal_handler(sig, frame):
-        console.print("[yellow]Signal received, shutting down.[/]")
-        shutdown_event.set()
-
-    # Assign signal handlers to SIGTERM and SIGINT
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-
-    worker = Worker(
-        "videoJobs",
-        process_job,
-        {"connection": REDIS_URL}
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run YOLO + license-plate detector + OCR on a video file.",
     )
+    parser.add_argument(
+        "video",
+        nargs="?",
+        default=None,
+        help=f"Input video path (default: VIDEO_PATH in settings.py, currently {VIDEO_PATH!r})",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help=f"Annotated output video (default: OUTPUT_VIDEO in settings or <name>_annotated.mp4)",
+    )
+    args = parser.parse_args()
 
-    console.print("[bold magenta]Worker started – waiting for jobs (Ctrl+C to stop)[/]")
+    from pipelines.test_pipeline import run_pipeline
 
-    # Wait until the shutdown event is set
-    await shutdown_event.wait()
+    video_path = args.video or VIDEO_PATH
+    if not os.path.isfile(video_path):
+        raise SystemExit(f"Video not found: {video_path}")
 
-    # Close the worker
-    console.print("[yellow]Cleaning up worker...[/]")
-    await worker.close()
-    console.print("[green]Worker shut down successfully.[/]")
+    out_path = args.output
+    if out_path is None:
+        out_path = OUTPUT_VIDEO if args.video is None else default_output_path(video_path)
+
+    run_pipeline(video_path, out_path)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

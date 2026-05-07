@@ -1,17 +1,19 @@
 # worker-python/settings.py
-from dotenv import load_dotenv
 import os
 
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-DATABASE_URL = os.getenv('DATABASE_URL')
-REDIS_URL = os.getenv('REDIS_URL')
+# Default input/output when no CLI args are passed (edit here or use: python worker.py video.mp4 -o out.mp4)
+VIDEO_PATH = os.getenv("VIDEO_PATH", "Test.mp4")
+OUTPUT_VIDEO = os.getenv("OUTPUT_VIDEO", "output_with_boxes.mp4")
 
-# Add your chunk sizes, thresholds, model paths here
-# Config for chunking and thresholds (adjust as needed)
 CHUNK_SECONDS = 5
 YOLO_CONFIDENCE = 0.5
 PLATE_CONFIDENCE = 0.5
 
-LP_MODEL_PATH = 'path/to/lp_model.pt'
-RFDETR_MODEL_PATH = 'path/to/rfdetr.pt'
+LP_MODEL_PATH = "path/to/lp_model.pt"
+RFDETR_MODEL_PATH = "path/to/rfdetr.pt"

@@ -1,6 +1,5 @@
-# Node
+# Node (if you add a JS tool later)
 node_modules/
-backend-js/node_modules/
 
 # Python caches
 __pycache__/

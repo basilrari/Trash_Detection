@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-# worker-python/scripts/test_pipeline.py
 """
-Test pipeline: runs YOLO -> LP -> OCR on a local video, writes:
-video_name, timestamp, crime, vehicle_number
+YOLO → LP detector → OCR on a local video; writes an annotated MP4.
 
-Usage:
-    cd worker-python
-    python -m scripts.test_pipeline
+Run from worker-python/:
+
+  python worker.py
+  python worker.py myvideo.mp4 -o out.mp4
+  python -m pipelines.test_pipeline   # uses paths from settings.py
 """
 
 import os
@@ -17,15 +17,11 @@ from rich.console import Console
 
 from models.yolo_detector import YoloDetector
 from models.lp_detector import LpDetector
-from models.ocr import Ocr  # must return List[Tuple[str, float]] per crop
+from models.ocr import Ocr
 from core.types import FrameData
-from settings import CHUNK_SECONDS, YOLO_CONFIDENCE, PLATE_CONFIDENCE
+from settings import CHUNK_SECONDS, OUTPUT_VIDEO, PLATE_CONFIDENCE, VIDEO_PATH, YOLO_CONFIDENCE
 
 console = Console()
-
-# Config — edit if needed
-VIDEO_PATH = "Test.mp4"
-OUTPUT_VIDEO = "output_with_boxes.mp4"
 
 VEHICLE_LABELS = ("vehicle", "car", "truck", "bus", "motorbike", "motorcycle")
 
@@ -41,22 +37,19 @@ def clamp_bbox(bbox, w, h):
     return x1, y1, x2, y2
 
 
-def main() -> None:
-    if not os.path.exists(VIDEO_PATH):
-        console.print(f"[red]Video not found:[/] {VIDEO_PATH}")
+def run_pipeline(video_path: str, output_video: str) -> None:
+    """Process ``video_path`` and write annotated video to ``output_video``."""
+    if not os.path.exists(video_path):
+        console.print(f"[red]Video not found:[/] {video_path}")
         sys.exit(2)
 
-    video_name = os.path.basename(VIDEO_PATH)
-
-    # Initialize models
     yolo = YoloDetector(conf_threshold=YOLO_CONFIDENCE)
     lp_detector = LpDetector()
-    ocr = Ocr()  # GPU-based Ocr implementation as requested
+    ocr = Ocr()
 
-    # Open video
-    cap = cv2.VideoCapture(VIDEO_PATH)
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        console.print(f"[red]Failed to open video:[/] {VIDEO_PATH}")
+        console.print(f"[red]Failed to open video:[/] {video_path}")
         sys.exit(3)
 
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -70,13 +63,12 @@ def main() -> None:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
     console.print(
-        f"[cyan]Loaded video[/] {VIDEO_PATH} ({width}x{height} @ {fps:.2f} FPS, {total_frames} frames);"
+        f"[cyan]Loaded video[/] {video_path} ({width}x{height} @ {fps:.2f} FPS, {total_frames} frames);"
         f" chunk={CHUNK_SECONDS}s -> {chunk_frames} frames"
     )
 
-    # Output video writer (annotated visualization)
     out = cv2.VideoWriter(
-        OUTPUT_VIDEO,
+        output_video,
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
         (width, height),
@@ -87,7 +79,6 @@ def main() -> None:
 
     try:
         while True:
-            # Read a chunk of frames
             chunk_frames_list = []
             for _ in range(chunk_frames):
                 ret, frame = cap.read()
@@ -101,10 +92,8 @@ def main() -> None:
             if not chunk_frames_list:
                 break
 
-            # Run YOLO on the chunk
             detections_per_frame = yolo.detect(chunk_frames_list)
 
-            # Align safety
             n = min(len(chunk_frames_list), len(detections_per_frame))
             if n == 0:
                 continue
@@ -115,7 +104,6 @@ def main() -> None:
                 h, w = frame.shape[:2]
                 detections = detections_per_frame[i]
 
-                # Draw YOLO detections
                 for det in detections:
                     try:
                         x1, y1, x2, y2 = map(int, det.bbox)
@@ -129,7 +117,6 @@ def main() -> None:
                     cv2.putText(frame, f"{det.label} {det.confidence:.2f}", (x1, max(0, y1 - 10)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-                # Handle vehicles
                 vehicles = [d for d in detections if d.label in VEHICLE_LABELS and d.confidence >= YOLO_CONFIDENCE]
                 for v in vehicles:
                     vb = clamp_bbox(v.bbox, w, h)
@@ -137,7 +124,6 @@ def main() -> None:
                         continue
                     vx1, vy1, vx2, vy2 = vb
 
-                    # crop vehicle and detect plates
                     vehicle_crop = frame[vy1:vy2, vx1:vx2]
                     if vehicle_crop.size == 0:
                         continue
@@ -156,7 +142,6 @@ def main() -> None:
                         if plate_crop.size == 0:
                             continue
 
-                        # OCR — expects list of crops, returns list of (text, conf)
                         try:
                             ocr_out = ocr.recognize([plate_crop])
                         except Exception as e:
@@ -165,22 +150,18 @@ def main() -> None:
 
                         plate_text, plate_conf = ocr_out[0] if ocr_out else ("", 0.0)
 
-                        # Optional: filter low confidence
                         if plate_conf < PLATE_CONFIDENCE:
                             continue
 
-                        # draw plate box + text+confidence on frame (convert plate coords to full-frame)
                         cv2.rectangle(frame, (vx1 + px1, vy1 + py1), (vx1 + px2, vy1 + py2), (255, 0, 0), 2)
                         label_str = f"{plate_text} {plate_conf:.2f}" if plate_text else f"{plate_conf:.2f}"
                         cv2.putText(frame, label_str, (vx1 + px1, max(0, vy1 + py1 - 10)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
 
-                # Write annotated frame
                 out.write(frame)
 
-        # finalize
         pbar.close()
-        console.print(f"[green]Annotated video saved:[/] {OUTPUT_VIDEO}")
+        console.print(f"[green]Annotated video saved:[/] {output_video}")
 
     finally:
         try:
@@ -194,4 +175,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_pipeline(VIDEO_PATH, OUTPUT_VIDEO)
