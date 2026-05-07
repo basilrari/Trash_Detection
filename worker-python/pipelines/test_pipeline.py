@@ -22,9 +22,11 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Sequence
+from typing import TYPE_CHECKING, Any, List, Sequence
 
 import cv2
+import numpy as np
+import supervision as sv
 from tqdm import tqdm
 from rich.console import Console
 
@@ -82,6 +84,99 @@ VEHICLE_LABELS = ("vehicle", "car", "truck", "bus", "motorbike", "motorcycle")
 PERSON_LABELS = ("person",)
 
 
+@dataclass(frozen=True)
+class FrameAnnotators:
+    """Supervision draw stack for one video resolution (BGR OpenCV frames)."""
+
+    trash_box: Any
+    yolo_box: Any
+    plate_box: Any
+    trash_label: Any
+    yolo_label: Any
+    plate_label: Any
+
+
+def _make_frame_annotators(width: int, height: int) -> FrameAnnotators:
+    """Box / label sizing from supervision heuristics; trash head style (red) for trash + cigarette."""
+    wh = (int(width), int(height))
+    base_thickness = int(sv.calculate_optimal_line_thickness(resolution_wh=wh))
+    # Slightly thicker than half of the optimal line (still lighter than full default).
+    line_thickness = max(2, (base_thickness * 2 + 2) // 3)
+
+    base_text_scale = float(sv.calculate_optimal_text_scale(resolution_wh=wh))
+    # A bit smaller than the previous 2× bump; stroke below makes labels read bolder.
+    text_scale = max(0.45, base_text_scale * 1.4)
+
+    # Bolder glyph stroke than the box lines (independent of line_thickness).
+    text_thickness = max(2, line_thickness + 1)
+    lookup = sv.ColorLookup.INDEX
+
+    trash_box = sv.BoxAnnotator(color=sv.Color.RED, thickness=line_thickness, color_lookup=lookup)
+    yolo_box = sv.BoxAnnotator(color=sv.Color.GREEN, thickness=line_thickness, color_lookup=lookup)
+    plate_box = sv.BoxAnnotator(color=sv.Color.BLUE, thickness=line_thickness, color_lookup=lookup)
+
+    trash_label = sv.LabelAnnotator(
+        color=sv.Color.RED,
+        text_color=sv.Color.BLACK,
+        text_scale=text_scale,
+        text_thickness=text_thickness,
+        smart_position=True,
+        color_lookup=lookup,
+    )
+    yolo_label = sv.LabelAnnotator(
+        color=sv.Color.GREEN,
+        text_color=sv.Color.BLACK,
+        text_scale=text_scale,
+        text_thickness=text_thickness,
+        smart_position=True,
+        color_lookup=lookup,
+    )
+    plate_label = sv.LabelAnnotator(
+        color=sv.Color.BLUE,
+        text_color=sv.Color.BLACK,
+        text_scale=text_scale,
+        text_thickness=text_thickness,
+        smart_position=True,
+        color_lookup=lookup,
+    )
+    return FrameAnnotators(
+        trash_box=trash_box,
+        yolo_box=yolo_box,
+        plate_box=plate_box,
+        trash_label=trash_label,
+        yolo_label=yolo_label,
+        plate_label=plate_label,
+    )
+
+
+def _detections_to_sv(
+    detections: Sequence[Detection], width: int, height: int
+) -> tuple[sv.Detections, list[str]]:
+    """Clamp boxes to frame and build supervision Detections + label strings."""
+    xyxy_list: list[list[float]] = []
+    conf_list: list[float] = []
+    labels: list[str] = []
+    for det in detections:
+        try:
+            x1, y1, x2, y2 = map(float, det.bbox)
+        except Exception:
+            continue
+        bbox = clamp_bbox((int(x1), int(y1), int(x2), int(y2)), width, height)
+        if bbox is None:
+            continue
+        x1, y1, x2, y2 = bbox
+        xyxy_list.append([float(x1), float(y1), float(x2), float(y2)])
+        conf_list.append(float(det.confidence))
+        labels.append(f"{det.label} {det.confidence:.2f}")
+    if not xyxy_list:
+        empty = np.zeros((0, 4), dtype=np.float32)
+        return sv.Detections(xyxy=empty), []
+    xyxy = np.asarray(xyxy_list, dtype=np.float32)
+    conf = np.asarray(conf_list, dtype=np.float32)
+    class_id = np.zeros(len(conf_list), dtype=np.int64)
+    return sv.Detections(xyxy=xyxy, confidence=conf, class_id=class_id), labels
+
+
 def _load_trash_detector_required() -> "RfDetrTrashDetector":
     """Load both RF-DETR heads; exit if ``rfdetr`` or either weights file is missing."""
     tw = Path(TRASH_WEIGHTS_PATH)
@@ -89,13 +184,13 @@ def _load_trash_detector_required() -> "RfDetrTrashDetector":
     if not tw.is_file():
         console.print(
             f"[red]RF-DETR is required but trash weights not found:[/] {tw}\n"
-            f"Set TRASH_WEIGHTS_PATH or place trash.pth under worker-python/weights/."
+            "Place your checkpoint at worker-python/weights/trash.pth."
         )
         raise SystemExit(2)
     if not cig.is_file():
         console.print(
             f"[red]RF-DETR is required but cigarette weights not found:[/] {cig}\n"
-            f"Set CIGARETTE_WEIGHTS_PATH or place cigarette.pth under worker-python/weights/."
+            "Place your checkpoint at worker-python/weights/cigarette.pth."
         )
         raise SystemExit(2)
     if tw.resolve() == cig.resolve():
@@ -144,28 +239,18 @@ def clamp_bbox(bbox, w, h):
     return x1, y1, x2, y2
 
 
-def _draw_trash_detections(frame, trash_detections: Sequence[Detection]) -> None:
-    """Draw RF-DETR boxes in red (BGR) under YOLO."""
+def _draw_trash_detections(
+    frame,
+    trash_detections: Sequence[Detection],
+    annots: FrameAnnotators,
+) -> None:
+    """Draw RF-DETR trash + cigarette in red (same trash head style)."""
     h, w = frame.shape[:2]
-    for det in trash_detections:
-        try:
-            x1, y1, x2, y2 = map(int, det.bbox)
-        except Exception:
-            continue
-        bbox = clamp_bbox((x1, y1, x2, y2), w, h)
-        if bbox is None:
-            continue
-        x1, y1, x2, y2 = bbox
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-        cv2.putText(
-            frame,
-            f"{det.label} {det.confidence:.2f}",
-            (x1, max(0, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 0, 255),
-            2,
-        )
+    sv_dets, labels = _detections_to_sv(trash_detections, w, h)
+    if not labels:
+        return
+    annots.trash_box.annotate(frame, sv_dets)
+    annots.trash_label.annotate(frame, sv_dets, labels=labels)
 
 
 def _annotate_yolo_lp_ocr(
@@ -174,29 +259,15 @@ def _annotate_yolo_lp_ocr(
     *,
     lp_detector: LpDetector,
     ocr: Ocr,
+    annots: FrameAnnotators,
 ) -> None:
     """Draw YOLO boxes, then LP + OCR on vehicle crops (mutates ``frame`` in place)."""
     h, w = frame.shape[:2]
 
-    for det in detections:
-        try:
-            x1, y1, x2, y2 = map(int, det.bbox)
-        except Exception:
-            continue
-        bbox = clamp_bbox((x1, y1, x2, y2), w, h)
-        if bbox is None:
-            continue
-        x1, y1, x2, y2 = bbox
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(
-            frame,
-            f"{det.label} {det.confidence:.2f}",
-            (x1, max(0, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            2,
-        )
+    yolo_dets, yolo_labels = _detections_to_sv(detections, w, h)
+    if yolo_labels:
+        annots.yolo_box.annotate(frame, yolo_dets)
+        annots.yolo_label.annotate(frame, yolo_dets, labels=yolo_labels)
 
     vehicles = [d for d in detections if d.label in VEHICLE_LABELS and d.confidence >= YOLO_CONFIDENCE]
     for v in vehicles:
@@ -214,6 +285,9 @@ def _annotate_yolo_lp_ocr(
             continue
         plates = plates_per_frame[0]
 
+        plate_rows: list[list[float]] = []
+        plate_confs: list[float] = []
+        plate_label_strs: list[str] = []
         for plate in plates:
             pbox = clamp_bbox(plate.bbox, vehicle_crop.shape[1], vehicle_crop.shape[0])
             if pbox is None:
@@ -234,17 +308,23 @@ def _annotate_yolo_lp_ocr(
             if plate_conf < PLATE_CONFIDENCE:
                 continue
 
-            cv2.rectangle(frame, (vx1 + px1, vy1 + py1), (vx1 + px2, vy1 + py2), (255, 0, 0), 2)
+            gx1, gy1, gx2, gy2 = vx1 + px1, vy1 + py1, vx1 + px2, vy1 + py2
+            gbox = clamp_bbox((gx1, gy1, gx2, gy2), w, h)
+            if gbox is None:
+                continue
+            gx1, gy1, gx2, gy2 = gbox
+            plate_rows.append([float(gx1), float(gy1), float(gx2), float(gy2)])
+            plate_confs.append(float(plate_conf))
             label_str = f"{plate_text} {plate_conf:.2f}" if plate_text else f"{plate_conf:.2f}"
-            cv2.putText(
-                frame,
-                label_str,
-                (vx1 + px1, max(0, vy1 + py1 - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 0, 0),
-                2,
-            )
+            plate_label_strs.append(label_str)
+
+        if plate_rows:
+            p_xyxy = np.asarray(plate_rows, dtype=np.float32)
+            p_conf = np.asarray(plate_confs, dtype=np.float32)
+            p_cls = np.zeros(len(plate_rows), dtype=np.int64)
+            p_dets = sv.Detections(xyxy=p_xyxy, confidence=p_conf, class_id=p_cls)
+            annots.plate_box.annotate(frame, p_dets)
+            annots.plate_label.annotate(frame, p_dets, labels=plate_label_strs)
 
 
 def _annotate_frame(
@@ -254,9 +334,10 @@ def _annotate_frame(
     *,
     lp_detector: LpDetector,
     ocr: Ocr,
+    annots: FrameAnnotators,
 ) -> None:
-    _draw_trash_detections(frame, trash_detections)
-    _annotate_yolo_lp_ocr(frame, yolo_detections, lp_detector=lp_detector, ocr=ocr)
+    _draw_trash_detections(frame, trash_detections, annots)
+    _annotate_yolo_lp_ocr(frame, yolo_detections, lp_detector=lp_detector, ocr=ocr, annots=annots)
 
 
 def _run_pipeline_chunked(
@@ -271,6 +352,7 @@ def _run_pipeline_chunked(
     ocr: Ocr,
     trash: "RfDetrTrashDetector",
     times: PipelineStepTimes,
+    annots: FrameAnnotators,
 ) -> None:
     pbar = tqdm(total=total_frames, desc="Processing video")
     frame_idx = 0
@@ -312,6 +394,7 @@ def _run_pipeline_chunked(
                     detections_per_frame[i],
                     lp_detector=lp_detector,
                     ocr=ocr,
+                    annots=annots,
                 )
                 times.annotate_sec += time.perf_counter() - t0
                 t0 = time.perf_counter()
@@ -338,6 +421,7 @@ def _run_pipeline_yolo_gated(
     gate: YoloStrideGate,
     trash: "RfDetrTrashDetector",
     times: PipelineStepTimes,
+    annots: FrameAnnotators,
 ) -> None:
     pbar = tqdm(total=total_frames, desc="Processing video (YOLO stride gate)")
     frame_idx = 0
@@ -366,7 +450,7 @@ def _run_pipeline_yolo_gated(
                 detections = []
 
             t0 = time.perf_counter()
-            _annotate_frame(frame, trash_dets, detections, lp_detector=lp_detector, ocr=ocr)
+            _annotate_frame(frame, trash_dets, detections, lp_detector=lp_detector, ocr=ocr, annots=annots)
             times.annotate_sec += time.perf_counter() - t0
             t0 = time.perf_counter()
             out.write(frame)
@@ -432,6 +516,8 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         )
     console.print("[cyan]RF-DETR trash/cigarette[/] loaded (required)")
 
+    annots = _make_frame_annotators(width, height)
+
     out_dir = os.path.dirname(os.path.abspath(output_video))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -466,6 +552,7 @@ def run_pipeline(video_path: str, output_video: str) -> None:
                 gate=stride_gate,
                 trash=trash,
                 times=times,
+                annots=annots,
             )
         else:
             _run_pipeline_chunked(
@@ -479,6 +566,7 @@ def run_pipeline(video_path: str, output_video: str) -> None:
                 ocr=ocr,
                 trash=trash,
                 times=times,
+                annots=annots,
             )
 
         console.print(f"[green]Annotated video saved:[/] {output_video}")

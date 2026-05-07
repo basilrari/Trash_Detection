@@ -63,10 +63,9 @@ YOLO_DENSE_STRIDE = int(os.getenv("YOLO_DENSE_STRIDE", "2"))
 YOLO_DENSE_IDLE_MISS_STREAK = max(1, int(os.getenv("YOLO_DENSE_IDLE_MISS_STREAK", "10")))
 
 # --- RF-DETR trash / cigarette (required; ``pip install rfdetr``) ---
-TRASH_WEIGHTS_PATH = os.getenv("TRASH_WEIGHTS_PATH", str(Path(__file__).resolve().parent / "weights" / "trash.pth"))
-CIGARETTE_WEIGHTS_PATH = os.getenv(
-    "CIGARETTE_WEIGHTS_PATH", str(Path(__file__).resolve().parent / "weights" / "cigarette.pth")
-)
+# Fixed local checkpoints only (no path override): worker-python/weights/{trash,cigarette}.pth
+TRASH_WEIGHTS_PATH = str(Path(__file__).resolve().parent / "weights" / "trash.pth")
+CIGARETTE_WEIGHTS_PATH = str(Path(__file__).resolve().parent / "weights" / "cigarette.pth")
 TRASH_CONFIDENCE = float(os.getenv("TRASH_CONFIDENCE", "0.4"))
 
 
