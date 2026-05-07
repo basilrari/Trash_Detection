@@ -63,7 +63,7 @@ In code, see the module docstring at the top of **`worker-python/settings.py`**,
 
 ### RF-DETR trash (required)
 
-**RF-DETR is required** for `worker.py` / `run_pipeline`: install `rfdetr` (`worker-python/requirements.txt`), place **`trash.pth`** under `worker-python/weights/` (or set `TRASH_WEIGHTS_PATH`). Optional second head: `cigarette.pth`. **`RF_DETR_SIZE`** picks the model family (`nano` \| `small` \| `medium` \| `large`); training hyperparameters stored in the checkpoint `args` (for example `patch_size`, `resolution`, `num_classes`) are merged into the constructor when they match that family’s config—so fine-tuned weights from Roboflow usually load without extra flags. If load still fails, set overrides below. If `rfdetr` or weights are missing, the process exits with an error.
+**RF-DETR is required** for `worker.py` / `run_pipeline`: install `rfdetr` (`worker-python/requirements.txt`), place **`trash.pth`** under `worker-python/weights/` (or set `TRASH_WEIGHTS_PATH`). Optional second head: `cigarette.pth`. **`RF_DETR_SIZE`** picks the model family (`nano` \| `small` \| `medium` \| `large`). Checkpoint ``args`` are merged when present; if backbone ``position_embeddings`` imply a square patch grid (e.g. 1370 tokens → PE side 37), **`positional_encoding_size`** and **`resolution`** are aligned automatically unless you set the `RF_DETR_*` overrides below. If `rfdetr` or weights are missing, the process exits with an error.
 
 | Setting / env | Meaning |
 |---------------|--------|
@@ -71,10 +71,10 @@ In code, see the module docstring at the top of **`worker-python/settings.py`**,
 | **`CIGARETTE_WEIGHTS_PATH`** | Optional second head; merged if the file exists and differs from trash weights. |
 | **`TRASH_CONFIDENCE`** | Confidence threshold for trash boxes (default **0.4**). |
 | **`RF_DETR_SIZE`** | Model family (`nano` \| `small` \| `medium` \| `large`). |
-| **`RF_DETR_PATCH_SIZE`** | Optional override (integer) when the checkpoint does not carry `args.patch_size`. |
+| **`RF_DETR_PATCH_SIZE`** | Optional override when checkpoint metadata is incomplete. |
 | **`RF_DETR_NUM_CLASSES`** | Optional override; use **`1`** for a single-class detector to silence class-count warnings. |
-| **`RF_DETR_RESOLUTION`** | Optional override for input resolution. |
-| **`RF_DETR_POSITIONAL_ENCODING_SIZE`** | Optional override; otherwise derived as `resolution // patch_size` when both are known. |
+| **`RF_DETR_RESOLUTION`** | Optional override for detector/backbone input size. |
+| **`RF_DETR_POSITIONAL_ENCODING_SIZE`** | Optional override (PE side); auto-inferred from weights when omitted. |
 
 With **`GATE_MODE=yolo`** (default), trash runs on the same cadence as YOLO (coarse/dense). With **`GATE_MODE=off`**, trash runs on every frame in each chunk.
 

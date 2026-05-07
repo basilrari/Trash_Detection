@@ -29,7 +29,9 @@ RF-DETR trash is **required** for the pipeline: install ``rfdetr``, place ``weig
 
 Fine-tuned checkpoints often store training ``args`` (``patch_size``, ``resolution``,
 ``num_classes``, …). Those are merged into the RF-DETR constructor when compatible with
-the chosen size class. Optional overrides: ``RF_DETR_PATCH_SIZE``, ``RF_DETR_NUM_CLASSES``,
+the chosen size class. If ``args`` omit backbone geometry, ``positional_encoding_size`` and
+``resolution`` are inferred from the saved ``position_embeddings`` tensor when the patch grid
+is square. Optional overrides: ``RF_DETR_PATCH_SIZE``, ``RF_DETR_NUM_CLASSES``,
 ``RF_DETR_RESOLUTION``, ``RF_DETR_POSITIONAL_ENCODING_SIZE`` (integers; unset = do not override).
 """
 import os

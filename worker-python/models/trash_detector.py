@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
@@ -21,19 +22,22 @@ def _ckpt_get(args_obj: Any, key: str) -> Any:
     return getattr(args_obj, key, None)
 
 
-def _rfdetr_kwargs_from_checkpoint(weights_path: str, cfg_class: type[Any]) -> Dict[str, Any]:
-    """Pull constructor kwargs from ``checkpoint['args']`` that exist on the model config class."""
-    allowed = frozenset(cfg_class.model_fields.keys()) - {"pretrain_weights"}
+def _load_checkpoint_dict(weights_path: str) -> Dict[str, Any] | None:
     p = Path(weights_path)
     if not p.is_file():
-        return {}
+        return None
     try:
         try:
-            ckpt = torch.load(str(p), map_location="cpu", weights_only=False)
+            return torch.load(str(p), map_location="cpu", weights_only=False)
         except TypeError:
-            ckpt = torch.load(str(p), map_location="cpu")
+            return torch.load(str(p), map_location="cpu")
     except Exception:
-        return {}
+        return None
+
+
+def _rfdetr_kwargs_from_ckpt_data(ckpt: Dict[str, Any], cfg_class: type[Any]) -> Dict[str, Any]:
+    """Pull constructor kwargs from ``checkpoint['args']`` that exist on the model config class."""
+    allowed = frozenset(cfg_class.model_fields.keys()) - {"pretrain_weights"}
     raw_args = ckpt.get("args")
     out: Dict[str, Any] = {}
     for key in allowed:
@@ -44,7 +48,38 @@ def _rfdetr_kwargs_from_checkpoint(weights_path: str, cfg_class: type[Any]) -> D
     return out
 
 
-def _manual_rfdetr_overrides() -> Dict[str, Any]:
+def _infer_pe_side_from_position_embeddings(ckpt: Dict[str, Any]) -> int | None:
+    """Infer ``positional_encoding_size`` (square grid side) from backbone ``position_embeddings`` shape.
+
+    RF-DETR windowed ViT uses ``num_patches = side * side`` patch tokens plus one class token.
+    ``positional_encoding_size`` in config satisfies ``implied_resolution = PE * patch_size`` and
+    ``num_patches = PE ** 2`` when the grid is square — see ``rfdetr`` ``dinov2.py`` (``implied_resolution``).
+    """
+    model = ckpt.get("model")
+    if not isinstance(model, dict):
+        return None
+    for _key, tensor in model.items():
+        if "position_embeddings" not in _key or not isinstance(tensor, torch.Tensor):
+            continue
+        if tensor.dim() != 3:
+            continue
+        seq_len = int(tensor.shape[1])
+        n_patch = seq_len - 1
+        if n_patch < 1:
+            continue
+        side = int(round(math.sqrt(n_patch)))
+        if side * side == n_patch:
+            return side
+    return None
+
+
+def _default_patch_size(cfg_class: type[Any]) -> int:
+    field = cfg_class.model_fields.get("patch_size")
+    d = getattr(field, "default", None) if field is not None else None
+    return int(d) if isinstance(d, int) else 16
+
+
+def _manual_rfdetr_overrides() -> tuple[Dict[str, Any], frozenset[str]]:
     from settings import (
         RF_DETR_NUM_CLASSES,
         RF_DETR_PATCH_SIZE,
@@ -61,7 +96,7 @@ def _manual_rfdetr_overrides() -> Dict[str, Any]:
         out["resolution"] = RF_DETR_RESOLUTION
     if RF_DETR_POSITIONAL_ENCODING_SIZE is not None:
         out["positional_encoding_size"] = RF_DETR_POSITIONAL_ENCODING_SIZE
-    return out
+    return out, frozenset(out.keys())
 
 
 def _sv_to_detections(
@@ -122,9 +157,20 @@ def _build_rfdetr(model_size: str, weights_path: str) -> Any:
     ctor = table.get(size, RFDETRMedium)
     cfg_class = ctor._model_config_class
 
-    merged: Dict[str, Any] = dict(_rfdetr_kwargs_from_checkpoint(weights_path, cfg_class))
-    merged.update(_manual_rfdetr_overrides())
-    _ensure_positional_encoding_size(merged)
+    ckpt = _load_checkpoint_dict(weights_path) or {}
+    merged: Dict[str, Any] = dict(_rfdetr_kwargs_from_ckpt_data(ckpt, cfg_class))
+    manual, manual_keys = _manual_rfdetr_overrides()
+    merged.update(manual)
+
+    inferred_side = _infer_pe_side_from_position_embeddings(ckpt) if ckpt else None
+    if inferred_side is not None and "positional_encoding_size" not in manual_keys:
+        ps = int(merged["patch_size"]) if merged.get("patch_size") is not None else _default_patch_size(cfg_class)
+        merged["positional_encoding_size"] = inferred_side
+        if "resolution" not in manual_keys:
+            merged["resolution"] = inferred_side * ps
+    else:
+        _ensure_positional_encoding_size(merged)
+
     merged["pretrain_weights"] = str(weights_path)
     return ctor(**merged)
 
