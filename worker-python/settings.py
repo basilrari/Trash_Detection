@@ -92,6 +92,7 @@ PEEING_PELVIC_BAND_Y_BELOW = float(os.getenv("PEEING_PELVIC_BAND_Y_BELOW", "0.17
 PEEING_STANDING_Y_MARGIN = float(os.getenv("PEEING_STANDING_Y_MARGIN", "0.03"))
 PEEING_EMA_ALPHA = float(os.getenv("PEEING_EMA_ALPHA", "0.4"))
 PEEING_ACTIVE_THRESHOLD = float(os.getenv("PEEING_ACTIVE_THRESHOLD", "0.62"))
+# Clear pose focus boxes when EMA falls below this (softer than active_threshold).
 PEEING_EMA_RELEASE_THRESHOLD = float(os.getenv("PEEING_EMA_RELEASE_THRESHOLD", "0.44"))
 # Seconds of video time with EMA >= PEEING_ACTIVE_THRESHOLD before PEEING UI / edges turn on.
 PEEING_MIN_ACTIVE_DURATION_SEC = float(os.getenv("PEEING_MIN_ACTIVE_DURATION_SEC", "5.0"))
