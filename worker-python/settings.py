@@ -96,8 +96,16 @@ PEEING_WINDOW_SEC = float(
 )
 # Instant pose score on a sample counts as a "match" if >= this (0–1).
 PEEING_POSE_MATCH_THRESHOLD = float(os.getenv("PEEING_POSE_MATCH_THRESHOLD", "0.6"))
-# Fraction of pose samples in the window that must be matches (strictly greater than this value).
-PEEING_MATCH_HIT_FRACTION = float(os.getenv("PEEING_MATCH_HIT_FRACTION", "0.6"))
+# Sliding-window alarm hysteresis: enter when hit fraction **>** this (with min samples below).
+PEEING_ALARM_ENTER_HIT_FRACTION = float(
+    os.getenv("PEEING_ALARM_ENTER_HIT_FRACTION", "0.65")
+)
+# While armed, stay armed until hit fraction drops **below** this (>= holds on at equality).
+PEEING_ALARM_EXIT_HIT_FRACTION = float(
+    os.getenv("PEEING_ALARM_EXIT_HIT_FRACTION", "0.45")
+)
+# Minimum pose samples in a full-length window before the enter rule may arm.
+PEEING_ALARM_MIN_SAMPLES = max(1, int(os.getenv("PEEING_ALARM_MIN_SAMPLES", "13")))
 PEEING_SQUAT_HIP_KNEE_GAP_MAX = float(os.getenv("PEEING_SQUAT_HIP_KNEE_GAP_MAX", "0.09"))
 PEEING_SQUAT_DEPTH_SCALE = float(os.getenv("PEEING_SQUAT_DEPTH_SCALE", "0.11"))
 PEEING_POSE_MODEL_PATH = os.getenv(

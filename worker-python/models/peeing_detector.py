@@ -6,9 +6,10 @@ instant score in that frame is recorded (no per-person IDs or tracking).
 **Standing** — wrist proximity to hips / pelvic band. **Squat** — hip–knee depth (same
 ``PEEING`` label). **Straddle** penalty reduces motorbike / wide stance false positives.
 
-**Alarm**: over the last ``window_sec`` seconds of pose samples, **more than**
-``match_hit_fraction`` of those samples must have instant pose score ≥
-``pose_match_threshold`` (defaults: 5s, **strictly** >60% of samples, score ≥ 0.6).
+**Alarm**: over the last ``window_sec`` seconds of pose samples, hysteresis on
+hit rate: arm when fraction **>** ``alarm_enter_hit_fraction`` with at least
+``alarm_min_samples`` samples; disarm when fraction **<** ``alarm_exit_hit_fraction``.
+Defaults: 5 s window, **>**65% to enter, **≥**45% to hold, **≥**13 samples to enter.
 
 Requires the MediaPipe **Tasks** bundle (``pose_landmarker_*.task``). If the file at
 ``model_path`` is missing, it is downloaded once from ``model_url`` (see settings).
@@ -21,7 +22,7 @@ import urllib.request
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Deque, List, Optional, Sequence, Tuple
+from typing import Any, Deque, List, Literal, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -37,6 +38,9 @@ PERSON_LABELS = ("person",)
 OverlayLandmarks = Tuple[Tuple[NormalizedLandmark, ...], ...]
 
 
+PeeingDisplayStatus = Literal["confirmed", "suspected", "unsure"]
+
+
 @dataclass(frozen=True)
 class PeeingState:
     """Latest peeing heuristic output for overlay / logging.
@@ -44,12 +48,17 @@ class PeeingState:
     ``score`` is the fraction of pose samples in the current window that are hits
     (only meaningful once the window is full). ``frame_match`` is the latest instant
     pose score when ``sampled`` is True.
+
+    ``status`` is a coarse UI tier (all algorithmic, not human verification):
+    ``confirmed`` = sliding-window alarm latched on; ``suspected`` = elevated hit
+    rate or partial window trending up; ``unsure`` = weak or insufficient evidence.
     """
 
     active: bool
     score: float
     sampled: bool
     frame_match: float
+    status: PeeingDisplayStatus
     overlay_landmarks: OverlayLandmarks
     edge_enter: bool
     edge_exit: bool
@@ -84,7 +93,9 @@ class PeeingDetector:
         standing_y_margin: float = 0.03,
         window_sec: float = 5.0,
         pose_match_threshold: float = 0.6,
-        match_hit_fraction: float = 0.6,
+        alarm_enter_hit_fraction: float = 0.65,
+        alarm_exit_hit_fraction: float = 0.45,
+        alarm_min_samples: int = 13,
         min_crop_side: int = 48,
         model_path: str | None = None,
         model_url: str | None = None,
@@ -106,9 +117,15 @@ class PeeingDetector:
         self.standing_y_margin = float(standing_y_margin)
         self.window_sec = float(max(1e-6, window_sec))
         self.pose_match_threshold = float(pose_match_threshold)
-        self.match_hit_fraction = float(
-            max(0.0, min(1.0, match_hit_fraction))
+        self.alarm_enter_hit_fraction = float(
+            max(0.0, min(1.0, alarm_enter_hit_fraction))
         )
+        self.alarm_exit_hit_fraction = float(
+            max(0.0, min(1.0, alarm_exit_hit_fraction))
+        )
+        if self.alarm_exit_hit_fraction > self.alarm_enter_hit_fraction - 1e-6:
+            self.alarm_exit_hit_fraction = max(0.0, self.alarm_enter_hit_fraction - 0.05)
+        self.alarm_min_samples = int(max(1, alarm_min_samples))
         self.min_crop_side = int(min_crop_side)
         self.squat_hip_knee_gap_max = float(squat_hip_knee_gap_max)
         self.squat_depth_scale = float(max(1e-6, squat_depth_scale))
@@ -503,23 +520,74 @@ class PeeingDetector:
             reports.append(rec)
         return reports
 
+    def pose_full_frame_landmarks_for_person(
+        self,
+        frame_bgr: np.ndarray,
+        det: Detection,
+    ) -> tuple[Tuple[NormalizedLandmark, ...] | None, tuple[int, int, int, int] | None]:
+        """Run pose on ``det``'s padded crop; return landmarks in **full-frame** normalized coords."""
+        h, w = frame_bgr.shape[:2]
+        box = self._clamp_crop(det.bbox, w, h)
+        if box is None:
+            return None, None
+        x1, y1, x2, y2 = box
+        crop = frame_bgr[y1:y2, x1:x2]
+        _score, lms, *_ = self._pose_on_crop(crop)
+        if not lms:
+            return None, box
+        ovl = self._to_full_frame_landmarks(lms, x1, y1, x2, y2, w, h)
+        return ovl, box
+
     def _trim_pose_samples(self, timestamp_sec: float) -> None:
         t_cut = float(timestamp_sec) - self.window_sec
         while self._pose_samples and self._pose_samples[0][0] < t_cut:
             self._pose_samples.popleft()
 
-    def _window_active(self, timestamp_sec: float) -> tuple[bool, float]:
+    def _window_active(
+        self, timestamp_sec: float
+    ) -> tuple[bool, float, bool, int]:
+        """Return ``(alarm_active, hit_fraction, span_full, sample_count)``."""
         self._trim_pose_samples(timestamp_sec)
         if not self._pose_samples:
-            return False, 0.0
+            return False, 0.0, False, 0
         oldest = self._pose_samples[0][0]
-        if float(timestamp_sec) - oldest < self.window_sec - 1e-9:
-            return False, 0.0
+        span_ok = (float(timestamp_sec) - oldest) >= self.window_sec - 1e-9
         total = len(self._pose_samples)
         hits = sum(1 for _, ok in self._pose_samples if ok)
-        frac = hits / total
-        active = frac > self.match_hit_fraction + 1e-12
-        return active, float(frac)
+        frac = hits / total if total else 0.0
+        if not span_ok:
+            return False, float(frac), False, total
+
+        prev = self._last_display_active
+        if not prev:
+            active = (total >= self.alarm_min_samples) and (
+                frac > self.alarm_enter_hit_fraction + 1e-12
+            )
+        else:
+            active = frac >= self.alarm_exit_hit_fraction - 1e-12
+        return active, float(frac), True, total
+
+    def _display_status(
+        self,
+        *,
+        display_active: bool,
+        hit_frac: float,
+        span_ok: bool,
+        n_samples: int,
+    ) -> PeeingDisplayStatus:
+        if display_active:
+            return "confirmed"
+        if n_samples <= 0:
+            return "unsure"
+        ex = self.alarm_exit_hit_fraction
+        en = self.alarm_enter_hit_fraction
+        if span_ok and n_samples >= self.alarm_min_samples:
+            if ex < hit_frac <= en + 1e-9:
+                return "suspected"
+        if n_samples >= 3 and hit_frac > ex + 1e-12:
+            if (not span_ok) or (n_samples < self.alarm_min_samples):
+                return "suspected"
+        return "unsure"
 
     def _finalize(
         self,
@@ -529,7 +597,15 @@ class PeeingDetector:
         overlay: OverlayLandmarks,
         timestamp_sec: float,
     ) -> PeeingState:
-        display_active, hit_frac = self._window_active(timestamp_sec)
+        display_active, hit_frac, span_ok, n_samples = self._window_active(
+            timestamp_sec
+        )
+        status = self._display_status(
+            display_active=display_active,
+            hit_frac=hit_frac,
+            span_ok=span_ok,
+            n_samples=n_samples,
+        )
         edge_enter = display_active and not self._last_display_active
         edge_exit = (not display_active) and self._last_display_active
         self._last_display_active = display_active
@@ -544,6 +620,7 @@ class PeeingDetector:
             score=float(hit_frac),
             sampled=sampled,
             frame_match=float(frame_match),
+            status=status,
             overlay_landmarks=overlay_out,
             edge_enter=edge_enter,
             edge_exit=edge_exit,

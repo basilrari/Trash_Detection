@@ -46,7 +46,9 @@ from settings import (
     PEEING_CROP_MARGIN,
     PEEING_GROIN_DIST_MAX,
     PEEING_GROIN_LOOSE_FACTOR,
-    PEEING_MATCH_HIT_FRACTION,
+    PEEING_ALARM_ENTER_HIT_FRACTION,
+    PEEING_ALARM_EXIT_HIT_FRACTION,
+    PEEING_ALARM_MIN_SAMPLES,
     PEEING_MIN_VISIBILITY,
     PEEING_PELVIC_BAND_Y_ABOVE,
     PEEING_PELVIC_BAND_Y_BELOW,
@@ -355,37 +357,90 @@ def _annotate_yolo_lp_ocr(
 
 
 def _draw_peeing_overlay(frame: np.ndarray, state: PeeingState) -> None:
-    """Single ``PEEING`` label top-left when the sliding-window rule fires."""
-    if not state.active:
-        return
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.9
-    thick = 3
-    color = (0, 255, 255)
-    outline = (0, 0, 0)
-    ox, oy = 12, 36
-    pad = 10
-    text = "PEEING"
-    (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
-    top = oy - th - pad // 2
-    bottom = oy + bl + pad // 2
-    cv2.rectangle(
-        frame,
-        (ox - pad, top),
-        (ox + tw + pad, bottom),
-        (20, 20, 20),
-        -1,
+    """Large top-left banner: algorithmic CONFIRMED / SUSPECTED / UNSURE (not human verification)."""
+    h, _w = frame.shape[:2]
+    font = cv2.FONT_HERSHEY_DUPLEX
+    scale = float(max(1.15, min(3.4, h / 380.0)))
+    thick = max(2, int(round(scale * 2.0)))
+    line_gap = int(6 + h / 160)
+
+    tier = state.status
+    line2 = {"confirmed": "CONFIRMED", "suspected": "SUSPECTED", "unsure": "UNSURE"}.get(
+        tier, "UNSURE"
     )
-    cv2.rectangle(
+    line1 = "PEEING"
+    colors = {
+        "confirmed": ((50, 255, 255), (0, 0, 0)),
+        "suspected": ((60, 180, 255), (0, 0, 0)),
+        "unsure": ((190, 190, 190), (20, 20, 20)),
+    }
+    fill, outline = colors.get(tier, colors["unsure"])
+
+    def line_size(text: str) -> tuple[int, int, int]:
+        (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
+        return tw, th, bl
+
+    w1, h1, b1 = line_size(line1)
+    w2, h2, b2 = line_size(line2)
+    tw = max(w1, w2)
+
+    sub_scale = max(0.42, scale * 0.38)
+    sub_th = max(1, thick - 1)
+    sub_text = f"window hits {state.score:.0%}  (auto)"
+    (sw, sh), sbl = cv2.getTextSize(sub_text, font, sub_scale, sub_th)
+
+    pad_x, pad_y = 18, 16
+    ox = 14
+    top = 16
+    baseline1 = top + pad_y + h1
+    baseline2 = baseline1 + b1 + line_gap + h2
+    baseline3 = baseline2 + b2 + max(8, int(h / 90)) + sh
+
+    box_top = top
+    box_bottom = int(baseline3 + sbl + pad_y)
+    left = ox - pad_x
+    right = ox + max(tw, sw) + pad_x
+
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (left, box_top), (right, box_bottom), (24, 24, 24), -1)
+    cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
+    cv2.rectangle(frame, (left, box_top), (right, box_bottom), (90, 90, 90), 2)
+
+    def put_outline(text: str, x: int, y_baseline: int) -> None:
+        for dx, dy in (
+            (-2, 0),
+            (2, 0),
+            (0, -2),
+            (0, 2),
+            (-1, -1),
+            (1, -1),
+            (-1, 1),
+            (1, 1),
+        ):
+            cv2.putText(
+                frame,
+                text,
+                (x + dx, y_baseline + dy),
+                font,
+                scale,
+                outline,
+                thick + 2,
+                cv2.LINE_AA,
+            )
+        cv2.putText(frame, text, (x, y_baseline), font, scale, fill, thick, cv2.LINE_AA)
+
+    put_outline(line1, ox, baseline1)
+    put_outline(line2, ox, baseline2)
+    cv2.putText(
         frame,
-        (ox - pad, top),
-        (ox + tw + pad, bottom),
-        (100, 100, 100),
-        2,
+        sub_text,
+        (ox, baseline3),
+        font,
+        sub_scale,
+        (140, 140, 140),
+        sub_th,
+        cv2.LINE_AA,
     )
-    for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2), (-1, -1), (1, -1), (-1, 1), (1, 1)):
-        cv2.putText(frame, text, (ox + dx, oy + dy), font, scale, outline, thick + 2, cv2.LINE_AA)
-    cv2.putText(frame, text, (ox, oy), font, scale, color, thick, cv2.LINE_AA)
 
 
 def _annotate_frame(
@@ -632,7 +687,9 @@ def run_pipeline(video_path: str, output_video: str) -> None:
             standing_y_margin=PEEING_STANDING_Y_MARGIN,
             window_sec=PEEING_WINDOW_SEC,
             pose_match_threshold=PEEING_POSE_MATCH_THRESHOLD,
-            match_hit_fraction=PEEING_MATCH_HIT_FRACTION,
+            alarm_enter_hit_fraction=PEEING_ALARM_ENTER_HIT_FRACTION,
+            alarm_exit_hit_fraction=PEEING_ALARM_EXIT_HIT_FRACTION,
+            alarm_min_samples=PEEING_ALARM_MIN_SAMPLES,
             squat_hip_knee_gap_max=PEEING_SQUAT_HIP_KNEE_GAP_MAX,
             squat_depth_scale=PEEING_SQUAT_DEPTH_SCALE,
             model_path=PEEING_POSE_MODEL_PATH,
@@ -647,8 +704,9 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         raise SystemExit(2) from exc
     console.print(
         "[cyan]Peeing hint:[/] standing + squat cues; straddle penalty; "
-        f"alarm when pose score ≥{PEEING_POSE_MATCH_THRESHOLD:.0%} on >{PEEING_MATCH_HIT_FRACTION:.0%} "
-        f"of samples over {PEEING_WINDOW_SEC:.0f}s (no per-person IDs)."
+        f"alarm: last {PEEING_WINDOW_SEC:.0f}s of pose hits (score ≥{PEEING_POSE_MATCH_THRESHOLD:.0%}); "
+        f"arm when >{PEEING_ALARM_ENTER_HIT_FRACTION:.0%} hits with ≥{PEEING_ALARM_MIN_SAMPLES} samples, "
+        f"disarm when <{PEEING_ALARM_EXIT_HIT_FRACTION:.0%} (no per-person IDs)."
     )
 
     annots = _make_frame_annotators(width, height)
