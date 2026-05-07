@@ -79,7 +79,30 @@ def _default_patch_size(cfg_class: type[Any]) -> int:
     return int(d) if isinstance(d, int) else 16
 
 
-def _manual_rfdetr_overrides() -> tuple[Dict[str, Any], frozenset[str]]:
+def _snap_side_to_block_grid(resolution: int, patch_size: int, num_windows: int) -> int:
+    """``rfdetr`` backbone requires H,W divisible by ``patch_size * num_windows`` (see ``predict()``)."""
+    block = int(patch_size) * int(num_windows)
+    if block <= 0:
+        return int(resolution)
+    r = int(resolution)
+    if r % block == 0:
+        return r
+    low = (r // block) * block
+    high = low + block
+    # Prefer rounding up on ties so we do not shrink below the trained default more than necessary.
+    return high if high - r <= r - low else max(low, block)
+
+
+def _predict_kwargs_if_needed(rfdetr_model: Any) -> Dict[str, Any]:
+    """Pass ``shape=`` to ``predict`` when ``model.resolution`` is not a multiple of ``patch_size * num_windows``."""
+    cfg = rfdetr_model.model_config
+    res = int(rfdetr_model.model.resolution)
+    patch = int(cfg.patch_size)
+    nw = int(getattr(cfg, "num_windows", 2))
+    snapped = _snap_side_to_block_grid(res, patch, nw)
+    if snapped == res:
+        return {}
+    return {"shape": (snapped, snapped)}
     from settings import (
         RF_DETR_NUM_CLASSES,
         RF_DETR_PATCH_SIZE,
@@ -214,7 +237,8 @@ class RfDetrTrashDetector(TrashDetector):
         merged: List[List[Detection]] = [[] for _ in frames]
 
         for model, default_lbl, _tag in self._models:
-            raw = model.predict(images_rgb, threshold=self._conf)
+            pkw = _predict_kwargs_if_needed(model)
+            raw = model.predict(images_rgb, threshold=self._conf, **pkw)
             per_frame = raw if isinstance(raw, list) else [raw]
             if len(per_frame) != len(frames):
                 continue
