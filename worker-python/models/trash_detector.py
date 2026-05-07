@@ -103,6 +103,9 @@ def _predict_kwargs_if_needed(rfdetr_model: Any) -> Dict[str, Any]:
     if snapped == res:
         return {}
     return {"shape": (snapped, snapped)}
+
+
+def _manual_rfdetr_overrides() -> tuple[Dict[str, Any], frozenset[str]]:
     from settings import (
         RF_DETR_NUM_CLASSES,
         RF_DETR_PATCH_SIZE,
