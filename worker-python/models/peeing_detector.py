@@ -11,8 +11,9 @@ walking / wide-stance / motorbike false positives).
 **Squatting** (defecation posture) uses hip–knee depth; merged into the same score and
 UI label ``PEEING``.
 
-**Sustained alarm**: ``PeeingState.active`` is true only after ``min_active_duration_sec``
-of consecutive EMA above ``active_threshold`` (hysteresis via ``ema_release_threshold``).
+**Sustained alarm**: ``PeeingState.active`` is true only after ``min_active_duration_sec`` of
+video time with EMA **continuously** at or above ``active_threshold`` (any dip below clears
+the timer). ``ema_release_threshold`` only affects when pose focus ``mark_bboxes`` are cleared.
 
 Requires the MediaPipe **Tasks** bundle (``pose_landmarker_*.task``). If the file at
 ``model_path`` is missing, it is downloaded once from ``model_url`` (see settings).
@@ -448,14 +449,14 @@ class PeeingDetector:
         return tuple(out)
 
     def _update_sustained(self, timestamp_sec: float) -> bool:
-        """Update sustain timer; return whether the public ``active`` flag should be on."""
+        """``active`` is on only after ``min_active_duration_sec`` with EMA >= ``active_threshold``."""
         if self._ema >= self.active_threshold:
             if self._sustain_start_t is None:
                 self._sustain_start_t = float(timestamp_sec)
-        elif self._ema < self.ema_release_threshold:
+        else:
             self._sustain_start_t = None
 
-        if self._sustain_start_t is None or self._ema < self.active_threshold:
+        if self._sustain_start_t is None:
             return False
         if self.min_active_duration_sec <= 0.0:
             return True
