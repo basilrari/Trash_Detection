@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YOLO → (optional RF-DETR trash) → LP → OCR on a local video; writes an annotated MP4.
+YOLO → RF-DETR trash → LP → OCR on a local video; writes an annotated MP4.
 
 Run from worker-python/ (put source videos in inputs/, results under outputs/ by default):
 
@@ -9,10 +9,10 @@ Run from worker-python/ (put source videos in inputs/, results under outputs/ by
   python worker.py inputs/myvideo.mp4 -o outputs/custom.mp4
   python -m pipelines.test_pipeline   # uses paths from settings.py
 
-**Gate (``GATE_MODE``)** — see ``settings.py`` module docstring and ``Readme.md`` § Gating.
+**Gate (``GATE_MODE``)** — default ``yolo``; see ``settings.py`` and ``Readme.md`` § Gating.
 
-**Trash (RF-DETR)** — optional; ``TRASH_ENABLED`` + ``weights/trash.pth`` (and optionally
-``cigarette.pth``). Requires ``pip install rfdetr``. See ``models/trash_detector.py``.
+**RF-DETR** — required: ``pip install rfdetr`` and ``weights/trash.pth`` (optional ``cigarette.pth``).
+See ``models/trash_detector.py``.
 """
 
 from __future__ import annotations
@@ -41,7 +41,6 @@ from settings import (
     PLATE_CONFIDENCE,
     RF_DETR_SIZE,
     TRASH_CONFIDENCE,
-    TRASH_ENABLED,
     TRASH_WEIGHTS_PATH,
     VIDEO_PATH,
     YOLO_COARSE_STRIDE,
@@ -84,22 +83,20 @@ VEHICLE_LABELS = ("vehicle", "car", "truck", "bus", "motorbike", "motorcycle")
 PERSON_LABELS = ("person",)
 
 
-def _try_load_trash_detector() -> RfDetrTrashDetector | None:
-    """Load RF-DETR trash heads when enabled and weights exist; otherwise log and skip."""
-    if not TRASH_ENABLED:
-        return None
+def _load_trash_detector_required() -> "RfDetrTrashDetector":
+    """Load RF-DETR; exit the process if ``rfdetr`` or weights are missing."""
     tw = Path(TRASH_WEIGHTS_PATH)
     if not tw.is_file():
         console.print(
-            f"[yellow]TRASH_ENABLED but weights missing ({tw}); "
-            f"skipping RF-DETR. Set TRASH_ENABLED=0 or add weights.[/]"
+            f"[red]RF-DETR is required but weights file not found:[/] {tw}\n"
+            f"Set TRASH_WEIGHTS_PATH or place trash.pth under worker-python/weights/."
         )
-        return None
-    try:
-        from models.trash_detector import RfDetrTrashDetector
+        raise SystemExit(2)
+    from models.trash_detector import RfDetrTrashDetector
 
-        cig = Path(CIGARETTE_WEIGHTS_PATH)
-        cig_path: str | None = str(cig) if cig.is_file() else None
+    cig = Path(CIGARETTE_WEIGHTS_PATH)
+    cig_path: str | None = str(cig) if cig.is_file() else None
+    try:
         return RfDetrTrashDetector(
             tw,
             cigarette_weights_path=cig_path,
@@ -107,9 +104,17 @@ def _try_load_trash_detector() -> RfDetrTrashDetector | None:
             conf_threshold=TRASH_CONFIDENCE,
             model_size=RF_DETR_SIZE,
         )
-    except Exception as exc:  # noqa: BLE001 — surface any import / CUDA / checkpoint issue
-        console.print(f"[yellow]RF-DETR trash disabled:[/] {exc}")
-        return None
+    except ModuleNotFoundError as exc:
+        if getattr(exc, "name", "") == "rfdetr":
+            console.print(
+                "[red]RF-DETR is required but the ``rfdetr`` package is not installed.[/]\n"
+                "Install with: [bold]pip install rfdetr[/]"
+            )
+            raise SystemExit(2) from exc
+        raise
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]RF-DETR failed to load (required):[/] {exc}")
+        raise SystemExit(3) from exc
 
 
 def _scene_has_activity(detections: Sequence[Detection], min_conf: float) -> bool:
@@ -258,7 +263,7 @@ def _run_pipeline_chunked(
     yolo: YoloDetector,
     lp_detector: LpDetector,
     ocr: Ocr,
-    trash: RfDetrTrashDetector | None,
+    trash: "RfDetrTrashDetector",
     times: PipelineStepTimes,
 ) -> None:
     pbar = tqdm(total=total_frames, desc="Processing video")
@@ -284,10 +289,7 @@ def _run_pipeline_chunked(
             detections_per_frame = yolo.detect(chunk_frames_list)
             times.yolo_sec += time.perf_counter() - t0
             t0 = time.perf_counter()
-            if trash:
-                trash_per_frame = trash.detect_trash(chunk_frames_list)
-            else:
-                trash_per_frame = [[] for _ in chunk_frames_list]
+            trash_per_frame = trash.detect_trash(chunk_frames_list)
             times.trash_sec += time.perf_counter() - t0
 
             n = min(len(chunk_frames_list), len(detections_per_frame), len(trash_per_frame))
@@ -328,7 +330,7 @@ def _run_pipeline_yolo_gated(
     lp_detector: LpDetector,
     ocr: Ocr,
     gate: YoloStrideGate,
-    trash: RfDetrTrashDetector | None,
+    trash: "RfDetrTrashDetector",
     times: PipelineStepTimes,
 ) -> None:
     pbar = tqdm(total=total_frames, desc="Processing video (YOLO stride gate)")
@@ -350,11 +352,10 @@ def _run_pipeline_yolo_gated(
                 times.yolo_sec += time.perf_counter() - t0
                 detections = dets_list[0] if dets_list else []
                 gate.observe(frame_idx, _scene_has_activity(detections, YOLO_CONFIDENCE))
-                if trash:
-                    t0 = time.perf_counter()
-                    tlist = trash.detect_trash([fd])
-                    times.trash_sec += time.perf_counter() - t0
-                    trash_dets = list(tlist[0]) if tlist else []
+                t0 = time.perf_counter()
+                tlist = trash.detect_trash([fd])
+                times.trash_sec += time.perf_counter() - t0
+                trash_dets = list(tlist[0]) if tlist else []
             else:
                 detections = []
 
@@ -385,15 +386,15 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         console.print(f"[red]Video not found:[/] {video_path}")
         sys.exit(2)
 
-    mode = GATE_MODE if GATE_MODE in ("off", "yolo") else "off"
+    mode = GATE_MODE if GATE_MODE in ("off", "yolo") else "yolo"
     if mode != GATE_MODE:
-        console.print(f"[yellow]Unknown GATE_MODE={GATE_MODE!r}; using 'off'[/]")
+        console.print(f"[yellow]Unknown GATE_MODE={GATE_MODE!r}; using 'yolo'[/]")
 
     t0 = time.perf_counter()
     yolo = YoloDetector(conf_threshold=YOLO_CONFIDENCE)
     lp_detector = LpDetector()
     ocr = Ocr()
-    trash = _try_load_trash_detector()
+    trash = _load_trash_detector_required()
     times.init_sec = time.perf_counter() - t0
 
     t_io = time.perf_counter()
@@ -424,10 +425,7 @@ def run_pipeline(video_path: str, output_video: str) -> None:
             f"[cyan]Loaded video[/] {video_path} ({width}x{height} @ {fps:.2f} FPS, {total_frames} frames); "
             f"chunk={CHUNK_SECONDS}s -> {chunk_frames} frames | GATE_MODE=off"
         )
-    if trash:
-        console.print("[cyan]RF-DETR trash/cigarette[/] enabled")
-    else:
-        console.print("[dim]RF-DETR trash[/] off (disabled or weights missing)")
+    console.print("[cyan]RF-DETR trash/cigarette[/] loaded (required)")
 
     out_dir = os.path.dirname(os.path.abspath(output_video))
     if out_dir:

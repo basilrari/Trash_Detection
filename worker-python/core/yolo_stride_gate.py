@@ -5,8 +5,9 @@ pipeline can skip expensive work on many frames.
 
 **Why “gate”?**  
 The gate is the policy layer that opens or closes how often we invoke YOLO (and thus
-LP/OCR that depend on YOLO boxes). ``GATE_MODE=off`` in settings means “no gate” for the
-stride path (full YOLO inside each time chunk). ``GATE_MODE=yolo`` uses this scheduler.
+LP/OCR that depend on YOLO boxes). ``GATE_MODE=yolo`` (default in ``settings.py``) uses this
+scheduler. ``GATE_MODE=off`` disables the stride gate for the **chunked** path (full YOLO
+inside each time chunk).
 
 **Coarse vs dense**
 

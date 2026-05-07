@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Local video pipeline: YOLO → license plate detector → OCR → annotated MP4.
+Local video pipeline: YOLO (stride gate by default) → RF-DETR trash → license plate → OCR → annotated MP4.
 
 Examples (paths relative to worker-python/):
 
@@ -8,15 +8,14 @@ Examples (paths relative to worker-python/):
   python worker.py inputs/clip.mp4
   python worker.py inputs/clip.mp4 -o outputs/custom.mp4
 
-Gating (optional, ``GATE_MODE=yolo``):
-  When the gate is on, we do not run the full YOLO+LP+OCR stack on every frame.
-  YOLO is used twice: (1) as the detector, (2) as the signal for when to run more
-  often — see ``core/yolo_stride_gate.py`` and env vars below.
+Gating (default ``GATE_MODE=yolo`` in ``settings.py``):
+  The gate decides how often YOLO runs (and thus LP/OCR, which need YOLO boxes). RF-DETR
+  runs on the same cadence as YOLO when the gate is on. See ``core/yolo_stride_gate.py``.
 
-  # YOLO-only stride gate: coarse when idle, denser after people/vehicles appear
-  GATE_MODE=yolo python worker.py inputs/clip.mp4
+  # Full YOLO on every frame inside each time chunk (no stride gate)
+  GATE_MODE=off python worker.py inputs/clip.mp4
 
-  # Same, with inline tuning (see Readme "Gating" section for meanings)
+  # Explicit coarse/dense tuning (defaults are already yolo in settings)
   GATE_MODE=yolo YOLO_COARSE_STRIDE=10 YOLO_DENSE_STRIDE=2 YOLO_DENSE_WINDOW_SEC=5 \\
     python worker.py inputs/clip.mp4 -o outputs/out.mp4
 """
@@ -42,12 +41,11 @@ def main() -> None:
         description=(
             "Run YOLO + license-plate detector + OCR on a video file.\n\n"
             "GATE_MODE:\n"
-            "  off  — Original behavior: YOLO on every frame inside each time chunk "
-            "(CHUNK_SECONDS in settings.py).\n"
-            "  yolo — YOLO-only gating: run YOLO coarsely when the scene looks idle, "
-            "and more often for a short window after a person or vehicle is seen. "
-            "Tuning: YOLO_COARSE_STRIDE, YOLO_DENSE_STRIDE, YOLO_DENSE_WINDOW_SEC "
-            "(env or settings.py). See Readme.md § Gating."
+            "  yolo — Default: YOLO-only stride gate (coarse when idle, denser after people/vehicles). "
+            "RF-DETR runs with the same schedule. Tuning: YOLO_COARSE_STRIDE, YOLO_DENSE_STRIDE, "
+            "YOLO_DENSE_WINDOW_SEC (env or settings.py). See Readme.md § Gating.\n"
+            "  off  — No stride gate: within each time chunk (CHUNK_SECONDS), YOLO on every frame; "
+            "RF-DETR runs on every frame in each chunk."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -69,8 +67,8 @@ def main() -> None:
         default=None,
         help=(
             "Override GATE_MODE for this run only: "
-            "'off' = full-rate YOLO within each chunk; "
-            "'yolo' = coarse/dense YOLO stride gate (no MOG2). "
+            "'yolo' = coarse/dense YOLO stride gate (default in settings); "
+            "'off' = full YOLO within each time chunk (no stride gate). "
             "Default: value from settings.py / environment."
         ),
     )

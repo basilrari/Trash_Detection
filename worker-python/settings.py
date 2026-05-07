@@ -2,11 +2,11 @@
 """
 Defaults for the local video pipeline.
 
-Gating (YOLO stride) — only used when ``GATE_MODE=yolo`` (see ``core/yolo_stride_gate.py``):
+Gating (YOLO stride) — default ``GATE_MODE=yolo`` (see ``core/yolo_stride_gate.py``):
 
   * **Gate** — Short for “when do we run the expensive stack (YOLO + LP + OCR)?”
+    ``GATE_MODE=yolo`` (default) runs YOLO on a **schedule**: mostly sparse, sometimes dense.
     ``GATE_MODE=off`` runs YOLO on every frame inside each time **chunk** (``CHUNK_SECONDS``).
-    ``GATE_MODE=yolo`` runs YOLO on a **schedule**: mostly sparse, sometimes dense.
 
   * **YOLO_COARSE_STRIDE** — While the scene is treated as “idle” (no recent person/vehicle
     on a YOLO pass), run YOLO at most once every **N** frames (e.g. 8 ≈ one check every 8
@@ -23,8 +23,9 @@ Gating (YOLO stride) — only used when ``GATE_MODE=yolo`` (see ``core/yolo_stri
 
 Environment variables override these values when set (same names as the variables).
 
-RF-DETR trash (``TRASH_ENABLED``, ``TRASH_WEIGHTS_PATH``, ``CIGARETTE_WEIGHTS_PATH``,
-``TRASH_CONFIDENCE``, ``RF_DETR_SIZE``): optional second detector; install ``rfdetr``.
+RF-DETR trash is **required** for the pipeline: install ``rfdetr``, place ``weights/trash.pth``
+(``TRASH_WEIGHTS_PATH``), optional ``cigarette.pth``, and set ``TRASH_CONFIDENCE`` /
+``RF_DETR_SIZE`` to match your checkpoints.
 """
 import os
 from pathlib import Path
@@ -48,14 +49,13 @@ YOLO_CONFIDENCE = 0.5
 PLATE_CONFIDENCE = 0.5
 
 # --- Gating (see module docstring above) ---
-# GATE_MODE: "off" | "yolo"
-GATE_MODE = os.getenv("GATE_MODE", "off").strip().lower()
+# GATE_MODE: "off" | "yolo" (default: yolo — coarse/dense YOLO stride)
+GATE_MODE = os.getenv("GATE_MODE", "yolo").strip().lower()
 YOLO_COARSE_STRIDE = int(os.getenv("YOLO_COARSE_STRIDE", "8"))
 YOLO_DENSE_STRIDE = int(os.getenv("YOLO_DENSE_STRIDE", "2"))
 YOLO_DENSE_WINDOW_SEC = float(os.getenv("YOLO_DENSE_WINDOW_SEC", "4.0"))
 
-# --- RF-DETR trash / cigarette (optional; requires ``pip install rfdetr``) ---
-TRASH_ENABLED = os.getenv("TRASH_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+# --- RF-DETR trash / cigarette (required; ``pip install rfdetr``) ---
 TRASH_WEIGHTS_PATH = os.getenv("TRASH_WEIGHTS_PATH", str(Path(__file__).resolve().parent / "weights" / "trash.pth"))
 CIGARETTE_WEIGHTS_PATH = os.getenv(
     "CIGARETTE_WEIGHTS_PATH", str(Path(__file__).resolve().parent / "weights" / "cigarette.pth")
