@@ -89,7 +89,7 @@ class PeeingDetector:
         pose_stride: int = 2,
         crop_margin: float = 0.12,
         min_visibility: float = 0.45,
-        groin_dist_max: float = 0.13,
+        groin_dist_max: float = 0.145,
         standing_y_margin: float = 0.03,
         window_sec: float = 5.0,
         pose_match_threshold: float = 0.6,
@@ -99,7 +99,7 @@ class PeeingDetector:
         min_crop_side: int = 48,
         model_path: str | None = None,
         model_url: str | None = None,
-        groin_loose_factor: float = 1.22,
+        groin_loose_factor: float = 1.28,
         wrist_band_min_visibility: float = 0.44,
         pelvic_band_y_above: float = -0.06,
         pelvic_band_y_below: float = 0.17,
@@ -262,11 +262,25 @@ class PeeingDetector:
             return 0.0
 
         gwx, gwy = float(groin_x), float(groin_y)
+
+        hip_sep = 0.0
+        if lh.x is not None and rh.x is not None and vis_ok(lh) and vis_ok(rh):
+            hip_sep = abs(float(lh.x) - float(rh.x))
+        # Side profile: hips collapse in x → tiny ``x_cut`` and large wrist–midline
+        # distance in normalized crop space even when hands are at the fly.
+        profile_like = bool(hip_sep > 1e-6 and hip_sep < 0.102)
+
         tight = max(self.groin_dist_max, 1e-6)
         loose = tight * self.groin_loose_factor
+        if profile_like:
+            tight *= 1.06
+            loose = max(loose * 1.38, 0.305)
+
+        prox_vis_thr = 0.11 if profile_like else self.min_visibility
+        loose_coef = 0.9 if profile_like else 0.52
 
         def wrist_prox_score(wrist) -> float:
-            if not vis_ok(wrist) or wrist.x is None or wrist.y is None:
+            if self._lm_vis(wrist) < prox_vis_thr or wrist.x is None or wrist.y is None:
                 return 0.0
             wx, wy = float(wrist.x), float(wrist.y)
             dists = [float(np.hypot(wx - gwx, wy - gwy))]
@@ -279,7 +293,7 @@ class PeeingDetector:
                 return float(min(1.0, 1.0 - d / tight))
             if d <= loose:
                 span = loose - tight
-                return float(0.52 * min(1.0, (loose - d) / max(span, 1e-6)))
+                return float(loose_coef * min(1.0, (loose - d) / max(span, 1e-6)))
             return 0.0
 
         best_prox = max(wrist_prox_score(lw), wrist_prox_score(rw))
@@ -304,11 +318,23 @@ class PeeingDetector:
                 0.07,
             ) * 1.12
             hip_sep = abs(float(lh.x) - float(rh.x))
+            shoulder_sep_b = abs(float(ls.x) - float(rs.x))
             # Narrow horizontal gate: shoulder-wide ``body_w`` was too permissive for
             # arms hanging naturally at the sides (still inside a tall pelvic band).
             x_cut = min(body_w * 0.62, max(hip_sep * 0.78, 0.066))
+            if profile_like:
+                x_cut = max(
+                    x_cut,
+                    shoulder_sep_b * 0.88 + 0.152,
+                    0.218,
+                )
+            band_wrist_thr = (
+                max(0.1, self.wrist_band_min_visibility - 0.34)
+                if profile_like
+                else self.wrist_band_min_visibility
+            )
             for wrist in (lw, rw):
-                if self._lm_vis(wrist) < self.wrist_band_min_visibility:
+                if self._lm_vis(wrist) < band_wrist_thr:
                     continue
                 if wrist.x is None or wrist.y is None:
                     continue
