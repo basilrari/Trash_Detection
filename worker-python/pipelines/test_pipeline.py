@@ -46,7 +46,7 @@ from settings import (
     YOLO_COARSE_STRIDE,
     YOLO_CONFIDENCE,
     YOLO_DENSE_STRIDE,
-    YOLO_DENSE_WINDOW_SEC,
+    YOLO_DENSE_IDLE_MISS_STREAK,
 )
 
 if TYPE_CHECKING:
@@ -414,11 +414,10 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
 
     if mode == "yolo":
-        dense_window_frames = max(1, int(fps * YOLO_DENSE_WINDOW_SEC))
         console.print(
             f"[cyan]Loaded video[/] {video_path} ({width}x{height} @ {fps:.2f} FPS, {total_frames} frames); "
             f"GATE_MODE=yolo | coarse_stride={YOLO_COARSE_STRIDE} dense_stride={YOLO_DENSE_STRIDE} "
-            f"dense_window={dense_window_frames}f (~{YOLO_DENSE_WINDOW_SEC}s)"
+            f"dense_idle_miss_streak={YOLO_DENSE_IDLE_MISS_STREAK} (YOLO runs w/o person/vehicle to leave dense)"
         )
     else:
         console.print(
@@ -442,12 +441,11 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     try:
         if mode == "yolo":
             t_gate = time.perf_counter()
-            dense_window_frames = max(1, int(fps * YOLO_DENSE_WINDOW_SEC))
             stride_gate = YoloStrideGate(
                 YoloStrideGateConfig(
                     coarse_stride=YOLO_COARSE_STRIDE,
                     dense_stride=YOLO_DENSE_STRIDE,
-                    dense_window_frames=dense_window_frames,
+                    dense_idle_miss_streak=YOLO_DENSE_IDLE_MISS_STREAK,
                 )
             )
             times.other_sec += time.perf_counter() - t_gate

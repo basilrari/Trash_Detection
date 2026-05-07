@@ -12,14 +12,13 @@ Gating (YOLO stride) — default ``GATE_MODE=yolo`` (see ``core/yolo_stride_gate
     on a YOLO pass), run YOLO at most once every **N** frames (e.g. 8 ≈ one check every 8
     frames). Larger N = cheaper, but easier to miss very short events between samples.
 
-  * **YOLO_DENSE_STRIDE** — After a person or vehicle is seen above ``YOLO_CONFIDENCE``,
-    we open a **dense window**: for the next ``YOLO_DENSE_WINDOW_SEC`` seconds of video we
-    still skip some frames, but less aggressively — run YOLO every **M** frames here
-    (``M=2`` means every **other** frame: 0, 2, 4, …).
+  * **YOLO_DENSE_STRIDE** — While **dense mode** is on (after YOLO sees a person or vehicle
+    above ``YOLO_CONFIDENCE``), also run YOLO every **M** frames (``M=2`` → every other frame
+    among indices that satisfy the dense rule, in addition to coarse samples).
 
-  * **YOLO_DENSE_WINDOW_SEC** — How long (in **seconds** of timeline, converted to frames
-    using FPS) the dense schedule stays active after a hit. When it expires without new
-    hits extending it, we fall back to coarse-only until the next person/vehicle.
+  * **YOLO_DENSE_IDLE_MISS_STREAK** — Dense mode is **not** a fixed time window. After a hit,
+    we stay dense until YOLO has run **this many times in a row** with **no** person/vehicle
+    (default **10**). Then we return to coarse-only until the next hit.
 
 Environment variables override these values when set (same names as the variables).
 
@@ -60,7 +59,7 @@ PLATE_CONFIDENCE = 0.5
 GATE_MODE = os.getenv("GATE_MODE", "yolo").strip().lower()
 YOLO_COARSE_STRIDE = int(os.getenv("YOLO_COARSE_STRIDE", "8"))
 YOLO_DENSE_STRIDE = int(os.getenv("YOLO_DENSE_STRIDE", "2"))
-YOLO_DENSE_WINDOW_SEC = float(os.getenv("YOLO_DENSE_WINDOW_SEC", "4.0"))
+YOLO_DENSE_IDLE_MISS_STREAK = max(1, int(os.getenv("YOLO_DENSE_IDLE_MISS_STREAK", "10")))
 
 # --- RF-DETR trash / cigarette (required; ``pip install rfdetr``) ---
 TRASH_WEIGHTS_PATH = os.getenv("TRASH_WEIGHTS_PATH", str(Path(__file__).resolve().parent / "weights" / "trash.pth"))

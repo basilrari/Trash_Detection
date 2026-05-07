@@ -16,7 +16,7 @@ Gating (default ``GATE_MODE=yolo`` in ``settings.py``):
   GATE_MODE=off python worker.py inputs/clip.mp4
 
   # Explicit coarse/dense tuning (defaults are already yolo in settings)
-  GATE_MODE=yolo YOLO_COARSE_STRIDE=10 YOLO_DENSE_STRIDE=2 YOLO_DENSE_WINDOW_SEC=5 \\
+  GATE_MODE=yolo YOLO_COARSE_STRIDE=10 YOLO_DENSE_STRIDE=2 YOLO_DENSE_IDLE_MISS_STREAK=10 \\
     python worker.py inputs/clip.mp4 -o outputs/out.mp4
 """
 from __future__ import annotations
@@ -43,7 +43,7 @@ def main() -> None:
             "GATE_MODE:\n"
             "  yolo — Default: YOLO-only stride gate (coarse when idle, denser after people/vehicles). "
             "RF-DETR runs with the same schedule. Tuning: YOLO_COARSE_STRIDE, YOLO_DENSE_STRIDE, "
-            "YOLO_DENSE_WINDOW_SEC (env or settings.py). See Readme.md § Gating.\n"
+            "YOLO_DENSE_IDLE_MISS_STREAK (env or settings.py). See Readme.md § Gating.\n"
             "  off  — No stride gate: within each time chunk (CHUNK_SECONDS), YOLO on every frame; "
             "RF-DETR runs on every frame in each chunk."
         ),
@@ -93,13 +93,13 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--yolo-dense-window-sec",
-        type=float,
+        "--yolo-dense-idle-miss-streak",
+        type=int,
         default=None,
-        metavar="SEC",
+        metavar="N",
         help=(
-            "When GATE_MODE=yolo: after a person/vehicle hit, keep the denser schedule for "
-            "this many seconds of video (converted to frames via FPS). Env: YOLO_DENSE_WINDOW_SEC."
+            "When GATE_MODE=yolo: exit dense sampling after N consecutive YOLO runs with no "
+            "person/vehicle (default 10). Env: YOLO_DENSE_IDLE_MISS_STREAK."
         ),
     )
 
@@ -111,8 +111,8 @@ def main() -> None:
         os.environ["YOLO_COARSE_STRIDE"] = str(args.yolo_coarse_stride)
     if args.yolo_dense_stride is not None:
         os.environ["YOLO_DENSE_STRIDE"] = str(args.yolo_dense_stride)
-    if args.yolo_dense_window_sec is not None:
-        os.environ["YOLO_DENSE_WINDOW_SEC"] = str(args.yolo_dense_window_sec)
+    if args.yolo_dense_idle_miss_streak is not None:
+        os.environ["YOLO_DENSE_IDLE_MISS_STREAK"] = str(args.yolo_dense_idle_miss_streak)
 
     from settings import OUTPUT_VIDEO, OUTPUTS_DIR, VIDEO_PATH
     from pipelines.test_pipeline import run_pipeline

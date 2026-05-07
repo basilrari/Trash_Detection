@@ -35,9 +35,9 @@ The **gate** is the rule that decides **how often** we run **YOLO** (and therefo
 | Setting / env | Meaning |
 |---------------|--------|
 | **`GATE_MODE`** | **`yolo`** (default): coarse / dense YOLO stride schedule (see `core/yolo_stride_gate.py`). **`off`**: no stride gate — within each time **chunk** (`CHUNK_SECONDS` in `settings.py`), YOLO runs on **every** frame in that chunk; RF-DETR runs on every frame in each chunk as well. |
-| **`YOLO_COARSE_STRIDE`** | When we are **not** in a “dense attention” window, run YOLO only on frames where the index is a multiple of this value (e.g. **8** → frames 0, 8, 16, …). Larger = cheaper idle sampling; typical range **5–10**. |
-| **`YOLO_DENSE_STRIDE`** | After YOLO sees a **person** or **vehicle** (above `YOLO_CONFIDENCE`), we open a **dense window**: run YOLO every **this many** frames while that window is active. **`2`** = every **other** frame. |
-| **`YOLO_DENSE_WINDOW_SEC`** | How many **seconds** of video (timeline) the dense schedule stays on after a hit; converted to frames with FPS. New hits **extend** the window. |
+| **`YOLO_COARSE_STRIDE`** | When **idle** (not in dense mode), run YOLO only on frames where the index is a multiple of this value (e.g. **8** → frames 0, 8, 16, …). Larger = cheaper sampling; typical **5–10**. |
+| **`YOLO_DENSE_STRIDE`** | While **dense mode** is on (after YOLO sees a person or vehicle above `YOLO_CONFIDENCE`), also run YOLO every **this many** frames. **`2`** = every **other** frame (among dense-scheduled indices). |
+| **`YOLO_DENSE_IDLE_MISS_STREAK`** | Dense mode is **not** a fixed time window. After a hit, we stay dense until YOLO has run **this many times in a row** with **no** person/vehicle (default **10**). Then we return to coarse-only until the next hit. |
 
 ```bash
 # Use full YOLO + RF-DETR on every frame inside each chunk (no stride gate)
@@ -47,15 +47,15 @@ python worker.py inputs/myvideo.mp4 -o outputs/out.mp4
 # Tune the default yolo gate for this run
 export GATE_MODE=yolo
 export YOLO_COARSE_STRIDE=10                             # idle: YOLO at most every 10th frame
-export YOLO_DENSE_STRIDE=2                              # when busy: YOLO every 2nd frame (0,2,4,…)
-export YOLO_DENSE_WINDOW_SEC=5                           # stay “dense” for ~5s after a person/vehicle hit
+export YOLO_DENSE_STRIDE=2                              # when dense: YOLO every 2nd frame (0,2,4,…)
+export YOLO_DENSE_IDLE_MISS_STREAK=10                   # exit dense after 10 consecutive YOLO passes w/o person/vehicle
 python worker.py inputs/myvideo.mp4 -o outputs/out.mp4
 
 # Same tuning via CLI flags (no exports); overrides apply before settings are read
 python worker.py --gate yolo \
   --yolo-coarse-stride 10 \
   --yolo-dense-stride 2 \
-  --yolo-dense-window-sec 5 \
+  --yolo-dense-idle-miss-streak 10 \
   inputs/myvideo.mp4 -o outputs/out.mp4
 ```
 

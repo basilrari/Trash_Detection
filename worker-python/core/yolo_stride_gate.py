@@ -11,25 +11,24 @@ inside each time chunk).
 
 **Coarse vs dense**
 
-* **Coarse stride** (``coarse_stride`` / ``YOLO_COARSE_STRIDE``): when we are **not**
-  inside a post-activity “dense” window, we only run YOLO on frames where
-  ``frame_idx % coarse_stride == 0``. Example: stride 8 → run on frames 0, 8, 16, …
-  Use roughly **5–10** when you want fewer idle checks.
+* **Coarse stride** (``coarse_stride`` / ``YOLO_COARSE_STRIDE``): when we are **idle**
+  (not in dense mode), we only run YOLO on frames where ``frame_idx % coarse_stride == 0``.
+  Example: stride 8 → frames 0, 8, 16, …
 
-* **Dense stride** (``dense_stride`` / ``YOLO_DENSE_STRIDE``): after YOLO sees a **person**
-  or **vehicle** (caller reports ``has_activity``), we extend an **activity window** and
-  run YOLO on frames where ``frame_idx % dense_stride == 0`` **while** ``frame_idx`` is
-  inside that window. Example: stride **2** → every **other** frame (0, 2, 4, … relative
-  to indices; combined with coarse, both can fire on the same frame — one YOLO call).
+* **Dense stride** (``dense_stride`` / ``YOLO_DENSE_STRIDE``): while **dense mode** is on
+  (after a person/vehicle was seen), run YOLO on frames where ``frame_idx % dense_stride == 0``
+  in addition to coarse hits (either branch can trigger a run on the same frame → one YOLO).
 
-* **Dense window** (``dense_window_frames`` / derived from ``YOLO_DENSE_WINDOW_SEC`` × FPS):
-  number of **frames** after a positive ``observe()`` during which the dense rule applies.
-  ``YOLO_DENSE_WINDOW_SEC`` is wall-time in seconds of the video; multiply by FPS to get
-  frames. New hits **extend** ``activity_until`` forward from the current frame index.
+* **Leaving dense mode** — **not** a fixed wall-clock window. After YOLO sees a person or
+  vehicle, we turn dense mode **on**. Each time YOLO runs and sees **no** person/vehicle, we
+  increment a counter. When that counter reaches ``dense_idle_miss_streak`` (default **10**,
+  ``YOLO_DENSE_IDLE_MISS_STREAK``), we turn dense mode **off** and go back to coarse-only until
+  the next hit. So “10 consecutive” means **10 consecutive YOLO passes** with no activity
+  (not necessarily 10 video frames, because YOLO may not run every frame).
 
 **Flow**  
-Each frame: if ``should_run_yolo`` → run YOLO → ``observe(frame_idx, has_person_or_vehicle)``.
-If we skip YOLO, do not call ``observe`` (no new evidence).
+Each frame: ``should_run_yolo`` → if true, run YOLO → ``observe(has_activity)``.
+If YOLO was skipped, do not call ``observe``.
 """
 
 from __future__ import annotations
@@ -45,27 +44,37 @@ class YoloStrideGateConfig:
     """When idle: run YOLO once per this many frame indices (typical 5–10)."""
 
     dense_stride: int = 2
-    """Inside the activity window: run YOLO every this many frames (2 = every other)."""
+    """While dense mode is on: also run YOLO every this many frames (2 = every other frame)."""
 
-    dense_window_frames: int = 48
-    """After ``observe(..., True)``, keep ``frame_idx <= activity_until`` for this many frames."""
+    dense_idle_miss_streak: int = 10
+    """Exit dense mode after this many **consecutive** YOLO runs with no person/vehicle."""
 
 
 class YoloStrideGate:
-    """Coarse sampling by default; temporarily densify after person/vehicle hits."""
+    """Coarse sampling by default; densify after a person/vehicle hit until idle miss streak."""
 
     def __init__(self, cfg: YoloStrideGateConfig) -> None:
         self._c = cfg
-        self._activity_until = -1
+        self._dense_active = False
+        self._consecutive_misses = 0
 
     def should_run_yolo(self, frame_idx: int) -> bool:
         """True if this frame index should run YOLO (and then LP/OCR if the pipeline does so)."""
         coarse = (frame_idx % max(1, self._c.coarse_stride)) == 0
-        in_window = frame_idx <= self._activity_until
-        dense = in_window and ((frame_idx % max(1, self._c.dense_stride)) == 0)
+        dense = self._dense_active and ((frame_idx % max(1, self._c.dense_stride)) == 0)
         return coarse or dense
 
-    def observe(self, frame_idx: int, has_activity: bool) -> None:
+    def observe(self, _frame_idx: int, has_activity: bool) -> None:
         """Call only on frames where YOLO actually ran; pass whether person/vehicle were found."""
+        streak = max(1, self._c.dense_idle_miss_streak)
         if has_activity:
-            self._activity_until = frame_idx + max(1, self._c.dense_window_frames)
+            self._dense_active = True
+            self._consecutive_misses = 0
+            return
+        if not self._dense_active:
+            self._consecutive_misses = 0
+            return
+        self._consecutive_misses += 1
+        if self._consecutive_misses >= streak:
+            self._dense_active = False
+            self._consecutive_misses = 0
