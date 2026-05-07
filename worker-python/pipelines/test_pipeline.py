@@ -11,7 +11,7 @@ Run from worker-python/ (put source videos in inputs/, results under outputs/ by
 
 **Gate (``GATE_MODE``)** — default ``yolo``; see ``settings.py`` and ``Readme.md`` § Gating.
 
-**RF-DETR** — required: ``pip install rfdetr`` and ``weights/trash.pth`` (optional ``cigarette.pth``).
+**RF-DETR** — required: ``pip install rfdetr``, **both** ``weights/trash.pth`` and ``weights/cigarette.pth``.
 See ``models/trash_detector.py``.
 """
 
@@ -39,7 +39,6 @@ from settings import (
     GATE_MODE,
     OUTPUT_VIDEO,
     PLATE_CONFIDENCE,
-    RF_DETR_SIZE,
     TRASH_CONFIDENCE,
     TRASH_WEIGHTS_PATH,
     VIDEO_PATH,
@@ -84,25 +83,32 @@ PERSON_LABELS = ("person",)
 
 
 def _load_trash_detector_required() -> "RfDetrTrashDetector":
-    """Load RF-DETR; exit the process if ``rfdetr`` or weights are missing."""
+    """Load both RF-DETR heads; exit if ``rfdetr`` or either weights file is missing."""
     tw = Path(TRASH_WEIGHTS_PATH)
+    cig = Path(CIGARETTE_WEIGHTS_PATH)
     if not tw.is_file():
         console.print(
-            f"[red]RF-DETR is required but weights file not found:[/] {tw}\n"
+            f"[red]RF-DETR is required but trash weights not found:[/] {tw}\n"
             f"Set TRASH_WEIGHTS_PATH or place trash.pth under worker-python/weights/."
         )
         raise SystemExit(2)
+    if not cig.is_file():
+        console.print(
+            f"[red]RF-DETR is required but cigarette weights not found:[/] {cig}\n"
+            f"Set CIGARETTE_WEIGHTS_PATH or place cigarette.pth under worker-python/weights/."
+        )
+        raise SystemExit(2)
+    if tw.resolve() == cig.resolve():
+        console.print("[red]trash.pth and cigarette.pth must be two different files.[/]")
+        raise SystemExit(2)
     from models.trash_detector import RfDetrTrashDetector
 
-    cig = Path(CIGARETTE_WEIGHTS_PATH)
-    cig_path: str | None = str(cig) if cig.is_file() else None
     try:
         return RfDetrTrashDetector(
             tw,
-            cigarette_weights_path=cig_path,
+            cig,
             class_names=None,
             conf_threshold=TRASH_CONFIDENCE,
-            model_size=RF_DETR_SIZE,
         )
     except ModuleNotFoundError as exc:
         if getattr(exc, "name", "") == "rfdetr":

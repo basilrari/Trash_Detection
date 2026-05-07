@@ -22,13 +22,14 @@ Gating (YOLO stride) — default ``GATE_MODE=yolo`` (see ``core/yolo_stride_gate
 
 Environment variables override these values when set (same names as the variables).
 
-RF-DETR trash is **required** for the pipeline: install ``rfdetr``, place ``weights/trash.pth``
-(``TRASH_WEIGHTS_PATH``), optional ``cigarette.pth``, and set ``TRASH_CONFIDENCE`` /
-``RF_DETR_SIZE`` to match your checkpoints.
+RF-DETR is **required**: install ``rfdetr``, place **both** ``weights/trash.pth`` and
+``weights/cigarette.pth`` (``TRASH_WEIGHTS_PATH`` / ``CIGARETTE_WEIGHTS_PATH``), and set
+``TRASH_CONFIDENCE``. The ``rfdetr`` model family is inferred from each checkpoint (``args``
+or trial load); no separate size setting.
 
 Fine-tuned checkpoints often store training ``args`` (``patch_size``, ``resolution``,
 ``num_classes``, …). Those are merged into the RF-DETR constructor when compatible with
-the chosen size class. If ``args`` omit backbone geometry, ``positional_encoding_size`` and
+the inferred size class. If ``args`` omit backbone geometry, ``positional_encoding_size`` and
 ``resolution`` are inferred from the saved ``position_embeddings`` tensor when the patch grid
 is square. Optional overrides: ``RF_DETR_PATCH_SIZE``, ``RF_DETR_NUM_CLASSES``,
 ``RF_DETR_RESOLUTION``, ``RF_DETR_POSITIONAL_ENCODING_SIZE`` (integers; unset = do not override).
@@ -67,8 +68,6 @@ CIGARETTE_WEIGHTS_PATH = os.getenv(
     "CIGARETTE_WEIGHTS_PATH", str(Path(__file__).resolve().parent / "weights" / "cigarette.pth")
 )
 TRASH_CONFIDENCE = float(os.getenv("TRASH_CONFIDENCE", "0.4"))
-# nano | small | medium | large — backbone family; checkpoint ``args`` still tune patch_size etc.
-RF_DETR_SIZE = os.getenv("RF_DETR_SIZE", "medium").strip().lower()
 
 
 def _optional_int_env(var: str) -> int | None:
@@ -81,6 +80,3 @@ RF_DETR_PATCH_SIZE = _optional_int_env("RF_DETR_PATCH_SIZE")
 RF_DETR_NUM_CLASSES = _optional_int_env("RF_DETR_NUM_CLASSES")
 RF_DETR_RESOLUTION = _optional_int_env("RF_DETR_RESOLUTION")
 RF_DETR_POSITIONAL_ENCODING_SIZE = _optional_int_env("RF_DETR_POSITIONAL_ENCODING_SIZE")
-
-LP_MODEL_PATH = "path/to/lp_model.pt"
-RFDETR_MODEL_PATH = "path/to/rfdetr.pt"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
@@ -12,6 +13,8 @@ import torch
 
 from core.types import Detection, FrameData
 from models.base import TrashDetector
+
+logger = logging.getLogger(__name__)
 
 
 def _ckpt_get(args_obj: Any, key: str) -> Any:
@@ -170,20 +173,44 @@ def _ensure_positional_encoding_size(merged: Dict[str, Any]) -> None:
     merged["positional_encoding_size"] = int(res) // int(ps)
 
 
-def _build_rfdetr(model_size: str, weights_path: str) -> Any:
+def _rfdetr_size_hint_from_checkpoint(ckpt: Dict[str, Any]) -> str | None:
+    """Return ``nano`` \| ``small`` \| ``medium`` \| ``large`` if the checkpoint records it."""
+    raw = ckpt.get("args")
+    if raw is None:
+        return None
+    for key in ("size", "model_size", "rfdetr_size", "rf_detr_size"):
+        v = _ckpt_get(raw, key)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            s = v.strip().lower()
+            for prefix in ("rfdetr-", "rf-detr-", "rfdetr_", "rf_detr_"):
+                if s.startswith(prefix):
+                    s = s[len(prefix) :]
+                    break
+            s = s.split(".")[0].split("/")[0].strip("-_")
+            if s in ("nano", "small", "medium", "large"):
+                return s
+    return None
+
+
+def _rfdetr_ctor_candidates(hint: str | None) -> List[Any]:
+    """Prefer checkpoint hint; otherwise try common families until one loads."""
     from rfdetr import RFDETRLarge, RFDETRMedium, RFDETRNano, RFDETRSmall
 
-    size = (model_size or "medium").strip().lower()
     table = {
         "nano": RFDETRNano,
         "small": RFDETRSmall,
         "medium": RFDETRMedium,
         "large": RFDETRLarge,
     }
-    ctor = table.get(size, RFDETRMedium)
-    cfg_class = ctor._model_config_class
+    if hint and hint in table:
+        return [table[hint]]
+    return [RFDETRMedium, RFDETRSmall, RFDETRLarge, RFDETRNano]
 
-    ckpt = _load_checkpoint_dict(weights_path) or {}
+
+def _merge_init_kwargs_for_rfdetr(ctor: type[Any], weights_path: str, ckpt: Dict[str, Any]) -> Dict[str, Any]:
+    cfg_class = ctor._model_config_class
     merged: Dict[str, Any] = dict(_rfdetr_kwargs_from_ckpt_data(ckpt, cfg_class))
     manual, manual_keys = _manual_rfdetr_overrides()
     merged.update(manual)
@@ -198,40 +225,87 @@ def _build_rfdetr(model_size: str, weights_path: str) -> Any:
         _ensure_positional_encoding_size(merged)
 
     merged["pretrain_weights"] = str(weights_path)
-    return ctor(**merged)
+    return merged
+
+
+def _optimize_rfdetr_for_inference(model: Any) -> None:
+    """Use rfdetr's export/inference path so ``predict`` skips the unoptimized warning.
+
+    ``compile=False`` keeps variable batch sizes valid (we call ``predict`` with
+    ``len(frames)`` images). If we snap ``predict(..., shape=...)``, align
+    ``model.model.resolution`` first so the optimized tensor size matches.
+    """
+    optimize = getattr(model, "optimize_for_inference", None)
+    if not callable(optimize):
+        return
+    ctx = model.model
+    orig_res = int(ctx.resolution)
+    pkw = _predict_kwargs_if_needed(model)
+    shape = pkw.get("shape")
+    if shape is not None:
+        h, w = int(shape[0]), int(shape[1])
+        if h != w:
+            return
+        ctx.resolution = h
+    try:
+        optimize(compile=False, batch_size=1, dtype=torch.float32)
+    except Exception:
+        ctx.resolution = orig_res
+        logger.warning("RF-DETR optimize_for_inference failed; using unoptimized path.", exc_info=True)
+
+
+def _build_rfdetr(weights_path: str) -> Any:
+    """Load **your** ``.pth`` only — pick ``RFDETR*`` class from checkpoint metadata or by trial."""
+    ckpt = _load_checkpoint_dict(weights_path) or {}
+    hint = _rfdetr_size_hint_from_checkpoint(ckpt)
+    errors: list[str] = []
+    for ctor in _rfdetr_ctor_candidates(hint):
+        try:
+            merged = _merge_init_kwargs_for_rfdetr(ctor, weights_path, ckpt)
+            model = ctor(**merged)
+            _optimize_rfdetr_for_inference(model)
+            return model
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{ctor.__name__}: {exc}")
+            continue
+    raise RuntimeError(
+        f"Could not load RF-DETR checkpoint {weights_path!r} (hint={hint!r}). "
+        "Attempts:\n  " + "\n  ".join(errors)
+    )
 
 
 class RfDetrTrashDetector(TrashDetector):
-    """Runs one or two RF-DETR checkpoints (e.g. ``trash.pth`` + ``cigarette.pth``) per batch.
+    """Runs **your** two RF-DETR checkpoints: ``trash.pth`` and ``cigarette.pth`` (both required).
+
+    The ``rfdetr`` size class (Nano/Small/Medium/Large) is inferred per file from checkpoint
+    ``args`` when possible, otherwise by trying families until weights load.
 
     Expects RGB inference internally; ``detect_trash`` converts BGR ``FrameData`` images.
     """
 
     def __init__(
         self,
-        weights_path: str | Path,
+        trash_weights: str | Path,
+        cigarette_weights: str | Path,
         *,
-        cigarette_weights_path: str | Path | None = None,
         class_names: Dict[int, str] | None = None,
         conf_threshold: float = 0.4,
-        model_size: str = "medium",
     ) -> None:
         self._conf = float(conf_threshold)
         self._class_names = dict(class_names) if class_names else None
-        wp = Path(weights_path)
-        if not wp.is_file():
-            raise FileNotFoundError(f"Trash RF-DETR weights not found: {wp}")
+        tw = Path(trash_weights)
+        cw = Path(cigarette_weights)
+        if not tw.is_file():
+            raise FileNotFoundError(f"RF-DETR trash weights not found: {tw}")
+        if not cw.is_file():
+            raise FileNotFoundError(f"RF-DETR cigarette weights not found: {cw}")
+        if tw.resolve() == cw.resolve():
+            raise ValueError("trash.pth and cigarette.pth must be two different checkpoint files")
 
-        self._models: List[tuple[Any, str, str]] = []
-        # (rfdetr_model, default_label_for_cls_fallback, run_tag)
-        self._models.append((_build_rfdetr(model_size, str(wp)), "trash", "trash"))
-
-        if cigarette_weights_path:
-            cp = Path(cigarette_weights_path)
-            if cp.is_file() and cp.resolve() != wp.resolve():
-                self._models.append(
-                    (_build_rfdetr(model_size, str(cp)), "cigarette", "cigarette")
-                )
+        self._models: List[tuple[Any, str, str]] = [
+            (_build_rfdetr(str(tw)), "trash", "trash"),
+            (_build_rfdetr(str(cw)), "cigarette", "cigarette"),
+        ]
 
     def detect_trash(self, frames: List[FrameData]) -> List[List[Detection]]:
         if not frames:
