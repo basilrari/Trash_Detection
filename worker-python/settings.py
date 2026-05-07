@@ -26,6 +26,11 @@ Environment variables override these values when set (same names as the variable
 RF-DETR trash is **required** for the pipeline: install ``rfdetr``, place ``weights/trash.pth``
 (``TRASH_WEIGHTS_PATH``), optional ``cigarette.pth``, and set ``TRASH_CONFIDENCE`` /
 ``RF_DETR_SIZE`` to match your checkpoints.
+
+Fine-tuned checkpoints often store training ``args`` (``patch_size``, ``resolution``,
+``num_classes``, …). Those are merged into the RF-DETR constructor when compatible with
+the chosen size class. Optional overrides: ``RF_DETR_PATCH_SIZE``, ``RF_DETR_NUM_CLASSES``,
+``RF_DETR_RESOLUTION``, ``RF_DETR_POSITIONAL_ENCODING_SIZE`` (integers; unset = do not override).
 """
 import os
 from pathlib import Path
@@ -61,8 +66,20 @@ CIGARETTE_WEIGHTS_PATH = os.getenv(
     "CIGARETTE_WEIGHTS_PATH", str(Path(__file__).resolve().parent / "weights" / "cigarette.pth")
 )
 TRASH_CONFIDENCE = float(os.getenv("TRASH_CONFIDENCE", "0.4"))
-# nano | small | medium | large — must match how checkpoints were trained
+# nano | small | medium | large — backbone family; checkpoint ``args`` still tune patch_size etc.
 RF_DETR_SIZE = os.getenv("RF_DETR_SIZE", "medium").strip().lower()
+
+
+def _optional_int_env(var: str) -> int | None:
+    raw = os.getenv(var, "").strip()
+    return int(raw) if raw else None
+
+
+# Optional RF-DETR ctor overrides (leave unset to use checkpoint ``args`` merge + library defaults)
+RF_DETR_PATCH_SIZE = _optional_int_env("RF_DETR_PATCH_SIZE")
+RF_DETR_NUM_CLASSES = _optional_int_env("RF_DETR_NUM_CLASSES")
+RF_DETR_RESOLUTION = _optional_int_env("RF_DETR_RESOLUTION")
+RF_DETR_POSITIONAL_ENCODING_SIZE = _optional_int_env("RF_DETR_POSITIONAL_ENCODING_SIZE")
 
 LP_MODEL_PATH = "path/to/lp_model.pt"
 RFDETR_MODEL_PATH = "path/to/rfdetr.pt"

@@ -3,13 +3,65 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Mapping
 
 import cv2
 import numpy as np
+import torch
 
 from core.types import Detection, FrameData
 from models.base import TrashDetector
+
+
+def _ckpt_get(args_obj: Any, key: str) -> Any:
+    if args_obj is None:
+        return None
+    if isinstance(args_obj, Mapping):
+        return args_obj.get(key)
+    return getattr(args_obj, key, None)
+
+
+def _rfdetr_kwargs_from_checkpoint(weights_path: str, cfg_class: type[Any]) -> Dict[str, Any]:
+    """Pull constructor kwargs from ``checkpoint['args']`` that exist on the model config class."""
+    allowed = frozenset(cfg_class.model_fields.keys()) - {"pretrain_weights"}
+    p = Path(weights_path)
+    if not p.is_file():
+        return {}
+    try:
+        try:
+            ckpt = torch.load(str(p), map_location="cpu", weights_only=False)
+        except TypeError:
+            ckpt = torch.load(str(p), map_location="cpu")
+    except Exception:
+        return {}
+    raw_args = ckpt.get("args")
+    out: Dict[str, Any] = {}
+    for key in allowed:
+        val = _ckpt_get(raw_args, key)
+        if val is None:
+            continue
+        out[key] = val
+    return out
+
+
+def _manual_rfdetr_overrides() -> Dict[str, Any]:
+    from settings import (
+        RF_DETR_NUM_CLASSES,
+        RF_DETR_PATCH_SIZE,
+        RF_DETR_POSITIONAL_ENCODING_SIZE,
+        RF_DETR_RESOLUTION,
+    )
+
+    out: Dict[str, Any] = {}
+    if RF_DETR_PATCH_SIZE is not None:
+        out["patch_size"] = RF_DETR_PATCH_SIZE
+    if RF_DETR_NUM_CLASSES is not None:
+        out["num_classes"] = RF_DETR_NUM_CLASSES
+    if RF_DETR_RESOLUTION is not None:
+        out["resolution"] = RF_DETR_RESOLUTION
+    if RF_DETR_POSITIONAL_ENCODING_SIZE is not None:
+        out["positional_encoding_size"] = RF_DETR_POSITIONAL_ENCODING_SIZE
+    return out
 
 
 def _sv_to_detections(
@@ -46,6 +98,17 @@ def _sv_to_detections(
     return out
 
 
+def _ensure_positional_encoding_size(merged: Dict[str, Any]) -> None:
+    """If ``resolution`` and ``patch_size`` are set but PE is not, set ``PE = resolution // patch_size``."""
+    if merged.get("positional_encoding_size") is not None:
+        return
+    res = merged.get("resolution")
+    ps = merged.get("patch_size")
+    if res is None or ps is None:
+        return
+    merged["positional_encoding_size"] = int(res) // int(ps)
+
+
 def _build_rfdetr(model_size: str, weights_path: str) -> Any:
     from rfdetr import RFDETRLarge, RFDETRMedium, RFDETRNano, RFDETRSmall
 
@@ -57,7 +120,13 @@ def _build_rfdetr(model_size: str, weights_path: str) -> Any:
         "large": RFDETRLarge,
     }
     ctor = table.get(size, RFDETRMedium)
-    return ctor(pretrain_weights=str(weights_path))
+    cfg_class = ctor._model_config_class
+
+    merged: Dict[str, Any] = dict(_rfdetr_kwargs_from_checkpoint(weights_path, cfg_class))
+    merged.update(_manual_rfdetr_overrides())
+    _ensure_positional_encoding_size(merged)
+    merged["pretrain_weights"] = str(weights_path)
+    return ctor(**merged)
 
 
 class RfDetrTrashDetector(TrashDetector):
