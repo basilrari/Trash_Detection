@@ -38,7 +38,7 @@ PERSON_LABELS = ("person",)
 OverlayLandmarks = Tuple[Tuple[NormalizedLandmark, ...], ...]
 
 
-PeeingDisplayStatus = Literal["confirmed", "suspected", "unsure"]
+PeeingDisplayStatus = Literal["confirmed", "suspected"]
 
 
 @dataclass(frozen=True)
@@ -50,8 +50,8 @@ class PeeingState:
     pose score when ``sampled`` is True.
 
     ``status`` is a coarse UI tier (all algorithmic, not human verification):
-    ``confirmed`` = sliding-window alarm latched on; ``suspected`` = elevated hit
-    rate or partial window trending up; ``unsure`` = weak or insufficient evidence.
+    ``confirmed`` = sliding-window alarm latched on; ``suspected`` = all other cases
+    (elevated hit rate, warming window, or weak evidence — no separate ``unsure`` tier).
     """
 
     active: bool
@@ -303,6 +303,10 @@ class PeeingDetector:
                 abs(float(ls.x) - float(rs.x)),
                 0.07,
             ) * 1.12
+            hip_sep = abs(float(lh.x) - float(rh.x))
+            # Narrow horizontal gate: shoulder-wide ``body_w`` was too permissive for
+            # arms hanging naturally at the sides (still inside a tall pelvic band).
+            x_cut = min(body_w * 0.62, max(hip_sep * 0.78, 0.066))
             for wrist in (lw, rw):
                 if self._lm_vis(wrist) < self.wrist_band_min_visibility:
                     continue
@@ -315,7 +319,7 @@ class PeeingDetector:
                     continue
                 if wy > gwy + self.pelvic_band_y_below:
                     continue
-                if abs(wx - gwx) > body_w * 0.98:
+                if abs(wx - gwx) > x_cut:
                     continue
                 band_score = max(band_score, 0.88)
 
@@ -323,6 +327,61 @@ class PeeingDetector:
         if eff <= 0.0:
             return 0.0
         return float(min(1.0, 0.34 + 0.66 * eff))
+
+    def _wrist_lateral_symmetry_suppressor(self, lms: list, PL) -> float:
+        """Reduce false standing hits when both wrists sit symmetrically wide at hip level.
+
+        The pelvic-band path can still fire for a neutral arms-at-side stance (wrist y
+        near hips). Peeing-like poses usually bring at least one wrist closer to the
+        midline than both elbows-out hang positions.
+        """
+        lh = lms[PL.LEFT_HIP.value]
+        rh = lms[PL.RIGHT_HIP.value]
+        lw = lms[PL.LEFT_WRIST.value]
+        rw = lms[PL.RIGHT_WRIST.value]
+        ls = lms[PL.LEFT_SHOULDER.value]
+        rs = lms[PL.RIGHT_SHOULDER.value]
+
+        def vis_ok(lm) -> bool:
+            return self._lm_vis(lm) >= self.min_visibility
+
+        if not (
+            vis_ok(lh)
+            and vis_ok(rh)
+            and vis_ok(lw)
+            and vis_ok(rw)
+            and lh.x is not None
+            and rh.x is not None
+            and lw.x is not None
+            and lw.y is not None
+            and rw.x is not None
+            and rw.y is not None
+        ):
+            return 1.0
+
+        if vis_ok(ls) and vis_ok(rs) and ls.y is not None and rs.y is not None:
+            smy = (float(ls.y) + float(rs.y)) * 0.5
+            if float(lw.y) < smy - 0.04 and float(rw.y) < smy - 0.04:
+                return 1.0
+
+        gwx = (float(lh.x) + float(rh.x)) * 0.5
+        gwy = (float(lh.y) + float(rh.y)) * 0.5
+        hip_w = abs(float(lh.x) - float(rh.x)) + 1e-6
+        lat_l = abs(float(lw.x) - gwx)
+        lat_r = abs(float(rw.x) - gwx)
+        side_ratio = min(lat_l, lat_r) / hip_w
+
+        for wy in (float(lw.y), float(rw.y)):
+            if wy < gwy + self.pelvic_band_y_above - 0.03:
+                return 1.0
+            if wy > gwy + self.pelvic_band_y_below + 0.06:
+                return 1.0
+
+        if side_ratio > 0.62:
+            return 0.18
+        if side_ratio > 0.52:
+            return 0.42
+        return 1.0
 
     def _squat_score(self, lms: list) -> float:
         PL = self._PoseLandmark
@@ -410,7 +469,10 @@ class PeeingDetector:
             return 0.0, None, 0.0, 0.0, 1.0
 
         lms = list(result.pose_landmarks[0])
-        stand = self._standing_pee_score(lms)
+        PL = self._PoseLandmark
+        stand = self._standing_pee_score(lms) * self._wrist_lateral_symmetry_suppressor(
+            lms, PL
+        )
         squat = self._squat_score(lms)
         smult = self._straddle_penalty(lms)
         score = max(stand, squat) * smult
@@ -578,7 +640,7 @@ class PeeingDetector:
         if display_active:
             return "confirmed"
         if n_samples <= 0:
-            return "unsure"
+            return "suspected"
         ex = self.alarm_exit_hit_fraction
         en = self.alarm_enter_hit_fraction
         if span_ok and n_samples >= self.alarm_min_samples:
@@ -587,7 +649,7 @@ class PeeingDetector:
         if n_samples >= 3 and hit_frac > ex + 1e-12:
             if (not span_ok) or (n_samples < self.alarm_min_samples):
                 return "suspected"
-        return "unsure"
+        return "suspected"
 
     def _finalize(
         self,

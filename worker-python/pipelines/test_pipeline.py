@@ -133,6 +133,9 @@ class FrameAnnotators:
     trash_label: Any
     yolo_label: Any
     plate_label: Any
+    # Same scale/thickness passed into LabelAnnotator — reuse for peeing status line (cv2).
+    label_text_scale: float
+    label_text_thickness: int
 
 
 def _make_frame_annotators(width: int, height: int) -> FrameAnnotators:
@@ -176,6 +179,8 @@ def _make_frame_annotators(width: int, height: int) -> FrameAnnotators:
         trash_label=trash_label,
         yolo_label=yolo_label,
         plate_label=plate_label,
+        label_text_scale=text_scale,
+        label_text_thickness=text_thickness,
     )
 
 
@@ -356,91 +361,56 @@ def _annotate_yolo_lp_ocr(
             annots.plate_label.annotate(frame, p_dets, labels=plate_label_strs)
 
 
-def _draw_peeing_overlay(frame: np.ndarray, state: PeeingState) -> None:
-    """Large top-left banner: algorithmic CONFIRMED / SUSPECTED / UNSURE (not human verification)."""
-    h, _w = frame.shape[:2]
-    font = cv2.FONT_HERSHEY_DUPLEX
-    scale = float(max(1.15, min(3.4, h / 380.0)))
-    thick = max(2, int(round(scale * 2.0)))
-    line_gap = int(6 + h / 160)
+def _draw_peeing_overlay(
+    frame: np.ndarray,
+    state: PeeingState,
+    *,
+    text_scale: float,
+    text_thickness: int,
+) -> None:
+    """Top-left single line: algorithmic status (not human verification)."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = float(max(0.22, min(0.95, text_scale)))
+    thick = max(1, min(3, int(round(text_thickness * 0.55))))
 
     tier = state.status
-    line2 = {"confirmed": "CONFIRMED", "suspected": "SUSPECTED", "unsure": "UNSURE"}.get(
-        tier, "UNSURE"
+    tier_word = {"confirmed": "CONFIRMED", "suspected": "SUSPECTED"}.get(
+        tier, "SUSPECTED"
     )
-    line1 = "PEEING"
+    text = f"PEEING {tier_word}  |  window {state.score:.0%}  (auto)"
     colors = {
         "confirmed": ((50, 255, 255), (0, 0, 0)),
         "suspected": ((60, 180, 255), (0, 0, 0)),
-        "unsure": ((190, 190, 190), (20, 20, 20)),
     }
-    fill, outline = colors.get(tier, colors["unsure"])
+    fill, outline = colors.get(tier, colors["suspected"])
 
-    def line_size(text: str) -> tuple[int, int, int]:
-        (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
-        return tw, th, bl
-
-    w1, h1, b1 = line_size(line1)
-    w2, h2, b2 = line_size(line2)
-    tw = max(w1, w2)
-
-    sub_scale = max(0.42, scale * 0.38)
-    sub_th = max(1, thick - 1)
-    sub_text = f"window hits {state.score:.0%}  (auto)"
-    (sw, sh), sbl = cv2.getTextSize(sub_text, font, sub_scale, sub_th)
-
-    pad_x, pad_y = 18, 16
-    ox = 14
-    top = 16
-    baseline1 = top + pad_y + h1
-    baseline2 = baseline1 + b1 + line_gap + h2
-    baseline3 = baseline2 + b2 + max(8, int(h / 90)) + sh
-
-    box_top = top
-    box_bottom = int(baseline3 + sbl + pad_y)
+    (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
+    pad_x, pad_y = 8, 6
+    ox = 10
+    top = 8
+    baseline = top + pad_y + th
     left = ox - pad_x
-    right = ox + max(tw, sw) + pad_x
+    right = ox + tw + pad_x
+    box_top = top
+    box_bottom = int(baseline + bl + pad_y)
 
     overlay = frame.copy()
     cv2.rectangle(overlay, (left, box_top), (right, box_bottom), (24, 24, 24), -1)
-    cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
-    cv2.rectangle(frame, (left, box_top), (right, box_bottom), (90, 90, 90), 2)
+    cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
+    cv2.rectangle(frame, (left, box_top), (right, box_bottom), (80, 80, 80), 1)
 
-    def put_outline(text: str, x: int, y_baseline: int) -> None:
-        for dx, dy in (
-            (-2, 0),
-            (2, 0),
-            (0, -2),
-            (0, 2),
-            (-1, -1),
-            (1, -1),
-            (-1, 1),
-            (1, 1),
-        ):
-            cv2.putText(
-                frame,
-                text,
-                (x + dx, y_baseline + dy),
-                font,
-                scale,
-                outline,
-                thick + 2,
-                cv2.LINE_AA,
-            )
-        cv2.putText(frame, text, (x, y_baseline), font, scale, fill, thick, cv2.LINE_AA)
-
-    put_outline(line1, ox, baseline1)
-    put_outline(line2, ox, baseline2)
-    cv2.putText(
-        frame,
-        sub_text,
-        (ox, baseline3),
-        font,
-        sub_scale,
-        (140, 140, 140),
-        sub_th,
-        cv2.LINE_AA,
-    )
+    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        cv2.putText(
+            frame,
+            text,
+            (ox + dx, baseline + dy),
+            font,
+            scale,
+            outline,
+            thick + 1,
+            cv2.LINE_AA,
+        )
+    cv2.putText(frame, text, (ox, baseline), font, scale, fill, thick, cv2.LINE_AA)
 
 
 def _annotate_frame(
@@ -455,7 +425,12 @@ def _annotate_frame(
 ) -> None:
     _draw_trash_detections(frame, trash_detections, annots)
     _annotate_yolo_lp_ocr(frame, yolo_detections, lp_detector=lp_detector, ocr=ocr, annots=annots)
-    _draw_peeing_overlay(frame, peeing_state)
+    _draw_peeing_overlay(
+        frame,
+        peeing_state,
+        text_scale=annots.label_text_scale,
+        text_thickness=annots.label_text_thickness,
+    )
 
 
 def _run_pipeline_chunked(
