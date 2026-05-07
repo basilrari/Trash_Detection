@@ -90,14 +90,14 @@ PEEING_WRIST_BAND_MIN_VISIBILITY = float(os.getenv("PEEING_WRIST_BAND_MIN_VISIBI
 PEEING_PELVIC_BAND_Y_ABOVE = float(os.getenv("PEEING_PELVIC_BAND_Y_ABOVE", "-0.06"))
 PEEING_PELVIC_BAND_Y_BELOW = float(os.getenv("PEEING_PELVIC_BAND_Y_BELOW", "0.17"))
 PEEING_STANDING_Y_MARGIN = float(os.getenv("PEEING_STANDING_Y_MARGIN", "0.03"))
-PEEING_EMA_ALPHA = float(os.getenv("PEEING_EMA_ALPHA", "0.4"))
-PEEING_ACTIVE_THRESHOLD = float(os.getenv("PEEING_ACTIVE_THRESHOLD", "0.62"))
-# Clear pose focus boxes when EMA falls below this (softer than active_threshold).
-PEEING_EMA_RELEASE_THRESHOLD = float(os.getenv("PEEING_EMA_RELEASE_THRESHOLD", "0.44"))
-# Seconds of video time with EMA >= PEEING_ACTIVE_THRESHOLD before PEEING UI / edges turn on.
-PEEING_MIN_ACTIVE_DURATION_SEC = float(os.getenv("PEEING_MIN_ACTIVE_DURATION_SEC", "5.0"))
-PEEING_DECAY_NO_YOLO = float(os.getenv("PEEING_DECAY_NO_YOLO", "0.97"))
-PEEING_DECAY_NO_PERSON = float(os.getenv("PEEING_DECAY_NO_PERSON", "0.96"))
+# Sliding window (seconds) of pose samples; alarm needs enough history in this span.
+PEEING_WINDOW_SEC = float(
+    os.getenv("PEEING_WINDOW_SEC", os.getenv("PEEING_MIN_ACTIVE_DURATION_SEC", "5.0"))
+)
+# Instant pose score on a sample counts as a "match" if >= this (0–1).
+PEEING_POSE_MATCH_THRESHOLD = float(os.getenv("PEEING_POSE_MATCH_THRESHOLD", "0.6"))
+# Fraction of pose samples in the window that must be matches (strictly greater than this value).
+PEEING_MATCH_HIT_FRACTION = float(os.getenv("PEEING_MATCH_HIT_FRACTION", "0.6"))
 PEEING_SQUAT_HIP_KNEE_GAP_MAX = float(os.getenv("PEEING_SQUAT_HIP_KNEE_GAP_MAX", "0.09"))
 PEEING_SQUAT_DEPTH_SCALE = float(os.getenv("PEEING_SQUAT_DEPTH_SCALE", "0.11"))
 PEEING_POSE_MODEL_PATH = os.getenv(

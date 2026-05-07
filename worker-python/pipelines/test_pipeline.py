@@ -19,6 +19,7 @@ See ``models/trash_detector.py``.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -42,24 +43,21 @@ from settings import (
     CIGARETTE_WEIGHTS_PATH,
     GATE_MODE,
     OUTPUT_VIDEO,
-    PEEING_ACTIVE_THRESHOLD,
     PEEING_CROP_MARGIN,
-    PEEING_DECAY_NO_PERSON,
-    PEEING_DECAY_NO_YOLO,
-    PEEING_EMA_ALPHA,
-    PEEING_EMA_RELEASE_THRESHOLD,
     PEEING_GROIN_DIST_MAX,
     PEEING_GROIN_LOOSE_FACTOR,
-    PEEING_MIN_ACTIVE_DURATION_SEC,
+    PEEING_MATCH_HIT_FRACTION,
     PEEING_MIN_VISIBILITY,
     PEEING_PELVIC_BAND_Y_ABOVE,
     PEEING_PELVIC_BAND_Y_BELOW,
+    PEEING_POSE_MATCH_THRESHOLD,
     PEEING_POSE_MODEL_PATH,
     PEEING_POSE_MODEL_URL,
     PEEING_POSE_STRIDE,
     PEEING_SQUAT_DEPTH_SCALE,
     PEEING_SQUAT_HIP_KNEE_GAP_MAX,
     PEEING_STANDING_Y_MARGIN,
+    PEEING_WINDOW_SEC,
     PEEING_WRIST_BAND_MIN_VISIBILITY,
     PLATE_CONFIDENCE,
     TRASH_CONFIDENCE,
@@ -115,6 +113,15 @@ def _is_scene_detection(d: Detection) -> bool:
 
 def _filter_scene_detections(detections: Sequence[Detection]) -> List[Detection]:
     return [d for d in detections if _is_scene_detection(d)]
+
+
+def normalize_plate_text(raw: str) -> str:
+    """Keep only letters and digits; spaces and other characters become ``-`` (collapsed)."""
+    if not raw or not str(raw).strip():
+        return ""
+    s = re.sub(r"[^0-9A-Za-z]+", "-", str(raw).strip())
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s
 
 
 @dataclass(frozen=True)
@@ -260,25 +267,6 @@ def clamp_bbox(bbox, w, h):
     return x1, y1, x2, y2
 
 
-def iou_xyxy(
-    a: tuple[float, float, float, float],
-    b: tuple[float, float, float, float],
-) -> float:
-    ax1, ay1, ax2, ay2 = map(float, a)
-    bx1, by1, bx2, by2 = map(float, b)
-    ix1 = max(ax1, bx1)
-    iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2)
-    iy2 = min(ay2, by2)
-    iw = max(0.0, ix2 - ix1)
-    ih = max(0.0, iy2 - iy1)
-    inter = iw * ih
-    aa = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    ba = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    union = aa + ba - inter + 1e-9
-    return float(inter / union)
-
-
 def _draw_trash_detections(
     frame,
     trash_detections: Sequence[Detection],
@@ -343,6 +331,7 @@ def _annotate_yolo_lp_ocr(
                 ocr_out = [("", 0.0)]
 
             plate_text, plate_conf = ocr_out[0] if ocr_out else ("", 0.0)
+            plate_text = normalize_plate_text(plate_text)
 
             if plate_conf < PLATE_CONFIDENCE:
                 continue
@@ -365,75 +354,38 @@ def _annotate_yolo_lp_ocr(
             annots.plate_label.annotate(frame, p_dets, labels=plate_label_strs)
 
 
-def _draw_peeing_on_persons(
-    frame: np.ndarray,
-    yolo_detections: Sequence[Detection],
-    state: PeeingState,
-) -> None:
-    """When peeing heuristic is active, tag only persons who match the pose focus boxes."""
+def _draw_peeing_overlay(frame: np.ndarray, state: PeeingState) -> None:
+    """Single ``PEEING`` label top-left when the sliding-window rule fires."""
     if not state.active:
         return
-    if not state.mark_bboxes:
-        return
-    h, w = frame.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.38
-    thickness = 3
-    text = "PEEING"
-    (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
-    pad = 5
-    iou_thr = 0.2
-    for det in yolo_detections:
-        if det.label not in PERSON_LABELS or det.confidence < YOLO_CONFIDENCE:
-            continue
-        bbox = clamp_bbox(tuple(map(int, det.bbox)), w, h)
-        if bbox is None:
-            continue
-        db = tuple(map(float, det.bbox))
-        if max(iou_xyxy(db, mb) for mb in state.mark_bboxes) < iou_thr:
-            continue
-        x1, y1, x2, y2 = bbox
-        cx = (x1 + x2) // 2
-        tx = int(cx - tw // 2)
-        ty = int(y1 - pad)
-        if ty < th + pad + 2:
-            ty = min(h - 2, y2 + th + pad)
-        tx = max(2, min(w - tw - pad - 2, tx))
-        bg_x1, bg_y1 = tx - pad, ty - th - pad
-        bg_x2, bg_y2 = tx + tw + pad, ty + baseline + pad
-        cv2.rectangle(frame, (bg_x1, bg_y1), (bg_x2, bg_y2), (180, 0, 220), -1)
-        cv2.rectangle(frame, (bg_x1, bg_y1), (bg_x2, bg_y2), (255, 255, 255), 1)
-        cv2.putText(frame, text, (tx, ty), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
-
-
-def _draw_peeing_overlay(frame: np.ndarray, state: PeeingState) -> None:
-    """Debug banner for the peeing heuristic (top-left, yellow)."""
-    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.9
     thick = 3
-    tag = "PEEING (active)" if state.active else "peeing"
-    extra = f" hit={state.frame_match:.2f}" if state.sampled else ""
-    line1 = f"{tag} score={state.score:.2f}{extra}"
-    cv2.putText(
+    color = (0, 255, 255)
+    outline = (0, 0, 0)
+    ox, oy = 12, 36
+    pad = 10
+    text = "PEEING"
+    (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
+    top = oy - th - pad // 2
+    bottom = oy + bl + pad // 2
+    cv2.rectangle(
         frame,
-        line1,
-        (10, 22),
-        font,
-        0.38,
-        (0, 255, 255),
-        thick,
-        cv2.LINE_AA,
+        (ox - pad, top),
+        (ox + tw + pad, bottom),
+        (20, 20, 20),
+        -1,
     )
-    if state.active:
-        cv2.putText(
-            frame,
-            "Heuristic ON — terminal for edge logs",
-            (10, 44),
-            font,
-            0.28,
-            (0, 255, 255),
-            thick,
-            cv2.LINE_AA,
-        )
+    cv2.rectangle(
+        frame,
+        (ox - pad, top),
+        (ox + tw + pad, bottom),
+        (100, 100, 100),
+        2,
+    )
+    for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+        cv2.putText(frame, text, (ox + dx, oy + dy), font, scale, outline, thick + 2, cv2.LINE_AA)
+    cv2.putText(frame, text, (ox, oy), font, scale, color, thick, cv2.LINE_AA)
 
 
 def _annotate_frame(
@@ -448,7 +400,6 @@ def _annotate_frame(
 ) -> None:
     _draw_trash_detections(frame, trash_detections, annots)
     _annotate_yolo_lp_ocr(frame, yolo_detections, lp_detector=lp_detector, ocr=ocr, annots=annots)
-    _draw_peeing_on_persons(frame, yolo_detections, peeing_state)
     _draw_peeing_overlay(frame, peeing_state)
 
 
@@ -511,14 +462,9 @@ def _run_pipeline_chunked(
                 )
                 times.peeing_sec += time.perf_counter() - t_p
                 if pstate.edge_enter:
-                    console.print(
-                        f"[bold magenta]PEEING heuristic ON[/] frame={frame_data.index} "
-                        f"score={pstate.score:.2f} instant={pstate.frame_match:.2f}"
-                    )
+                    console.print(f"[bold magenta]PEEING[/] frame={frame_data.index}")
                 if pstate.edge_exit:
-                    console.print(
-                        f"[dim]PEEING heuristic OFF[/] frame={frame_data.index} score={pstate.score:.2f}"
-                    )
+                    console.print(f"[dim]PEEING off[/] frame={frame_data.index}")
                 t0 = time.perf_counter()
                 _annotate_frame(
                     frame,
@@ -594,12 +540,9 @@ def _run_pipeline_yolo_gated(
             )
             times.peeing_sec += time.perf_counter() - t_p
             if pstate.edge_enter:
-                console.print(
-                    f"[bold magenta]PEEING heuristic ON[/] frame={frame_idx} "
-                    f"score={pstate.score:.2f} instant={pstate.frame_match:.2f}"
-                )
+                console.print(f"[bold magenta]PEEING[/] frame={frame_idx}")
             if pstate.edge_exit:
-                console.print(f"[dim]PEEING heuristic OFF[/] frame={frame_idx} score={pstate.score:.2f}")
+                console.print(f"[dim]PEEING off[/] frame={frame_idx}")
 
             t0 = time.perf_counter()
             _annotate_frame(
@@ -687,12 +630,9 @@ def run_pipeline(video_path: str, output_video: str) -> None:
             pelvic_band_y_above=PEEING_PELVIC_BAND_Y_ABOVE,
             pelvic_band_y_below=PEEING_PELVIC_BAND_Y_BELOW,
             standing_y_margin=PEEING_STANDING_Y_MARGIN,
-            ema_alpha=PEEING_EMA_ALPHA,
-            active_threshold=PEEING_ACTIVE_THRESHOLD,
-            ema_release_threshold=PEEING_EMA_RELEASE_THRESHOLD,
-            min_active_duration_sec=PEEING_MIN_ACTIVE_DURATION_SEC,
-            decay_no_yolo=PEEING_DECAY_NO_YOLO,
-            decay_no_person=PEEING_DECAY_NO_PERSON,
+            window_sec=PEEING_WINDOW_SEC,
+            pose_match_threshold=PEEING_POSE_MATCH_THRESHOLD,
+            match_hit_fraction=PEEING_MATCH_HIT_FRACTION,
             squat_hip_knee_gap_max=PEEING_SQUAT_HIP_KNEE_GAP_MAX,
             squat_depth_scale=PEEING_SQUAT_DEPTH_SCALE,
             model_path=PEEING_POSE_MODEL_PATH,
@@ -707,8 +647,8 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         raise SystemExit(2) from exc
     console.print(
         "[cyan]Peeing hint:[/] standing + squat cues; straddle penalty; "
-        f"alarm after {PEEING_MIN_ACTIVE_DURATION_SEC:.0f}s sustained above threshold "
-        f"(release EMA<{PEEING_EMA_RELEASE_THRESHOLD})."
+        f"alarm when pose score ≥{PEEING_POSE_MATCH_THRESHOLD:.0%} on >{PEEING_MATCH_HIT_FRACTION:.0%} "
+        f"of samples over {PEEING_WINDOW_SEC:.0f}s (no per-person IDs)."
     )
 
     annots = _make_frame_annotators(width, height)

@@ -1,19 +1,14 @@
-"""Heuristic peeing cue from MediaPipe Pose (Tasks API) on YOLO person crops (prototype).
+"""Heuristic peeing cue from MediaPipe Pose (Tasks API) on YOLO person crops.
 
-Runs only when the caller passes ``run_yolo=True`` (aligned with the YOLO stride gate)
-and at least one ``person`` detection is present; pose is further subsampled by
-``POSE_STRIDE`` on those eligible frames. Temporal smoothing uses an EMA on a
-per-frame max score across people.
+On each pose sample, MediaPipe runs on **every** YOLO ``person`` crop; the strongest
+instant score in that frame is recorded (no per-person IDs or tracking).
 
-**Standing urination** uses wrist proximity to hips / pelvic band (tuned to reduce
-walking / wide-stance / motorbike false positives).
+**Standing** — wrist proximity to hips / pelvic band. **Squat** — hip–knee depth (same
+``PEEING`` label). **Straddle** penalty reduces motorbike / wide stance false positives.
 
-**Squatting** (defecation posture) uses hip–knee depth; merged into the same score and
-UI label ``PEEING``.
-
-**Sustained alarm**: ``PeeingState.active`` is true only after ``min_active_duration_sec`` of
-video time with EMA **continuously** at or above ``active_threshold`` (any dip below clears
-the timer). ``ema_release_threshold`` only affects when pose focus ``mark_bboxes`` are cleared.
+**Alarm**: over the last ``window_sec`` seconds of pose samples, **more than**
+``match_hit_fraction`` of those samples must have instant pose score ≥
+``pose_match_threshold`` (defaults: 5s, **strictly** >60% of samples, score ≥ 0.6).
 
 Requires the MediaPipe **Tasks** bundle (``pose_landmarker_*.task``). If the file at
 ``model_path`` is missing, it is downloaded once from ``model_url`` (see settings).
@@ -23,9 +18,10 @@ from __future__ import annotations
 
 import logging
 import urllib.request
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Deque, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -43,7 +39,12 @@ OverlayLandmarks = Tuple[Tuple[NormalizedLandmark, ...], ...]
 
 @dataclass(frozen=True)
 class PeeingState:
-    """Latest peeing heuristic output for overlay / logging."""
+    """Latest peeing heuristic output for overlay / logging.
+
+    ``score`` is the fraction of pose samples in the current window that are hits
+    (only meaningful once the window is full). ``frame_match`` is the latest instant
+    pose score when ``sampled`` is True.
+    """
 
     active: bool
     score: float
@@ -52,7 +53,6 @@ class PeeingState:
     overlay_landmarks: OverlayLandmarks
     edge_enter: bool
     edge_exit: bool
-    # YOLO person xyxy (pixel) tied to the latest strong pose sample; used to tag chips.
     mark_bboxes: Tuple[Tuple[float, float, float, float], ...]
 
 
@@ -82,12 +82,9 @@ class PeeingDetector:
         min_visibility: float = 0.45,
         groin_dist_max: float = 0.13,
         standing_y_margin: float = 0.03,
-        ema_alpha: float = 0.4,
-        active_threshold: float = 0.62,
-        ema_release_threshold: float = 0.44,
-        min_active_duration_sec: float = 5.0,
-        decay_no_yolo: float = 0.97,
-        decay_no_person: float = 0.96,
+        window_sec: float = 5.0,
+        pose_match_threshold: float = 0.6,
+        match_hit_fraction: float = 0.6,
         min_crop_side: int = 48,
         model_path: str | None = None,
         model_url: str | None = None,
@@ -107,12 +104,11 @@ class PeeingDetector:
         self.pelvic_band_y_above = float(pelvic_band_y_above)
         self.pelvic_band_y_below = float(pelvic_band_y_below)
         self.standing_y_margin = float(standing_y_margin)
-        self.ema_alpha = float(ema_alpha)
-        self.active_threshold = float(active_threshold)
-        self.ema_release_threshold = float(ema_release_threshold)
-        self.min_active_duration_sec = float(max(0.0, min_active_duration_sec))
-        self.decay_no_yolo = float(decay_no_yolo)
-        self.decay_no_person = float(decay_no_person)
+        self.window_sec = float(max(1e-6, window_sec))
+        self.pose_match_threshold = float(pose_match_threshold)
+        self.match_hit_fraction = float(
+            max(0.0, min(1.0, match_hit_fraction))
+        )
         self.min_crop_side = int(min_crop_side)
         self.squat_hip_knee_gap_max = float(squat_hip_knee_gap_max)
         self.squat_depth_scale = float(max(1e-6, squat_depth_scale))
@@ -137,10 +133,9 @@ class PeeingDetector:
         self._landmarker = PoseLandmarker.create_from_model_path(resolved_path)
 
         self._stride_counter = 0
-        self._ema = 0.0
         self._last_display_active = False
         self._mark_bboxes: Tuple[Tuple[float, float, float, float], ...] = tuple()
-        self._sustain_start_t: float | None = None
+        self._pose_samples: Deque[tuple[float, bool]] = deque()
 
     def close(self) -> None:
         lm = getattr(self, "_landmarker", None)
@@ -150,10 +145,9 @@ class PeeingDetector:
 
     def reset(self) -> None:
         self._stride_counter = 0
-        self._ema = 0.0
         self._last_display_active = False
         self._mark_bboxes = tuple()
-        self._sustain_start_t = None
+        self._pose_samples.clear()
 
     def _person_detections(
         self, detections: Sequence[Detection], yolo_conf: float
@@ -186,7 +180,6 @@ class PeeingDetector:
         return float(v)
 
     def _upright_standing(self, lms: list, PL) -> bool:
-        """True when hips are clearly above knees (typical standing), not seated / straddle."""
         lh = lms[PL.LEFT_HIP.value]
         rh = lms[PL.RIGHT_HIP.value]
         lk = lms[PL.LEFT_KNEE.value]
@@ -219,7 +212,6 @@ class PeeingDetector:
         return leg_ok
 
     def _standing_pee_score(self, lms: list) -> float:
-        """Wrist near groin / pelvic band; only when clearly upright standing."""
         PL = self._PoseLandmark
 
         def lm_at(idx: int):
@@ -316,7 +308,6 @@ class PeeingDetector:
         return float(min(1.0, 0.34 + 0.66 * eff))
 
     def _squat_score(self, lms: list) -> float:
-        """Deep squat / hips dropped toward knees (defecation cue); same UI label as peeing."""
         PL = self._PoseLandmark
         lh, rh = lms[PL.LEFT_HIP.value], lms[PL.RIGHT_HIP.value]
         lk, rk = lms[PL.LEFT_KNEE.value], lms[PL.RIGHT_KNEE.value]
@@ -338,7 +329,6 @@ class PeeingDetector:
 
         hip_m = (float(lh.y) + float(rh.y)) * 0.5
         knee_m = (float(lk.y) + float(rk.y)) * 0.5
-        # Hips near or below knee line in image = crouched / squat (y grows downward).
         if hip_m < knee_m - self.squat_hip_knee_gap_max:
             return 0.0
         depth = (hip_m - (knee_m - self.squat_hip_knee_gap_max)) / self.squat_depth_scale
@@ -346,7 +336,6 @@ class PeeingDetector:
         return float(min(1.0, 0.38 + 0.58 * depth))
 
     def _straddle_penalty(self, lms: list) -> float:
-        """Down-weight motorbike / wide straddle: large ankle or knee span vs hip width."""
         PL = self._PoseLandmark
         lh, rh = lms[PL.LEFT_HIP.value], lms[PL.RIGHT_HIP.value]
         lk, rk = lms[PL.LEFT_KNEE.value], lms[PL.RIGHT_KNEE.value]
@@ -388,10 +377,12 @@ class PeeingDetector:
 
         return mult
 
-    def _pose_on_crop(self, crop_bgr: np.ndarray) -> tuple[float, list | None]:
-        """Run pose on one BGR crop; return (heuristic score, crop-normalized landmarks or None)."""
+    def _pose_on_crop(
+        self, crop_bgr: np.ndarray
+    ) -> tuple[float, list | None, float, float, float]:
+        """Returns ``(score, landmarks_or_none, standing, squat, straddle_mult)``."""
         if crop_bgr.size == 0 or crop_bgr.shape[0] < 16 or crop_bgr.shape[1] < 16:
-            return 0.0, None
+            return 0.0, None, 0.0, 0.0, 1.0
         rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
         if not rgb.flags["C_CONTIGUOUS"]:
             rgb = np.ascontiguousarray(rgb)
@@ -399,15 +390,15 @@ class PeeingDetector:
         mp_image = self._mp_image_mod.Image(self._mp_image_mod.ImageFormat.SRGB, rgb)
         result = self._landmarker.detect(mp_image)
         if not result.pose_landmarks:
-            return 0.0, None
+            return 0.0, None, 0.0, 0.0, 1.0
 
         lms = list(result.pose_landmarks[0])
         stand = self._standing_pee_score(lms)
         squat = self._squat_score(lms)
-        score = max(stand, squat)
-        score *= self._straddle_penalty(lms)
+        smult = self._straddle_penalty(lms)
+        score = max(stand, squat) * smult
         score = float(min(1.0, max(0.0, score)))
-        return score, lms
+        return score, lms, stand, squat, smult
 
     def _to_full_frame_landmarks(
         self,
@@ -448,19 +439,87 @@ class PeeingDetector:
             )
         return tuple(out)
 
-    def _update_sustained(self, timestamp_sec: float) -> bool:
-        """``active`` is on only after ``min_active_duration_sec`` with EMA >= ``active_threshold``."""
-        if self._ema >= self.active_threshold:
-            if self._sustain_start_t is None:
-                self._sustain_start_t = float(timestamp_sec)
-        else:
-            self._sustain_start_t = None
+    def debug_analyze_crop(self, crop_bgr: np.ndarray) -> dict[str, Any]:
+        """JSON-friendly pose + heuristic breakdown for one BGR crop (copy-paste / tuning)."""
+        score, lms, stand, squat, smult = self._pose_on_crop(crop_bgr)
+        out: dict[str, Any] = {
+            "final_score": score,
+            "standing_score": stand,
+            "squat_score": squat,
+            "straddle_multiplier": smult,
+            "pose_match_threshold": self.pose_match_threshold,
+            "counts_as_hit_now": bool(score >= self.pose_match_threshold),
+            "landmarks_normalized_in_crop": None,
+        }
+        if lms is None:
+            return out
+        lrows: list[dict[str, Any]] = []
+        for i, lm in enumerate(lms):
+            row: dict[str, Any] = {"index": i}
+            if lm.x is not None:
+                row["x"] = round(float(lm.x), 6)
+            if lm.y is not None:
+                row["y"] = round(float(lm.y), 6)
+            vz = getattr(lm, "z", None)
+            if vz is not None:
+                row["z"] = round(float(vz), 6)
+            vv = getattr(lm, "visibility", None)
+            if vv is not None:
+                row["visibility"] = round(float(vv), 6)
+            name = getattr(lm, "name", None)
+            if name:
+                row["name"] = str(name)
+            lrows.append(row)
+        out["landmarks_normalized_in_crop"] = lrows
+        return out
 
-        if self._sustain_start_t is None:
-            return False
-        if self.min_active_duration_sec <= 0.0:
-            return True
-        return (float(timestamp_sec) - self._sustain_start_t) >= self.min_active_duration_sec
+    def debug_person_reports(
+        self,
+        frame_bgr: np.ndarray,
+        detections: Sequence[Detection],
+        *,
+        yolo_conf: float,
+    ) -> list[dict[str, Any]]:
+        """One report dict per YOLO person (after ``yolo_conf`` filter), with pose landmarks."""
+        h, w = frame_bgr.shape[:2]
+        reports: list[dict[str, Any]] = []
+        for j, d in enumerate(self._person_detections(detections, yolo_conf)):
+            box = self._clamp_crop(d.bbox, w, h)
+            rec: dict[str, Any] = {
+                "person_index": j,
+                "yolo_label": d.label,
+                "yolo_confidence": float(d.confidence),
+                "bbox_xyxy_global": [float(x) for x in d.bbox],
+                "crop_used_xyxy": None,
+            }
+            if box is None:
+                rec["error"] = "crop too small after padding"
+                reports.append(rec)
+                continue
+            x1, y1, x2, y2 = box
+            rec["crop_used_xyxy"] = [x1, y1, x2, y2]
+            crop = frame_bgr[y1:y2, x1:x2]
+            rec.update(self.debug_analyze_crop(crop))
+            reports.append(rec)
+        return reports
+
+    def _trim_pose_samples(self, timestamp_sec: float) -> None:
+        t_cut = float(timestamp_sec) - self.window_sec
+        while self._pose_samples and self._pose_samples[0][0] < t_cut:
+            self._pose_samples.popleft()
+
+    def _window_active(self, timestamp_sec: float) -> tuple[bool, float]:
+        self._trim_pose_samples(timestamp_sec)
+        if not self._pose_samples:
+            return False, 0.0
+        oldest = self._pose_samples[0][0]
+        if float(timestamp_sec) - oldest < self.window_sec - 1e-9:
+            return False, 0.0
+        total = len(self._pose_samples)
+        hits = sum(1 for _, ok in self._pose_samples if ok)
+        frac = hits / total
+        active = frac > self.match_hit_fraction + 1e-12
+        return active, float(frac)
 
     def _finalize(
         self,
@@ -470,19 +529,19 @@ class PeeingDetector:
         overlay: OverlayLandmarks,
         timestamp_sec: float,
     ) -> PeeingState:
-        display_active = self._update_sustained(timestamp_sec)
+        display_active, hit_frac = self._window_active(timestamp_sec)
         edge_enter = display_active and not self._last_display_active
         edge_exit = (not display_active) and self._last_display_active
         self._last_display_active = display_active
 
-        if self._ema < self.ema_release_threshold:
+        if not display_active:
             self._mark_bboxes = tuple()
 
         overlay_out: OverlayLandmarks = overlay if display_active else tuple()
 
         return PeeingState(
             active=display_active,
-            score=float(self._ema),
+            score=float(hit_frac),
             sampled=sampled,
             frame_match=float(frame_match),
             overlay_landmarks=overlay_out,
@@ -504,14 +563,12 @@ class PeeingDetector:
         empty_overlay: OverlayLandmarks = tuple()
 
         if not run_yolo:
-            self._ema *= self.decay_no_yolo
             return self._finalize(
                 sampled=False, frame_match=0.0, overlay=empty_overlay, timestamp_sec=timestamp_sec
             )
 
         persons = self._person_detections(detections, yolo_conf)
         if not persons:
-            self._ema *= self.decay_no_person
             return self._finalize(
                 sampled=False, frame_match=0.0, overlay=empty_overlay, timestamp_sec=timestamp_sec
             )
@@ -529,18 +586,21 @@ class PeeingDetector:
                 continue
             x1, y1, x2, y2 = box
             crop = frame_bgr[y1:y2, x1:x2]
-            score, lms = self._pose_on_crop(crop)
+            score, lms, _stand, _squat, _smult = self._pose_on_crop(crop)
             ov = self._to_full_frame_landmarks(lms, x1, y1, x2, y2, w, h) if lms else None
             entries.append((d, score, ov))
 
+        ts = float(timestamp_sec)
         if not entries:
+            self._pose_samples.append((ts, False))
             return self._finalize(
                 sampled=True, frame_match=0.0, overlay=tuple(), timestamp_sec=timestamp_sec
             )
 
         scores = [e[1] for e in entries]
         best = max(scores) if scores else 0.0
-        self._ema = self.ema_alpha * best + (1.0 - self.ema_alpha) * self._ema
+        hit = best >= self.pose_match_threshold
+        self._pose_samples.append((ts, hit))
 
         eps = 1e-4
         focus_min = 0.14
