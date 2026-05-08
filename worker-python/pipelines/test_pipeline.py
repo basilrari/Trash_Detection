@@ -13,8 +13,8 @@ Run from worker-python/ (put source videos in inputs/, results under outputs/ by
 
 **Gate (``GATE_MODE``)** — default ``yolo``; see ``settings.py`` and ``Readme.md`` § Gating.
 
-**RF-DETR** — required: ``pip install rfdetr``, **both** ``weights/trash.pth`` and ``weights/cigarette.pth``.
-See ``models/trash_detector.py``.
+**RF-DETR** — TensorRT engines: ``weights/trash.engine`` and ``weights/cigarette.engine``
+(``TRASH_ENGINE_PATH`` / ``CIGARETTE_ENGINE_PATH``); see ``models/rfdetr_trt_trash.py``.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Sequence
+from typing import Any, List, Sequence
 
 import cv2
 import numpy as np
@@ -33,6 +33,7 @@ import supervision as sv
 from tqdm import tqdm
 from rich.console import Console
 
+from models.base import TrashDetector
 from models.yolo_detector import YoloDetector
 from models.lp_detector import LpDetector
 from models.ocr import Ocr
@@ -41,7 +42,7 @@ from core.types import Detection, FrameData
 from core.yolo_stride_gate import YoloStrideGate, YoloStrideGateConfig
 from settings import (
     CHUNK_SECONDS,
-    CIGARETTE_WEIGHTS_PATH,
+    CIGARETTE_ENGINE_PATH,
     GATE_MODE,
     OUTPUT_VIDEO,
     PEEING_CROP_MARGIN,
@@ -64,16 +65,13 @@ from settings import (
     PEEING_WRIST_BAND_MIN_VISIBILITY,
     PLATE_CONFIDENCE,
     TRASH_CONFIDENCE,
-    TRASH_WEIGHTS_PATH,
+    TRASH_ENGINE_PATH,
     VIDEO_PATH,
     YOLO_COARSE_STRIDE,
     YOLO_CONFIDENCE,
     YOLO_DENSE_STRIDE,
     YOLO_DENSE_IDLE_MISS_STREAK,
 )
-
-if TYPE_CHECKING:
-    from models.trash_detector import RfDetrTrashDetector
 
 console = Console()
 
@@ -86,19 +84,34 @@ class PipelineStepTimes:
     yolo_sec: float = 0.0
     trash_sec: float = 0.0
     peeing_sec: float = 0.0
-    annotate_sec: float = 0.0
+    annotate_draw_sec: float = 0.0
+    lp_sec: float = 0.0
+    ocr_sec: float = 0.0
     video_write_sec: float = 0.0
     other_sec: float = 0.0  # open video, build writer, gate setup, chunk assembly
 
     def print_summary(self, *, wall_total_sec: float) -> None:
-        inf = self.yolo_sec + self.trash_sec + self.peeing_sec + self.annotate_sec + self.video_write_sec
+        ann = (
+            self.annotate_draw_sec
+            + self.lp_sec
+            + self.ocr_sec
+        )
+        inf = (
+            self.yolo_sec
+            + self.trash_sec
+            + self.peeing_sec
+            + ann
+            + self.video_write_sec
+        )
         console.print("[bold]Step timings (cumulative)[/]")
         console.print(f"  Model init:           {self.init_sec:8.2f} s")
         console.print(f"  Other (I/O, chunks):  {self.other_sec:8.2f} s")
         console.print(f"  YOLO:                 {self.yolo_sec:8.2f} s")
         console.print(f"  RF-DETR (trash):      {self.trash_sec:8.2f} s")
         console.print(f"  Peeing (MediaPipe):   {self.peeing_sec:8.2f} s")
-        console.print(f"  Annotate + LP + OCR: {self.annotate_sec:8.2f} s")
+        console.print(f"  Annotate (draw only): {self.annotate_draw_sec:8.2f} s")
+        console.print(f"  LP detect:            {self.lp_sec:8.2f} s")
+        console.print(f"  OCR:                  {self.ocr_sec:8.2f} s")
         console.print(f"  Video write:          {self.video_write_sec:8.2f} s")
         console.print(f"  [dim]Sum (inference): {inf:8.2f} s[/]")
         console.print(f"  [bold]Wall clock total:   {wall_total_sec:8.2f} s[/]")
@@ -213,44 +226,42 @@ def _detections_to_sv(
     return sv.Detections(xyxy=xyxy, confidence=conf, class_id=class_id), labels
 
 
-def _load_trash_detector_required() -> "RfDetrTrashDetector":
-    """Load both RF-DETR heads; exit if ``rfdetr`` or either weights file is missing."""
-    tw = Path(TRASH_WEIGHTS_PATH)
-    cig = Path(CIGARETTE_WEIGHTS_PATH)
-    if not tw.is_file():
+def _load_trash_detector_required():
+    """Load both RF-DETR heads from TensorRT ``.engine`` files only (no PyTorch / ONNX fallback)."""
+    te = Path(TRASH_ENGINE_PATH)
+    ce = Path(CIGARETTE_ENGINE_PATH)
+    if not te.is_file():
         console.print(
-            f"[red]RF-DETR is required but trash weights not found:[/] {tw}\n"
-            "Place your checkpoint at worker-python/weights/trash.pth."
+            f"[red]RF-DETR requires trash TensorRT engine:[/] {te}\n"
+            "Place ``trash.engine`` under worker-python/weights/ or set TRASH_ENGINE_PATH."
         )
         raise SystemExit(2)
-    if not cig.is_file():
+    if not ce.is_file():
         console.print(
-            f"[red]RF-DETR is required but cigarette weights not found:[/] {cig}\n"
-            "Place your checkpoint at worker-python/weights/cigarette.pth."
+            f"[red]RF-DETR requires cigarette TensorRT engine:[/] {ce}\n"
+            "Place ``cigarette.engine`` under worker-python/weights/ or set CIGARETTE_ENGINE_PATH."
         )
         raise SystemExit(2)
-    if tw.resolve() == cig.resolve():
-        console.print("[red]trash.pth and cigarette.pth must be two different files.[/]")
+    if te.resolve() == ce.resolve():
+        console.print("[red]trash.engine and cigarette.engine must be two different files.[/]")
         raise SystemExit(2)
-    from models.trash_detector import RfDetrTrashDetector
+    from models.rfdetr_trt_trash import RfDetrTrtTrashDetector
 
     try:
-        return RfDetrTrashDetector(
-            tw,
-            cig,
+        return RfDetrTrtTrashDetector(
+            te,
+            ce,
             class_names=None,
             conf_threshold=TRASH_CONFIDENCE,
         )
-    except ModuleNotFoundError as exc:
-        if getattr(exc, "name", "") == "rfdetr":
-            console.print(
-                "[red]RF-DETR is required but the ``rfdetr`` package is not installed.[/]\n"
-                "Install with: [bold]pip install rfdetr[/]"
-            )
-            raise SystemExit(2) from exc
-        raise
+    except ImportError as exc:
+        console.print(
+            "[red]RF-DETR TensorRT requires tensorrt and pycuda.[/]\n"
+            "Example: [bold]pip install tensorrt pycuda[/]"
+        )
+        raise SystemExit(2) from exc
     except Exception as exc:  # noqa: BLE001
-        console.print(f"[red]RF-DETR failed to load (required):[/] {exc}")
+        console.print(f"[red]RF-DETR TensorRT failed to load:[/] {exc}")
         raise SystemExit(3) from exc
 
 
@@ -295,6 +306,7 @@ def _annotate_yolo_lp_ocr(
     lp_detector: LpDetector,
     ocr: Ocr,
     annots: FrameAnnotators,
+    times: PipelineStepTimes,
 ) -> None:
     """Draw YOLO labels (no boxes), then LP + OCR on vehicle crops (mutates ``frame`` in place).
 
@@ -305,8 +317,10 @@ def _annotate_yolo_lp_ocr(
     scene = _filter_scene_detections(detections)
 
     yolo_dets, yolo_labels = _detections_to_sv(scene, w, h)
+    t_draw = time.perf_counter()
     if yolo_labels:
         annots.yolo_label.annotate(frame, yolo_dets, labels=yolo_labels)
+    times.annotate_draw_sec += time.perf_counter() - t_draw
 
     vehicles = [d for d in scene if d.label in VEHICLE_LABELS and d.confidence >= YOLO_CONFIDENCE]
     veh_crops: list[tuple[int, int, int, int, np.ndarray]] = []
@@ -326,7 +340,9 @@ def _annotate_yolo_lp_ocr(
     fd_list = [
         FrameData(index=i, timestamp=0.0, image=entry[4]) for i, entry in enumerate(veh_crops)
     ]
+    t_lp = time.perf_counter()
     plates_per_frame = lp_detector.detect_plates(fd_list)
+    times.lp_sec += time.perf_counter() - t_lp
 
     ocr_crops: list[np.ndarray] = []
     ocr_geos: list[tuple[int, int, int, int]] = []
@@ -353,11 +369,13 @@ def _annotate_yolo_lp_ocr(
     if not ocr_crops:
         return
 
+    t_ocr = time.perf_counter()
     try:
         ocr_out = ocr.recognize(ocr_crops)
     except Exception as e:
         console.print(f"[yellow]OCR error:[/] {str(e)}")
         ocr_out = [("", 0.0)] * len(ocr_crops)
+    times.ocr_sec += time.perf_counter() - t_ocr
     if len(ocr_out) != len(ocr_crops):
         ocr_out = list(ocr_out) + [("", 0.0)] * max(0, len(ocr_crops) - len(ocr_out))
         ocr_out = ocr_out[: len(ocr_crops)]
@@ -375,12 +393,14 @@ def _annotate_yolo_lp_ocr(
         label_str = f"{plate_text} {plate_conf:.2f}" if plate_text else f"{plate_conf:.2f}"
         plate_label_strs.append(label_str)
 
+    t_plate = time.perf_counter()
     if plate_rows:
         p_xyxy = np.asarray(plate_rows, dtype=np.float32)
         p_conf = np.asarray(plate_confs, dtype=np.float32)
         p_cls = np.zeros(len(plate_rows), dtype=np.int64)
         p_dets = sv.Detections(xyxy=p_xyxy, confidence=p_conf, class_id=p_cls)
         annots.plate_label.annotate(frame, p_dets, labels=plate_label_strs)
+    times.annotate_draw_sec += time.perf_counter() - t_plate
 
 
 def _draw_peeing_overlay(
@@ -444,15 +464,27 @@ def _annotate_frame(
     ocr: Ocr,
     annots: FrameAnnotators,
     peeing_state: PeeingState,
+    times: PipelineStepTimes,
 ) -> None:
+    t0 = time.perf_counter()
     _draw_trash_detections(frame, trash_detections, annots)
-    _annotate_yolo_lp_ocr(frame, yolo_detections, lp_detector=lp_detector, ocr=ocr, annots=annots)
+    times.annotate_draw_sec += time.perf_counter() - t0
+    _annotate_yolo_lp_ocr(
+        frame,
+        yolo_detections,
+        lp_detector=lp_detector,
+        ocr=ocr,
+        annots=annots,
+        times=times,
+    )
+    t0 = time.perf_counter()
     _draw_peeing_overlay(
         frame,
         peeing_state,
         text_scale=annots.label_text_scale,
         text_thickness=annots.label_text_thickness,
     )
+    times.annotate_draw_sec += time.perf_counter() - t0
 
 
 def _run_pipeline_chunked(
@@ -465,7 +497,7 @@ def _run_pipeline_chunked(
     yolo: YoloDetector,
     lp_detector: LpDetector,
     ocr: Ocr,
-    trash: "RfDetrTrashDetector",
+    trash: TrashDetector,
     times: PipelineStepTimes,
     annots: FrameAnnotators,
     peeing: PeeingDetector,
@@ -517,7 +549,6 @@ def _run_pipeline_chunked(
                     console.print(f"[bold magenta]PEEING[/] frame={frame_data.index}")
                 if pstate.edge_exit:
                     console.print(f"[dim]PEEING off[/] frame={frame_data.index}")
-                t0 = time.perf_counter()
                 _annotate_frame(
                     frame,
                     trash_per_frame[i],
@@ -526,8 +557,8 @@ def _run_pipeline_chunked(
                     ocr=ocr,
                     annots=annots,
                     peeing_state=pstate,
+                    times=times,
                 )
-                times.annotate_sec += time.perf_counter() - t0
                 t0 = time.perf_counter()
                 out.write(frame)
                 times.video_write_sec += time.perf_counter() - t0
@@ -540,6 +571,18 @@ def _run_pipeline_chunked(
             pass
 
 
+def _rfdetr_engine_batch(trash: TrashDetector) -> int:
+    """TensorRT engines use a static batch; PyTorch path may omit ``engine_batch_size``."""
+    bs = getattr(trash, "engine_batch_size", None)
+    return max(1, int(bs)) if bs is not None else 8
+
+
+def _pad_rfdetr_frame(template: FrameData) -> FrameData:
+    """Black frame for TensorRT fixed-batch padding (tail / streak break)."""
+    blank = np.zeros_like(template.image)
+    return FrameData(index=-1, timestamp=0.0, image=blank)
+
+
 def _run_pipeline_yolo_gated(
     *,
     cap: cv2.VideoCapture,
@@ -550,13 +593,84 @@ def _run_pipeline_yolo_gated(
     lp_detector: LpDetector,
     ocr: Ocr,
     gate: YoloStrideGate,
-    trash: "RfDetrTrashDetector",
+    trash: TrashDetector,
     times: PipelineStepTimes,
     annots: FrameAnnotators,
     peeing: PeeingDetector,
 ) -> None:
+    """YOLO stride gate with **batched** RF-DETR on consecutive YOLO frames (engine batch ``B``).
+
+    When ``run_yolo`` is true, frames are queued; ``detect_trash`` runs on each full batch of ``B``
+    real frames. On a non-YOLO frame or at EOF, any remainder ``1..B-1`` is padded once (black
+    frames) so TensorRT always sees a full batch. Frames are written in index order via a stash.
+    """
+    B = _rfdetr_engine_batch(trash)
     pbar = tqdm(total=total_frames, desc="Processing video (YOLO stride gate)")
     frame_idx = 0
+    emit_idx = 0
+    stash: dict[int, tuple[np.ndarray, List[Detection], List[Detection], PeeingState]] = {}
+    rfdetr_q: list[tuple[FrameData, List[Detection], PeeingState]] = []
+
+    def emit_ready() -> None:
+        nonlocal emit_idx
+        while emit_idx in stash:
+            img, td, scene, pst = stash.pop(emit_idx)
+            _annotate_frame(
+                img,
+                td,
+                scene,
+                lp_detector=lp_detector,
+                ocr=ocr,
+                annots=annots,
+                peeing_state=pst,
+                times=times,
+            )
+            t0 = time.perf_counter()
+            out.write(img)
+            times.video_write_sec += time.perf_counter() - t0
+            emit_idx += 1
+
+    def flush_one_rfdetr_batch() -> None:
+        nonlocal rfdetr_q
+        if len(rfdetr_q) < B:
+            return
+        batch = rfdetr_q[:B]
+        rfdetr_q = rfdetr_q[B:]
+        fds = [x[0] for x in batch]
+        t0 = time.perf_counter()
+        outs = trash.detect_trash(fds)
+        times.trash_sec += time.perf_counter() - t0
+        for j in range(B):
+            fd, scene, pst = batch[j]
+            td = list(outs[j]) if j < len(outs) else []
+            stash[fd.index] = (fd.image, td, scene, pst)
+        emit_ready()
+
+    def flush_rfdetr_padded_tail() -> None:
+        nonlocal rfdetr_q
+        n = len(rfdetr_q)
+        if n == 0:
+            return
+        batch = list(rfdetr_q)
+        rfdetr_q.clear()
+        fds = [b[0] for b in batch]
+        pad_fd = _pad_rfdetr_frame(fds[-1])
+        while len(fds) < B:
+            fds.append(pad_fd)
+        t0 = time.perf_counter()
+        outs = trash.detect_trash(fds)
+        times.trash_sec += time.perf_counter() - t0
+        for j in range(n):
+            fd, scene, pst = batch[j]
+            td = list(outs[j]) if j < len(outs) else []
+            stash[fd.index] = (fd.image, td, scene, pst)
+        emit_ready()
+
+    def drain_rfdetr_before_non_yolo() -> None:
+        while len(rfdetr_q) >= B:
+            flush_one_rfdetr_batch()
+        flush_rfdetr_padded_tail()
+
     try:
         while True:
             t_read = time.perf_counter()
@@ -566,20 +680,16 @@ def _run_pipeline_yolo_gated(
                 break
 
             run_yolo = gate.should_run_yolo(frame_idx)
-            trash_dets: List[Detection] = []
             scene_dets: List[Detection] = []
+            fd_opt: FrameData | None = None
             if run_yolo:
-                fd = FrameData(index=frame_idx, timestamp=frame_idx / fps, image=frame)
+                fd_opt = FrameData(index=frame_idx, timestamp=frame_idx / fps, image=frame.copy())
                 t0 = time.perf_counter()
-                dets_list = yolo.detect([fd])
+                dets_list = yolo.detect([fd_opt])
                 times.yolo_sec += time.perf_counter() - t0
                 detections = dets_list[0] if dets_list else []
                 scene_dets = _filter_scene_detections(detections)
                 gate.observe(frame_idx, _scene_has_activity(scene_dets, YOLO_CONFIDENCE))
-                t0 = time.perf_counter()
-                tlist = trash.detect_trash([fd])
-                times.trash_sec += time.perf_counter() - t0
-                trash_dets = list(tlist[0]) if tlist else []
 
             t_p = time.perf_counter()
             ts = frame_idx / fps
@@ -596,23 +706,21 @@ def _run_pipeline_yolo_gated(
             if pstate.edge_exit:
                 console.print(f"[dim]PEEING off[/] frame={frame_idx}")
 
-            t0 = time.perf_counter()
-            _annotate_frame(
-                frame,
-                trash_dets,
-                scene_dets,
-                lp_detector=lp_detector,
-                ocr=ocr,
-                annots=annots,
-                peeing_state=pstate,
-            )
-            times.annotate_sec += time.perf_counter() - t0
-            t0 = time.perf_counter()
-            out.write(frame)
-            times.video_write_sec += time.perf_counter() - t0
+            if run_yolo and fd_opt is not None:
+                rfdetr_q.append((fd_opt, scene_dets, pstate))
+                while len(rfdetr_q) >= B:
+                    flush_one_rfdetr_batch()
+            else:
+                drain_rfdetr_before_non_yolo()
+                stash[frame_idx] = (frame.copy(), [], scene_dets, pstate)
+                emit_ready()
 
             frame_idx += 1
             pbar.update(1)
+
+        while len(rfdetr_q) >= B:
+            flush_one_rfdetr_batch()
+        flush_rfdetr_padded_tail()
 
         pbar.close()
     finally:

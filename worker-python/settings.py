@@ -22,17 +22,16 @@ Gating (YOLO stride) — default ``GATE_MODE=yolo`` (see ``core/yolo_stride_gate
 
 Environment variables override these values when set (same names as the variables).
 
-RF-DETR is **required**: install ``rfdetr``, place **both** ``weights/trash.pth`` and
-``weights/cigarette.pth`` (``TRASH_WEIGHTS_PATH`` / ``CIGARETTE_WEIGHTS_PATH``), and set
-``TRASH_CONFIDENCE``. The ``rfdetr`` model family is inferred from each checkpoint (``args``
-or trial load); no separate size setting.
+RF-DETR: the video pipeline uses **TensorRT** engines only — ``weights/trash.engine`` and
+``weights/cigarette.engine`` (``TRASH_ENGINE_PATH`` / ``CIGARETTE_ENGINE_PATH``) and
+``TRASH_CONFIDENCE``. Requires ``tensorrt`` and ``pycuda``. Static batch and input size are
+fixed inside each engine (see ``models/rfdetr_trt_trash.py``).
 
-Fine-tuned checkpoints often store training ``args`` (``patch_size``, ``resolution``,
-``num_classes``, …). Those are merged into the RF-DETR constructor when compatible with
-the inferred size class. If ``args`` omit backbone geometry, ``positional_encoding_size`` and
-``resolution`` are inferred from the saved ``position_embeddings`` tensor when the patch grid
-is square. Optional overrides: ``RF_DETR_PATCH_SIZE``, ``RF_DETR_NUM_CLASSES``,
-``RF_DETR_RESOLUTION``, ``RF_DETR_POSITIONAL_ENCODING_SIZE`` (integers; unset = do not override).
+Optional: ``RF_DETR_PARALLEL_HEADS`` — default **on** (trash + cigarette heads in parallel
+threads for both PyTorch and TensorRT paths). Set to ``0`` / ``false`` / ``off`` to force
+sequential heads on one GPU.
+
+Optional path overrides: ``TRASH_ENGINE_PATH``, ``CIGARETTE_ENGINE_PATH`` (same names as settings).
 """
 import os
 from pathlib import Path
@@ -62,10 +61,10 @@ YOLO_COARSE_STRIDE = int(os.getenv("YOLO_COARSE_STRIDE", "8"))
 YOLO_DENSE_STRIDE = int(os.getenv("YOLO_DENSE_STRIDE", "2"))
 YOLO_DENSE_IDLE_MISS_STREAK = max(1, int(os.getenv("YOLO_DENSE_IDLE_MISS_STREAK", "10")))
 
-# --- RF-DETR trash / cigarette (required; ``pip install rfdetr``) ---
-# Fixed local checkpoints only (no path override): worker-python/weights/{trash,cigarette}.pth
-TRASH_WEIGHTS_PATH = str(Path(__file__).resolve().parent / "weights" / "trash.pth")
-CIGARETTE_WEIGHTS_PATH = str(Path(__file__).resolve().parent / "weights" / "cigarette.pth")
+# --- RF-DETR trash / cigarette (TensorRT engines only) ---
+_w = Path(__file__).resolve().parent / "weights"
+TRASH_ENGINE_PATH = os.getenv("TRASH_ENGINE_PATH", str(_w / "trash.engine"))
+CIGARETTE_ENGINE_PATH = os.getenv("CIGARETTE_ENGINE_PATH", str(_w / "cigarette.engine"))
 TRASH_CONFIDENCE = float(os.getenv("TRASH_CONFIDENCE", "0.4"))
 
 

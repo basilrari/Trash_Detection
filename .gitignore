@@ -60,3 +60,4 @@ worker-python/*.bin
 
 # Nested reference project (not tracked in this repository)
 EnvironmentalLitterDetection/
+temp_rfdetr_conversion/

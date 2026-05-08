@@ -262,9 +262,9 @@ def _merge_init_kwargs_for_rfdetr(ctor: type[Any], weights_path: str, ckpt: Dict
 def _optimize_rfdetr_for_inference(model: Any) -> None:
     """Use rfdetr's export/inference path so ``predict`` skips the unoptimized warning.
 
-    ``compile=False`` keeps variable batch sizes valid (we call ``predict`` with
-    ``len(frames)`` images). If we snap ``predict(..., shape=...)``, align
-    ``model.model.resolution`` first so the optimized tensor size matches.
+    ``compile=True`` enables ``torch.compile`` / kernel fusion (experimental). Variable
+    ``len(frames)`` batches may trigger recompiles or fail on some PyTorch builds; if
+    inference breaks, set back to ``compile=False`` or pin a fixed batch size.
     """
     optimize = getattr(model, "optimize_for_inference", None)
     if not callable(optimize):
@@ -279,7 +279,7 @@ def _optimize_rfdetr_for_inference(model: Any) -> None:
             return
         ctx.resolution = h
     try:
-        optimize(compile=False, batch_size=1, dtype=torch.float32)
+        optimize(compile=True, batch_size=1, dtype=torch.float32)
     except Exception:
         ctx.resolution = orig_res
         logger.warning("RF-DETR optimize_for_inference failed; using unoptimized path.", exc_info=True)
@@ -288,16 +288,27 @@ def _optimize_rfdetr_for_inference(model: Any) -> None:
 def _parallel_rfdetr_heads_enabled() -> bool:
     """When true, ``trash`` + ``cigarette`` RF-DETR heads run in parallel threads.
 
-    Default is **off**: on a single GPU, two threads often **increase** RF-DETR time
-    (driver contention). Set ``RF_DETR_PARALLEL_HEADS=1`` to experiment (e.g. CPU
-    inference or unusual overlap wins).
+    Default is **on** (PyTorch ``predict`` and TensorRT ``decode_batch_nchw`` both use a
+    small thread pool). On a single GPU, kernels may still serialize; set
+    ``RF_DETR_PARALLEL_HEADS=0`` (or ``false`` / ``off``) to force strict sequential
+    inference if you hit driver issues or want deterministic single-thread behavior.
     """
-    v = os.environ.get("RF_DETR_PARALLEL_HEADS", "0").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    v = os.environ.get("RF_DETR_PARALLEL_HEADS", "").strip().lower()
+    if not v:
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return True
 
 
-def _build_rfdetr(weights_path: str) -> Any:
-    """Load **your** ``.pth`` only — pick ``RFDETR*`` class from checkpoint metadata or by trial."""
+def _build_rfdetr(weights_path: str, *, run_optimize: bool = True) -> Any:
+    """Load **your** ``.pth`` only — pick ``RFDETR*`` class from checkpoint metadata or by trial.
+
+    Set ``run_optimize=False`` before ONNX export to avoid ``torch.compile`` / dtype
+    transforms that can break tracing.
+    """
     ckpt = _load_checkpoint_dict(weights_path) or {}
     hint = _rfdetr_size_hint_from_checkpoint(ckpt)
     errors: list[str] = []
@@ -305,7 +316,8 @@ def _build_rfdetr(weights_path: str) -> Any:
         try:
             merged = _merge_init_kwargs_for_rfdetr(ctor, weights_path, ckpt)
             model = ctor(**merged)
-            _optimize_rfdetr_for_inference(model)
+            if run_optimize:
+                _optimize_rfdetr_for_inference(model)
             return model
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{ctor.__name__}: {exc}")
@@ -324,8 +336,9 @@ class RfDetrTrashDetector(TrashDetector):
 
     Expects RGB inference internally; ``detect_trash`` converts BGR ``FrameData`` images.
 
-    With ``RF_DETR_PARALLEL_HEADS=1``, both heads call ``predict`` on worker threads
-    (see :func:`_parallel_rfdetr_heads_enabled`). Default remains **sequential** on one GPU.
+    With :func:`_parallel_rfdetr_heads_enabled` (default **on**), both heads call
+    ``predict`` on worker threads. Set ``RF_DETR_PARALLEL_HEADS=0`` for sequential
+    inference only.
     """
 
     def __init__(
