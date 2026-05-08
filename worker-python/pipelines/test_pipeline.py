@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 YOLO → RF-DETR trash → LP → OCR on a local video; writes an annotated MP4.
+LP and OCR are **batched per frame** across all vehicle crops (fewer small GPU calls).
 Labels only (no bounding boxes) for trash, YOLO, and plates; YOLO is person + road vehicles.
 
 Run from worker-python/ (put source videos in inputs/, results under outputs/ by default):
@@ -295,7 +296,11 @@ def _annotate_yolo_lp_ocr(
     ocr: Ocr,
     annots: FrameAnnotators,
 ) -> None:
-    """Draw YOLO labels (no boxes), then LP + OCR on vehicle crops (mutates ``frame`` in place)."""
+    """Draw YOLO labels (no boxes), then LP + OCR on vehicle crops (mutates ``frame`` in place).
+
+    One **batched** LP inference for all vehicle crops in this frame, then one **batched**
+    OCR call for all plate crops (reduces per-vehicle Python ↔ GPU overhead).
+    """
     h, w = frame.shape[:2]
     scene = _filter_scene_detections(detections)
 
@@ -304,25 +309,32 @@ def _annotate_yolo_lp_ocr(
         annots.yolo_label.annotate(frame, yolo_dets, labels=yolo_labels)
 
     vehicles = [d for d in scene if d.label in VEHICLE_LABELS and d.confidence >= YOLO_CONFIDENCE]
+    veh_crops: list[tuple[int, int, int, int, np.ndarray]] = []
     for v in vehicles:
         vb = clamp_bbox(v.bbox, w, h)
         if vb is None:
             continue
         vx1, vy1, vx2, vy2 = vb
-
         vehicle_crop = frame[vy1:vy2, vx1:vx2]
         if vehicle_crop.size == 0:
             continue
+        veh_crops.append((vx1, vy1, vx2, vy2, vehicle_crop))
 
-        plates_per_frame = lp_detector.detect_plates([FrameData(0, 0.0, vehicle_crop)])
-        if not plates_per_frame:
-            continue
-        plates = plates_per_frame[0]
+    if not veh_crops:
+        return
 
-        plate_rows: list[list[float]] = []
-        plate_confs: list[float] = []
-        plate_label_strs: list[str] = []
-        for plate in plates:
+    fd_list = [
+        FrameData(index=i, timestamp=0.0, image=entry[4]) for i, entry in enumerate(veh_crops)
+    ]
+    plates_per_frame = lp_detector.detect_plates(fd_list)
+
+    ocr_crops: list[np.ndarray] = []
+    ocr_geos: list[tuple[int, int, int, int]] = []
+
+    for i, (vx1, vy1, vx2, vy2, vehicle_crop) in enumerate(veh_crops):
+        if i >= len(plates_per_frame):
+            break
+        for plate in plates_per_frame[i]:
             pbox = clamp_bbox(plate.bbox, vehicle_crop.shape[1], vehicle_crop.shape[0])
             if pbox is None:
                 continue
@@ -330,35 +342,45 @@ def _annotate_yolo_lp_ocr(
             plate_crop = vehicle_crop[py1:py2, px1:px2]
             if plate_crop.size == 0:
                 continue
-
-            try:
-                ocr_out = ocr.recognize([plate_crop])
-            except Exception as e:
-                console.print(f"[yellow]OCR error:[/] {str(e)}")
-                ocr_out = [("", 0.0)]
-
-            plate_text, plate_conf = ocr_out[0] if ocr_out else ("", 0.0)
-            plate_text = normalize_plate_text(plate_text)
-
-            if plate_conf < PLATE_CONFIDENCE:
-                continue
-
             gx1, gy1, gx2, gy2 = vx1 + px1, vy1 + py1, vx1 + px2, vy1 + py2
             gbox = clamp_bbox((gx1, gy1, gx2, gy2), w, h)
             if gbox is None:
                 continue
             gx1, gy1, gx2, gy2 = gbox
-            plate_rows.append([float(gx1), float(gy1), float(gx2), float(gy2)])
-            plate_confs.append(float(plate_conf))
-            label_str = f"{plate_text} {plate_conf:.2f}" if plate_text else f"{plate_conf:.2f}"
-            plate_label_strs.append(label_str)
+            ocr_crops.append(plate_crop)
+            ocr_geos.append((gx1, gy1, gx2, gy2))
 
-        if plate_rows:
-            p_xyxy = np.asarray(plate_rows, dtype=np.float32)
-            p_conf = np.asarray(plate_confs, dtype=np.float32)
-            p_cls = np.zeros(len(plate_rows), dtype=np.int64)
-            p_dets = sv.Detections(xyxy=p_xyxy, confidence=p_conf, class_id=p_cls)
-            annots.plate_label.annotate(frame, p_dets, labels=plate_label_strs)
+    if not ocr_crops:
+        return
+
+    try:
+        ocr_out = ocr.recognize(ocr_crops)
+    except Exception as e:
+        console.print(f"[yellow]OCR error:[/] {str(e)}")
+        ocr_out = [("", 0.0)] * len(ocr_crops)
+    if len(ocr_out) != len(ocr_crops):
+        ocr_out = list(ocr_out) + [("", 0.0)] * max(0, len(ocr_crops) - len(ocr_out))
+        ocr_out = ocr_out[: len(ocr_crops)]
+
+    plate_rows: list[list[float]] = []
+    plate_confs: list[float] = []
+    plate_label_strs: list[str] = []
+    for (gx1, gy1, gx2, gy2), ocr_one in zip(ocr_geos, ocr_out):
+        plate_text, plate_conf = ocr_one
+        plate_text = normalize_plate_text(plate_text)
+        if plate_conf < PLATE_CONFIDENCE:
+            continue
+        plate_rows.append([float(gx1), float(gy1), float(gx2), float(gy2)])
+        plate_confs.append(float(plate_conf))
+        label_str = f"{plate_text} {plate_conf:.2f}" if plate_text else f"{plate_conf:.2f}"
+        plate_label_strs.append(label_str)
+
+    if plate_rows:
+        p_xyxy = np.asarray(plate_rows, dtype=np.float32)
+        p_conf = np.asarray(plate_confs, dtype=np.float32)
+        p_cls = np.zeros(len(plate_rows), dtype=np.int64)
+        p_dets = sv.Detections(xyxy=p_xyxy, confidence=p_conf, class_id=p_cls)
+        annots.plate_label.annotate(frame, p_dets, labels=plate_label_strs)
 
 
 def _draw_peeing_overlay(

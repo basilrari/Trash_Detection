@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
@@ -283,6 +285,17 @@ def _optimize_rfdetr_for_inference(model: Any) -> None:
         logger.warning("RF-DETR optimize_for_inference failed; using unoptimized path.", exc_info=True)
 
 
+def _parallel_rfdetr_heads_enabled() -> bool:
+    """When true, ``trash`` + ``cigarette`` RF-DETR heads run in parallel threads.
+
+    Set ``RF_DETR_PARALLEL_HEADS=0`` if a single-GPU setup shows instability (rare).
+    On one GPU, kernels often still serialize; overlap helps most when host-side work
+    hides latency or when inference is CPU-bound.
+    """
+    v = os.environ.get("RF_DETR_PARALLEL_HEADS", "1").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
 def _build_rfdetr(weights_path: str) -> Any:
     """Load **your** ``.pth`` only — pick ``RFDETR*`` class from checkpoint metadata or by trial."""
     ckpt = _load_checkpoint_dict(weights_path) or {}
@@ -310,6 +323,9 @@ class RfDetrTrashDetector(TrashDetector):
     ``args`` when possible, otherwise by trying families until weights load.
 
     Expects RGB inference internally; ``detect_trash`` converts BGR ``FrameData`` images.
+
+    With ``RF_DETR_PARALLEL_HEADS`` defaulting to on, both heads call ``predict`` on worker
+    threads (see :func:`_parallel_rfdetr_heads_enabled`).
     """
 
     def __init__(
@@ -336,11 +352,51 @@ class RfDetrTrashDetector(TrashDetector):
             (_build_rfdetr(str(cw)), "cigarette", "cigarette"),
         ]
 
+    def _predict_one_head(
+        self,
+        head_index: int,
+        images_rgb: List[np.ndarray],
+    ) -> tuple[int, List[List[Detection]]]:
+        model, default_lbl, _tag = self._models[head_index]
+        use_sv_names = self._class_names is not None
+        pkw = _predict_kwargs_if_needed(model)
+        raw = model.predict(images_rgb, threshold=self._conf, **pkw)
+        per_frame = raw if isinstance(raw, list) else [raw]
+        n = len(images_rgb)
+        if len(per_frame) != n:
+            return head_index, [[] for _ in range(n)]
+        out: List[List[Detection]] = []
+        for sv_det in per_frame:
+            out.append(
+                _sv_to_detections(
+                    sv_det,
+                    class_id_map=self._class_names,
+                    default_label=default_lbl,
+                    use_sv_class_names=use_sv_names,
+                )
+            )
+        return head_index, out
+
     def detect_trash(self, frames: List[FrameData]) -> List[List[Detection]]:
         if not frames:
             return []
         images_rgb = [cv2.cvtColor(f.image, cv2.COLOR_BGR2RGB) for f in frames]
         merged: List[List[Detection]] = [[] for _ in frames]
+
+        if _parallel_rfdetr_heads_enabled() and len(self._models) > 1:
+            with ThreadPoolExecutor(max_workers=len(self._models)) as ex:
+                futures = {
+                    ex.submit(self._predict_one_head, i, images_rgb): i
+                    for i in range(len(self._models))
+                }
+                parts: dict[int, List[List[Detection]]] = {}
+                for fut in as_completed(futures):
+                    idx, per = fut.result()
+                    parts[idx] = per
+            for i in range(len(self._models)):
+                for fi, dets in enumerate(parts[i]):
+                    merged[fi].extend(dets)
+            return merged
 
         use_sv_names = self._class_names is not None
         for model, default_lbl, _tag in self._models:
