@@ -288,11 +288,11 @@ def _optimize_rfdetr_for_inference(model: Any) -> None:
 def _parallel_rfdetr_heads_enabled() -> bool:
     """When true, ``trash`` + ``cigarette`` RF-DETR heads run in parallel threads.
 
-    Set ``RF_DETR_PARALLEL_HEADS=0`` if a single-GPU setup shows instability (rare).
-    On one GPU, kernels often still serialize; overlap helps most when host-side work
-    hides latency or when inference is CPU-bound.
+    Default is **off**: on a single GPU, two threads often **increase** RF-DETR time
+    (driver contention). Set ``RF_DETR_PARALLEL_HEADS=1`` to experiment (e.g. CPU
+    inference or unusual overlap wins).
     """
-    v = os.environ.get("RF_DETR_PARALLEL_HEADS", "1").strip().lower()
+    v = os.environ.get("RF_DETR_PARALLEL_HEADS", "0").strip().lower()
     return v in ("1", "true", "yes", "on")
 
 
@@ -324,8 +324,8 @@ class RfDetrTrashDetector(TrashDetector):
 
     Expects RGB inference internally; ``detect_trash`` converts BGR ``FrameData`` images.
 
-    With ``RF_DETR_PARALLEL_HEADS`` defaulting to on, both heads call ``predict`` on worker
-    threads (see :func:`_parallel_rfdetr_heads_enabled`).
+    With ``RF_DETR_PARALLEL_HEADS=1``, both heads call ``predict`` on worker threads
+    (see :func:`_parallel_rfdetr_heads_enabled`). Default remains **sequential** on one GPU.
     """
 
     def __init__(
