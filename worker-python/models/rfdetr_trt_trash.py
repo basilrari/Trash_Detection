@@ -6,6 +6,7 @@ Requires ``tensorrt`` and ``pycuda`` on the inference machine.
 
 from __future__ import annotations
 
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, List, Tuple
@@ -67,6 +68,30 @@ def _post_process(
         return out
 
 
+def _tensorrt_deserialize_hint(engine_path: str | Path) -> str:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            c = torch.cuda.get_device_capability(0)
+            n = torch.cuda.get_device_name(0)
+            vis = os.environ.get("CUDA_VISIBLE_DEVICES", "(unset)")
+            return (
+                "\nTensorRT engines are tied to the GPU **architecture** they were built on "
+                "(e.g. sm_86 vs sm_120). This plan does not match the GPU visible to this process.\n"
+                f"  torch.cuda:0 = {n!r}  sm_{c[0]}{c[1]}  (CUDA_VISIBLE_DEVICES={vis})\n"
+                "Fix: set CUDA_VISIBLE_DEVICES to the same physical GPU used when building the .engine "
+                "files, or rebuild trash.engine and cigarette.engine on this machine/GPU "
+                "(see scripts/export_rfdetr_heads.py + trtexec)."
+            )
+    except Exception:
+        pass
+    return (
+        "\nTensorRT engine load failed. Re-export or rebuild the .engine for the GPU "
+        "you use at inference time."
+    )
+
+
 class TensorRTEngineWrapper:
     """Loads a fixed-shape RF-DETR TensorRT engine and runs batched inference."""
 
@@ -83,7 +108,9 @@ class TensorRTEngineWrapper:
         blob = Path(engine_path).read_bytes()
         self.engine = self.runtime.deserialize_cuda_engine(blob)
         if self.engine is None:
-            raise RuntimeError(f"Failed to deserialize engine: {engine_path}")
+            raise RuntimeError(
+                f"Failed to deserialize TensorRT engine: {engine_path}\n{_tensorrt_deserialize_hint(engine_path)}"
+            )
         self.context = self.engine.create_execution_context()
         self.stream = cuda.Stream()
         self.bindings: dict[str, dict[str, Any]] = {}

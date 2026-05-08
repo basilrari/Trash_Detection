@@ -67,6 +67,12 @@ TRASH_ENGINE_PATH = os.getenv("TRASH_ENGINE_PATH", str(_w / "trash.engine"))
 CIGARETTE_ENGINE_PATH = os.getenv("CIGARETTE_ENGINE_PATH", str(_w / "cigarette.engine"))
 TRASH_CONFIDENCE = float(os.getenv("TRASH_CONFIDENCE", "0.4"))
 
+# --- PaddleOCR (see ``models/ocr.py``) ---
+# ``PADDLE_OCR_DEVICE``: unset → use GPU if Paddle sees CUDA, else CPU. Override with ``cpu``,
+# ``gpu``, or ``gpu:0`` as needed.
+# ``PADDLE_OCR_ISOLATE_PROCESS``: ``1``/``0`` override. On Blackwell + GPU OCR, default is
+# isolated subprocess mode to avoid CUDA context collisions with torch/TRT in one process.
+
 
 def _optional_int_env(var: str) -> int | None:
     raw = os.getenv(var, "").strip()

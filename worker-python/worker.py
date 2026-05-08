@@ -18,6 +18,9 @@ Gating (default ``GATE_MODE=yolo`` in ``settings.py``):
   # Explicit coarse/dense tuning (defaults are already yolo in settings)
   GATE_MODE=yolo YOLO_COARSE_STRIDE=10 YOLO_DENSE_STRIDE=2 YOLO_DENSE_IDLE_MISS_STREAK=10 \\
     python worker.py inputs/clip.mp4 -o outputs/out.mp4
+
+  # If PyTorch reports ``no kernel image`` on a very new GPU (e.g. Blackwell) but another GPU works:
+  CUDA_VISIBLE_DEVICES=1 python worker.py inputs/clip.mp4 -o outputs/out.mp4
 """
 from __future__ import annotations
 

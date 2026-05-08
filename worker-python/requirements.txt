@@ -1,10 +1,20 @@
 # worker-python/requirements.txt — core inference stack (pin in production as needed)
 opencv-python-headless>=4.8.0
-numpy>=1.24.0
+numpy>=1.24.0,<2.4
 tqdm>=4.66.0
 rich>=13.0.0
 ultralytics>=8.3.0
 paddleocr>=2.7.0
+# GPU OCR — Ampere/Ada/Hopper (cu126): uninstall CPU paddle then e.g.
+#   pip install paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+# **Blackwell (sm_120) Paddle:** official cu129 wheel (then restore torch stack):
+#   pip uninstall -y paddlepaddle paddlepaddle-gpu
+#   pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+#   pip install --force-reinstall "torch==2.11.0+cu128" "torchvision==0.26.0+cu128" "torchaudio==2.11.0+cu128" --index-url https://download.pytorch.org/whl/cu128
+#   pip install "numpy>=1.24,<2.4"   # paddlex / paddleocr stack often pins numpy<2.4
+# Pip will warn that paddle wants nvidia-* 12.9 while torch wants 12.8; both can still run — verify with:
+#   python scripts/verify_env.py
+# Blackwell PaddleOCR: https://paddlepaddle.github.io/PaddleOCR/main/en/version3.x/pipeline_usage/PaddleOCR-VL-NVIDIA-Blackwell.html
 torch  # install wheel matching your CUDA from https://pytorch.org/get-started/locally/
 rfdetr>=1.6.0
 # Optional fast RF-DETR: export ONNX then set RF_DETR_BACKEND=onnx (see scripts/export_rfdetr_heads.py)

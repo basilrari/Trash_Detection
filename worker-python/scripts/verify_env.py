@@ -27,15 +27,30 @@ def main() -> int:
         name = torch.cuda.get_device_name(0)
         cap = torch.cuda.get_device_capability(0)
         print("CUDA device:", name, f"capability sm_{cap[0]}{cap[1]}")
-        if cap[0] >= 12:
-            print(
-                "NOTE: This GPU may need a PyTorch build with sm_120+ support, or use an "
-                "older-GPU index, e.g. CUDA_VISIBLE_DEVICES=1 for a second card."
-            )
+        try:
+            x = torch.randn(64, 64, device="cuda", dtype=torch.float32)
+            _ = x @ x
+            torch.cuda.synchronize()
+            print("PyTorch CUDA matmul probe: OK")
+        except Exception as exc:
+            print("PyTorch CUDA matmul probe: FAILED", type(exc).__name__, exc)
+            if cap[0] >= 12:
+                print(
+                    "Blackwell (sm_120): use torch 2.7+ cu128 wheels from pytorch.org, or "
+                    "CUDA_VISIBLE_DEVICES to an Ampere/Ada GPU if kernels are missing."
+                )
+            return 1
 
     import paddle
 
-    print("Paddle:", paddle.__version__, "compiled_with_cuda:", paddle.device.is_compiled_with_cuda())
+    print(
+        "Paddle:",
+        paddle.__version__,
+        "compiled_with_cuda:",
+        paddle.device.is_compiled_with_cuda(),
+        "cuda_device_count:",
+        paddle.device.cuda.device_count(),
+    )
 
     from ultralytics import YOLO
 
@@ -60,6 +75,8 @@ def main() -> int:
     from models.ocr import Ocr
 
     ocr = Ocr()
+    print("PaddleOCR resolved device:", ocr.paddle_device)
+    print("PaddleOCR isolate_process:", getattr(ocr, "isolate_process", False))
     blank = np.zeros((48, 160, 3), dtype=np.uint8)
     cv2.putText(blank, "X0", (10, 32), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
     out = ocr.recognize([blank])
