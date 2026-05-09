@@ -32,9 +32,9 @@ PLATE_CONFIDENCE = 0.5
 # --- Gating (``core/yolo_stride_gate.py``) ---
 # GATE_MODE: "off" | "yolo" (default: yolo — coarse/dense YOLO stride)
 GATE_MODE = "yolo"
-YOLO_COARSE_STRIDE = 8
+YOLO_COARSE_STRIDE = 10
 YOLO_DENSE_STRIDE = 2
-YOLO_DENSE_IDLE_MISS_STREAK = 10
+YOLO_DENSE_IDLE_MISS_STREAK = 8
 
 # --- RF-DETR trash / cigarette (TensorRT engines only) ---
 _w = Path(__file__).resolve().parent / "weights"
@@ -48,11 +48,11 @@ RF_DETR_TRT_TIMING = False
 # RF-DETR preprocess: use CPU (NumPy + OpenCV) unless you set a CUDA opt-in value here:
 # ``"1"``, ``"true"``, ``"yes"``, ``"on"``, ``"cuda"``, ``"auto"`` (CUDA when available).
 # ``""``, ``"0"``, ``"cpu"``, ``"false"``, ``"off"``, ``"no"`` → CPU.
-RF_DETR_PREPROCESS_CUDA = ""
+RF_DETR_PREPROCESS_CUDA = "1"
 
 # --- PaddleOCR (``models/ocr.py``) ---
 # ``""`` → auto (GPU if Paddle sees CUDA). Otherwise ``"cpu"``, ``"gpu"``, ``"gpu:0"``, etc.
-PADDLE_OCR_DEVICE = ""
+PADDLE_OCR_DEVICE = "gpu"
 # ``None`` → default isolation rule (Blackwell + GPU OCR). ``True`` / ``False`` to force.
 PADDLE_OCR_ISOLATE_PROCESS: bool | None = None
 
