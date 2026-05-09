@@ -27,9 +27,11 @@ RF-DETR: the video pipeline uses **TensorRT** engines only — ``weights/trash.e
 ``TRASH_CONFIDENCE``. Requires ``tensorrt`` and ``pycuda``. Static batch and input size are
 fixed inside each engine (see ``models/rfdetr_trt_trash.py``).
 
-Optional: ``RF_DETR_PARALLEL_HEADS`` — default **on** (trash + cigarette heads in parallel
-threads for both PyTorch and TensorRT paths). Set to ``0`` / ``false`` / ``off`` to force
-sequential heads on one GPU.
+Optional: ``RF_DETR_PARALLEL_HEADS`` — default **on** (trash + cigarette TensorRT heads in
+parallel threads). Set to ``0`` / ``false`` / ``off`` to force sequential head decode on one GPU.
+
+Optional: ``RF_DETR_TRT_TIMING`` — set to ``1`` / ``true`` to print per-batch ``[TRT]`` timing from
+``models/rfdetr_trt_trash.py`` (preprocess when measured by caller, forward, postprocess).
 
 Optional path overrides: ``TRASH_ENGINE_PATH``, ``CIGARETTE_ENGINE_PATH`` (same names as settings).
 """
@@ -72,18 +74,6 @@ TRASH_CONFIDENCE = float(os.getenv("TRASH_CONFIDENCE", "0.4"))
 # ``gpu``, or ``gpu:0`` as needed.
 # ``PADDLE_OCR_ISOLATE_PROCESS``: ``1``/``0`` override. On Blackwell + GPU OCR, default is
 # isolated subprocess mode to avoid CUDA context collisions with torch/TRT in one process.
-
-
-def _optional_int_env(var: str) -> int | None:
-    raw = os.getenv(var, "").strip()
-    return int(raw) if raw else None
-
-
-# Optional RF-DETR ctor overrides (leave unset to use checkpoint ``args`` merge + library defaults)
-RF_DETR_PATCH_SIZE = _optional_int_env("RF_DETR_PATCH_SIZE")
-RF_DETR_NUM_CLASSES = _optional_int_env("RF_DETR_NUM_CLASSES")
-RF_DETR_RESOLUTION = _optional_int_env("RF_DETR_RESOLUTION")
-RF_DETR_POSITIONAL_ENCODING_SIZE = _optional_int_env("RF_DETR_POSITIONAL_ENCODING_SIZE")
 
 # --- Peeing heuristic (MediaPipe Pose on YOLO person crops; always on) ---
 PEEING_POSE_STRIDE = max(1, int(os.getenv("PEEING_POSE_STRIDE", "2")))

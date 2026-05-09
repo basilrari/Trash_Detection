@@ -21,17 +21,60 @@ import logging
 import urllib.request
 from collections import deque
 from dataclasses import dataclass
+from enum import IntEnum
 from pathlib import Path
 from typing import Any, Deque, List, Literal, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
+from mediapipe.tasks.python.components.containers.landmark import NormalizedLandmark
 
 from core.types import Detection
 
 logger = logging.getLogger(__name__)
 
-from mediapipe.tasks.python.components.containers.landmark import NormalizedLandmark
+
+class BlazePoseLandmark(IntEnum):
+    """BlazePose 33-point indices for :class:`PoseLandmarker` (Tasks API).
+
+    ``PoseLandmarker`` does not re-export a ``PoseLandmark`` enum from
+    ``mediapipe.tasks.python.vision``; indices match ``PoseLandmarksConnections``.
+    """
+
+    NOSE = 0
+    LEFT_EYE_INNER = 1
+    LEFT_EYE = 2
+    LEFT_EYE_OUTER = 3
+    RIGHT_EYE_INNER = 4
+    RIGHT_EYE = 5
+    RIGHT_EYE_OUTER = 6
+    LEFT_EAR = 7
+    RIGHT_EAR = 8
+    MOUTH_LEFT = 9
+    MOUTH_RIGHT = 10
+    LEFT_SHOULDER = 11
+    RIGHT_SHOULDER = 12
+    LEFT_ELBOW = 13
+    RIGHT_ELBOW = 14
+    LEFT_WRIST = 15
+    RIGHT_WRIST = 16
+    LEFT_PINKY = 17
+    RIGHT_PINKY = 18
+    LEFT_INDEX = 19
+    RIGHT_INDEX = 20
+    LEFT_THUMB = 21
+    RIGHT_THUMB = 22
+    LEFT_HIP = 23
+    RIGHT_HIP = 24
+    LEFT_KNEE = 25
+    RIGHT_KNEE = 26
+    LEFT_ANKLE = 27
+    RIGHT_ANKLE = 28
+    LEFT_HEEL = 29
+    RIGHT_HEEL = 30
+    LEFT_FOOT_INDEX = 31
+    RIGHT_FOOT_INDEX = 32
+
 
 PERSON_LABELS = ("person",)
 
@@ -130,11 +173,11 @@ class PeeingDetector:
         self.squat_hip_knee_gap_max = float(squat_hip_knee_gap_max)
         self.squat_depth_scale = float(max(1e-6, squat_depth_scale))
 
-        from mediapipe.tasks.python.vision import PoseLandmarker, PoseLandmark
+        from mediapipe.tasks.python.vision import PoseLandmarker
         from mediapipe.tasks.python.vision.core import image as mp_image
 
         self._PoseLandmarker = PoseLandmarker
-        self._PoseLandmark = PoseLandmark
+        self._PoseLandmark = BlazePoseLandmark
         self._mp_image_mod = mp_image
 
         cache_dir = Path.home() / ".cache" / "trash_detection_worker"

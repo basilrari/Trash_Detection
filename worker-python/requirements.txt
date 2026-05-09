@@ -16,8 +16,5 @@ paddleocr>=2.7.0
 #   python scripts/verify_env.py
 # Blackwell PaddleOCR: https://paddlepaddle.github.io/PaddleOCR/main/en/version3.x/pipeline_usage/PaddleOCR-VL-NVIDIA-Blackwell.html
 torch  # install wheel matching your CUDA from https://pytorch.org/get-started/locally/
-rfdetr>=1.6.0
-# Optional fast RF-DETR: export ONNX then set RF_DETR_BACKEND=onnx (see scripts/export_rfdetr_heads.py)
-# onnxruntime-gpu>=1.17.0
 supervision>=0.24.0
 mediapipe>=0.10.0

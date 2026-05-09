@@ -6,7 +6,7 @@ This repository analyzes CCTV-style videos in chunks using computer-vision model
 
 ## What runs today
 
-The **Python** package under `worker-python/` streams a video, runs **YOLO** with a **YOLO stride gate by default** (`GATE_MODE=yolo`), **RF-DETR** litter heads (required: `rfdetr` + `weights/trash.pth` and `weights/cigarette.pth`), **license-plate YOLO** on vehicle crops, **PaddleOCR** on plate crops, and writes an **annotated MP4**.
+The **Python** package under `worker-python/` streams a video, runs **YOLO** with a **YOLO stride gate by default** (`GATE_MODE=yolo`), **RF-DETR** litter heads via **TensorRT** (`weights/trash.engine` and `weights/cigarette.engine`), **license-plate YOLO** on vehicle crops, **PaddleOCR** on plate crops, and writes an **annotated MP4**.
 
 Planned extensions (from the original design): pose/behavior, CSV export — not all are wired yet.
 
@@ -63,17 +63,14 @@ In code, see the module docstring at the top of **`worker-python/settings.py`**,
 
 ### RF-DETR trash (required)
 
-**RF-DETR is required** for `worker.py` / `run_pipeline`: install `rfdetr` (`worker-python/requirements.txt`), place **`trash.pth`** and **`cigarette.pth`** under `worker-python/weights/` (or set `TRASH_WEIGHTS_PATH` and `CIGARETTE_WEIGHTS_PATH`). The `rfdetr` model family is **inferred from each checkpoint** (saved `args` or trial load); there is no separate “nano/medium/large” setting. Checkpoint ``args`` are merged when present; if backbone ``position_embeddings`` imply a square patch grid (e.g. 1370 tokens → PE side 37), **`positional_encoding_size`** and **`resolution`** are aligned automatically unless you set the `RF_DETR_*` overrides below. If `rfdetr` or weights are missing, the process exits with an error.
+Inference uses **TensorRT** only: place **`trash.engine`** and **`cigarette.engine`** under `worker-python/weights/` (or set **`TRASH_ENGINE_PATH`** and **`CIGARETTE_ENGINE_PATH`**). You need **`tensorrt`** and **`pycuda`**. Engine batch size and input resolution are fixed inside each plan file (see `models/rfdetr_trt_trash.py`). Optional archival PyTorch checkpoints **`trash.pth`** / **`cigarette.pth`** may live alongside them but are **not** loaded by this pipeline.
 
 | Setting / env | Meaning |
 |---------------|--------|
-| **`TRASH_WEIGHTS_PATH`** | Path to `trash.pth` (default: `weights/trash.pth`). |
-| **`CIGARETTE_WEIGHTS_PATH`** | Path to `cigarette.pth` (default: `weights/cigarette.pth`). **Required.** |
+| **`TRASH_ENGINE_PATH`** | Path to `trash.engine` (default: `weights/trash.engine`). |
+| **`CIGARETTE_ENGINE_PATH`** | Path to `cigarette.engine` (default: `weights/cigarette.engine`). **Required.** |
 | **`TRASH_CONFIDENCE`** | Confidence threshold for trash boxes (default **0.4**). |
-| **`RF_DETR_PATCH_SIZE`** | Optional override when checkpoint metadata is incomplete. |
-| **`RF_DETR_NUM_CLASSES`** | Optional override; use **`1`** for a single-class detector to silence class-count warnings. |
-| **`RF_DETR_RESOLUTION`** | Optional override for detector/backbone input size. |
-| **`RF_DETR_POSITIONAL_ENCODING_SIZE`** | Optional override (PE side); auto-inferred from weights when omitted. |
+| **`RF_DETR_PARALLEL_HEADS`** | Default **on** — trash + cigarette heads decode in parallel threads; set `0`/`off` for sequential. |
 
 With **`GATE_MODE=yolo`** (default), trash runs on the same cadence as YOLO (coarse/dense). With **`GATE_MODE=off`**, trash runs on every frame in each chunk.
 
@@ -92,13 +89,13 @@ python -m pipelines.test_pipeline
 - `worker.py` — CLI entrypoint
 - `settings.py` — default video paths, chunk size, confidence thresholds, optional `.env` via `python-dotenv` if installed
 - `pipelines/test_pipeline.py` — `run_pipeline(video_path, output_video)`
-- `models/` — YOLO, LP detector, OCR, RF-DETR trash (`trash_detector.py`); `base.py` interfaces
+- `models/` — YOLO, LP detector, OCR, RF-DETR TensorRT (`rfdetr_trt_trash.py`, `trash_detector.py` helpers); `base.py` interfaces
 - `core/` — `types.py`, `writer.py`, `yolo_stride_gate.py` (YOLO coarse/dense scheduling; default on)
-- `weights/` — place `yolo11x.pt`, `bestlicense.pt`, **`trash.pth`** and **`cigarette.pth`** (both required for RF-DETR; see `.gitignore`)
+- `weights/` — place `yolo11x.pt`, `bestlicense.pt`, **`trash.engine`** and **`cigarette.engine`** (RF-DETR); optional `trash.pth` / `cigarette.pth` for archival only (see `.gitignore`)
 
 ## Model weights and GPU
 
 - YOLO: `worker-python/weights/yolo11x.pt`
 - License plates: `worker-python/weights/bestlicense.pt`
-- RF-DETR: `worker-python/weights/trash.pth` and `worker-python/weights/cigarette.pth`
+- RF-DETR: `worker-python/weights/trash.engine` and `worker-python/weights/cigarette.engine` (optional `trash.pth` / `cigarette.pth` not used at runtime)
 - PaddleOCR is configured for GPU in `models/ocr.py`
