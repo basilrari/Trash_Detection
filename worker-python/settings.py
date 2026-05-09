@@ -32,9 +32,8 @@ Trash + cigarette TensorRT heads always decode **in parallel** (two threads; sha
 Optional: ``RF_DETR_TRT_TIMING`` — set to ``1`` / ``true`` to print per-batch ``[TRT]`` timing from
 ``models/rfdetr_trt_trash.py`` (preprocess when measured by caller, forward, postprocess).
 
-Optional: ``RF_DETR_PREPROCESS_CUDA`` — **unset = CPU preprocess** (default). Set ``1`` / ``true`` /
-``cuda`` / ``auto`` to try PyTorch GPU preprocess (often slower here). ``0`` / ``cpu`` / ``false``
-forces NumPy + OpenCV CPU.
+Optional: ``RF_DETR_PREPROCESS_CUDA`` — **default: PyTorch CUDA preprocess** when CUDA is available.
+Set ``cpu`` / ``0`` / ``false`` / ``off`` / ``no`` to force the NumPy + OpenCV CPU path.
 
 Optional path overrides: ``TRASH_ENGINE_PATH``, ``CIGARETTE_ENGINE_PATH`` (same names as settings).
 

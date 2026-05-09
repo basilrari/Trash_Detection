@@ -5,8 +5,9 @@ Requires ``tensorrt`` and ``pycuda`` on the inference machine.
 
 Set ``RF_DETR_TRT_TIMING=1`` to print per-chunk ``[TRT]`` timing (preprocess / forward / postprocess).
 
-Set ``RF_DETR_PREPROCESS_CUDA=1`` (or ``cuda`` / ``auto``) to try **PyTorch CUDA** preprocess; **unset**
-defaults to **CPU** (usually faster here). ``RF_DETR_PREPROCESS_CUDA=cpu`` forces the NumPy path.
+**Default:** PyTorch **CUDA** preprocess when ``torch.cuda.is_available()`` (BGR→tile→NCHW on GPU,
+TRT input via D2D). Set ``RF_DETR_PREPROCESS_CUDA=cpu`` (or ``0`` / ``false`` / ``off``) to force
+the NumPy + OpenCV CPU path.
 """
 
 from __future__ import annotations
@@ -37,21 +38,18 @@ def _trt_timing_enabled() -> bool:
 
 
 def _preprocess_use_cuda() -> bool:
-    """GPU preprocess only when explicitly enabled (default remains fast CPU NumPy/OpenCV).
+    """Use PyTorch CUDA preprocess when CUDA is available (project default).
 
-    ``RF_DETR_PREPROCESS_CUDA=1`` / ``true`` / ``cuda`` / ``on`` — use PyTorch CUDA when CUDA exists.
-    ``auto`` — same as ``1`` when CUDA exists (alias for explicit opt-in).
-    ``0`` / ``cpu`` / ``false`` / ``off`` — force CPU path.
+    ``RF_DETR_PREPROCESS_CUDA=cpu`` / ``0`` / ``false`` / ``off`` / ``no`` — force NumPy + OpenCV CPU.
 
-    **Unset** defaults to **CPU**: the CUDA path does per-frame host uploads and synchronizes
-    before TensorRT; on many setups it is **slower** than the vectorized CPU preprocessor.
+    Any other value (including **unset**) uses the GPU path when ``torch.cuda.is_available()``.
     """
+    if not torch.cuda.is_available():
+        return False
     v = os.environ.get("RF_DETR_PREPROCESS_CUDA", "").strip().lower()
     if v in ("0", "false", "no", "off", "cpu"):
         return False
-    if v in ("1", "true", "yes", "on", "cuda", "auto"):
-        return bool(torch.cuda.is_available())
-    return False
+    return True
 
 
 def _box_cxcywh_to_xyxy(x: torch.Tensor) -> torch.Tensor:
@@ -684,8 +682,8 @@ def _dict_to_sv(d: dict[str, Any]) -> sv.Detections:
 class RfDetrTrtTrashDetector(TrashDetector):
     """Two TensorRT RF-DETR engines (trash + cigarette); same ``detect_trash`` contract as PyTorch.
 
-    Each batch is **preprocessed once** on the trash head (NumPy/OpenCV CPU by default; optional
-    **PyTorch CUDA** when ``RF_DETR_PREPROCESS_CUDA=1``); both heads then run ``decode_batch_nchw`` on that
+    Each batch is **preprocessed once** on the trash head (**PyTorch CUDA** when CUDA is available,
+    else NumPy + OpenCV CPU); both heads then run ``decode_batch_nchw`` on that
     shared tensor **in parallel** (two threads; one TRT forward + post per head).
     """
 
@@ -712,8 +710,8 @@ class RfDetrTrtTrashDetector(TrashDetector):
         self._use_sv_names = use_sv
         if self._heads[0][0]._want_cuda_preprocess:
             logger.info(
-                "RF-DETR preprocess: PyTorch CUDA (experimental; RF_DETR_PREPROCESS_CUDA=1). "
-                "Unset env = fast CPU path."
+                "RF-DETR preprocess: PyTorch CUDA (default when CUDA is available; "
+                "RF_DETR_PREPROCESS_CUDA=cpu for NumPy/OpenCV CPU path)."
             )
 
     @property

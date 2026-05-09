@@ -465,8 +465,9 @@ class PipelineStepTimes:
             )
             console.print(
                 "  [dim]RF-DETR note:[/] ``[RF-DETR] … fps`` logs are per ``detect_trash`` call; "
-                "eff. FPS above is the fair average. GPU preprocess is opt-in (``RF_DETR_PREPROCESS_CUDA=1``); "
-                "default CPU preprocess + two TRT heads dominate when ``[TRT]`` preprocess ms is high."
+                "eff. FPS above is the fair average. Default preprocess is **PyTorch CUDA** when CUDA "
+                "is available (``RF_DETR_PREPROCESS_CUDA=cpu`` for CPU); two TRT heads dominate "
+                "``[TRT]`` forward time once preprocess is small."
             )
         console.print(f"  Peeing (MediaPipe):   {self.peeing_sec:8.2f} s")
         console.print(f"  Annotate (draw only): {self.annotate_draw_sec:8.2f} s")
