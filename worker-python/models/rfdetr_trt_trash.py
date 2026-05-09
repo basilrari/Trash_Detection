@@ -4,6 +4,9 @@ Engines use static batch (e.g. 8) and input size (e.g. 672×672) baked in at exp
 Requires ``tensorrt`` and ``pycuda`` on the inference machine.
 
 Set ``RF_DETR_TRT_TIMING=1`` to print per-chunk ``[TRT]`` timing (preprocess / forward / postprocess).
+
+Set ``RF_DETR_PREPROCESS_CUDA=1`` (default when CUDA is available) to run BGR→tile→normalize→NCHW on
+the GPU with PyTorch; set to ``0`` / ``cpu`` to force the NumPy/OpenCV CPU path (no OpenCV CUDA).
 """
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, List, Tuple, Union
 
 import cv2
 import numpy as np
@@ -31,6 +34,16 @@ logger = logging.getLogger(__name__)
 def _trt_timing_enabled() -> bool:
     v = os.environ.get("RF_DETR_TRT_TIMING", "").strip().lower()
     return v in ("1", "true", "yes", "on")
+
+
+def _preprocess_use_cuda() -> bool:
+    """GPU preprocess via PyTorch when CUDA is available (override with ``RF_DETR_PREPROCESS_CUDA``)."""
+    v = os.environ.get("RF_DETR_PREPROCESS_CUDA", "").strip().lower()
+    if v in ("0", "false", "no", "off", "cpu"):
+        return False
+    if v in ("1", "true", "yes", "on", "cuda", "auto", ""):
+        return bool(torch.cuda.is_available())
+    return bool(torch.cuda.is_available())
 
 
 def _box_cxcywh_to_xyxy(x: torch.Tensor) -> torch.Tensor:
@@ -145,6 +158,35 @@ def _post_process_gpu(
         return out
 
 
+def _torch_rgb_to_engine_hw(rgb: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    """Center crop / pad float ``rgb`` (h,w,3) on CUDA to ``(H,W,3)`` (same dtype/device)."""
+    h, w = int(rgb.shape[0]), int(rgb.shape[1])
+    dev, dt = rgb.device, rgb.dtype
+    if h >= H and w >= W:
+        y0 = (h - H) // 2
+        x0 = (w - W) // 2
+        return rgb[y0 : y0 + H, x0 : x0 + W].clone()
+    if h <= H and w <= W:
+        out = torch.zeros((H, W, 3), device=dev, dtype=dt)
+        y0 = (H - h) // 2
+        x0 = (W - w) // 2
+        out[y0 : y0 + h, x0 : x0 + w] = rgb
+        return out
+    if h >= H and w < W:
+        y0 = (h - H) // 2
+        slab = rgb[y0 : y0 + H, :]
+        out = torch.zeros((H, W, 3), device=dev, dtype=dt)
+        x0 = (W - w) // 2
+        out[:, x0 : x0 + w] = slab
+        return out
+    x0 = (w - W) // 2
+    slab = rgb[:, x0 : x0 + W]
+    out = torch.zeros((H, W, 3), device=dev, dtype=dt)
+    y0 = (H - h) // 2
+    out[y0 : y0 + h, :] = slab
+    return out
+
+
 def _tensorrt_deserialize_hint(engine_path: str | Path) -> str:
     try:
         if torch.cuda.is_available():
@@ -227,6 +269,21 @@ class TensorRTEngineWrapper:
                     tdt = torch.float32
                 self._torch_out[name] = torch.empty(shape, dtype=tdt, device=dev)
 
+        idt = np.dtype(self.bindings[self.input_name]["dtype"])
+        self._torch_in_dtype = torch.float16 if idt == np.dtype(np.float16) else torch.float32
+        self._want_cuda_preprocess = _preprocess_use_cuda()
+        self._mean_t: torch.Tensor | None = None
+        self._std_t: torch.Tensor | None = None
+
+    def _ensure_torch_norm(self, device: torch.device) -> None:
+        if self._mean_t is None or self._mean_t.device != device:
+            self._mean_t = torch.tensor(
+                [0.485, 0.456, 0.406], device=device, dtype=torch.float32
+            ).view(1, 1, 1, 3)
+            self._std_t = torch.tensor(
+                [0.229, 0.224, 0.225], device=device, dtype=torch.float32
+            ).view(1, 1, 1, 3)
+
     def _setup_bindings(self) -> None:
         trt = self.trt
         for i in range(self.engine.num_io_tensors):
@@ -301,7 +358,53 @@ class TensorRTEngineWrapper:
         out[y0 : y0 + h, :] = slab
         return out
 
-    def _preprocess(self, frames_bgr: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _preprocess(
+        self, frames_bgr: list[np.ndarray]
+    ) -> tuple[Union[np.ndarray, torch.Tensor], np.ndarray, np.ndarray]:
+        if self._want_cuda_preprocess:
+            return self._preprocess_cuda(frames_bgr)
+        return self._preprocess_cpu(frames_bgr)
+
+    def _preprocess_cuda(
+        self, frames_bgr: list[np.ndarray]
+    ) -> tuple[torch.Tensor, np.ndarray, np.ndarray]:
+        """BGR uint8 (CPU) → RGB / tile / normalize / NCHW on CUDA (no OpenCV CUDA)."""
+        if not frames_bgr:
+            dev = torch.device("cuda", torch.cuda.current_device())
+            z = torch.zeros(
+                (0, 3, self.height, self.width), device=dev, dtype=self._torch_in_dtype
+            )
+            return z, np.zeros((0, 2), dtype=np.float32), np.zeros((0, 2), dtype=np.float32)
+
+        dev = torch.device("cuda", torch.cuda.current_device())
+        self._ensure_torch_norm(dev)
+        H, W = self.height, self.width
+        tiles: list[torch.Tensor] = []
+        sizes_list: list[tuple[int, int]] = []
+        off_list: list[tuple[float, float]] = []
+
+        for frame in frames_bgr:
+            if not frame.flags["C_CONTIGUOUS"]:
+                frame = np.ascontiguousarray(frame)
+            bgr = torch.from_numpy(frame).to(device=dev, dtype=torch.float32)
+            bgr.mul_(1.0 / 255.0)
+            rgb = bgr.flip(-1)
+            h0, w0 = int(rgb.shape[0]), int(rgb.shape[1])
+            sizes_list.append((h0, w0))
+            off_list.append(self._orig_xy_offset_for_engine_tile(h0, w0, H, W))
+            tiles.append(_torch_rgb_to_engine_hw(rgb, H, W))
+
+        torch.cuda.synchronize()
+        batch_hwc = torch.stack(tiles, dim=0)
+        batch = batch_hwc.permute(0, 3, 1, 2).contiguous()
+        batch = ((batch - self._mean_t) / self._std_t).to(self._torch_in_dtype)
+        sizes = np.asarray(sizes_list, dtype=np.float32)
+        offsets = np.asarray(off_list, dtype=np.float32)
+        return batch, sizes, offsets
+
+    def _preprocess_cpu(
+        self, frames_bgr: list[np.ndarray]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         CPU preprocessing without ``cv2.resize``: center **crop** and/or **pad** to engine
         ``self.height`` × ``self.width``, then batched normalize to NCHW float32.
@@ -367,13 +470,33 @@ class TensorRTEngineWrapper:
             and threading.current_thread() is threading.main_thread()
         )
 
-    def _infer_raw_async(self, batch_nchw: np.ndarray) -> None:
-        """Queue H2D + execute + D2D into torch GPU buffers on ``self.stream`` (no synchronize)."""
+    def _infer_raw_async(self, batch_nchw: Union[np.ndarray, torch.Tensor]) -> None:
+        """Queue input copy + TRT execute + output D2D/D2H on ``self.stream`` (no synchronize).
+
+        ``batch_nchw`` may be a contiguous CUDA tensor (device-matching TRT) or a NumPy array
+        (host → pagelocked → device).
+        """
         inp = self.bindings[self.input_name]
         if tuple(batch_nchw.shape) != tuple(inp["shape"]):
             raise ValueError(f"Expected input shape {inp['shape']}, got {tuple(batch_nchw.shape)}")
-        np.copyto(inp["host"], batch_nchw.ravel().astype(inp["dtype"], copy=False))
-        self.cuda.memcpy_htod_async(inp["device"], inp["host"], self.stream)
+        if isinstance(batch_nchw, torch.Tensor):
+            if not batch_nchw.is_cuda:
+                raise ValueError("RF-DETR CUDA preprocess requires a CUDA tensor")
+            batch_nchw = batch_nchw.contiguous()
+            nb = int(batch_nchw.numel() * batch_nchw.element_size())
+            if nb != int(inp["nbytes"]):
+                raise ValueError(
+                    f"TRT input byte size mismatch: torch {nb} vs binding {inp['nbytes']}"
+                )
+            self.cuda.memcpy_dtod_async(
+                int(inp["device"]),
+                int(batch_nchw.data_ptr()),
+                nb,
+                self.stream,
+            )
+        else:
+            np.copyto(inp["host"], batch_nchw.ravel().astype(inp["dtype"], copy=False))
+            self.cuda.memcpy_htod_async(inp["device"], inp["host"], self.stream)
         if not self.context.execute_async_v3(self.stream.handle):
             raise RuntimeError("TensorRT execute_async_v3 failed.")
         if self._use_gpu_torch_decode_this_thread():
@@ -395,7 +518,7 @@ class TensorRTEngineWrapper:
                     continue
                 self.cuda.memcpy_dtoh_async(buf["host"], buf["device"], self.stream)
 
-    def _infer_raw_numpy_outputs(self, batch_nchw: np.ndarray) -> list[np.ndarray]:
+    def _infer_raw_numpy_outputs(self, batch_nchw: Union[np.ndarray, torch.Tensor]) -> list[np.ndarray]:
         """D2H to pagelocked host + one stream sync (fallback path)."""
         self._infer_raw_async(batch_nchw)
         self.stream.synchronize()
@@ -408,7 +531,7 @@ class TensorRTEngineWrapper:
 
     def decode_batch_nchw(
         self,
-        batch_nchw: np.ndarray,
+        batch_nchw: Union[np.ndarray, torch.Tensor],
         sizes: np.ndarray,
         box_offsets: np.ndarray,
         valid: int,
@@ -547,9 +670,9 @@ def _dict_to_sv(d: dict[str, Any]) -> sv.Detections:
 class RfDetrTrtTrashDetector(TrashDetector):
     """Two TensorRT RF-DETR engines (trash + cigarette); same ``detect_trash`` contract as PyTorch.
 
-    Each batch is **preprocessed once** (BGR→tile→NCHW on the trash head's wrapper); both heads
-    then run ``decode_batch_nchw`` on that shared tensor **in parallel** (two threads; one TRT
-    forward + post per head).
+    Each batch is **preprocessed once** on the trash head (NumPy/OpenCV CPU, or **PyTorch CUDA**
+    when ``RF_DETR_PREPROCESS_CUDA`` allows); both heads then run ``decode_batch_nchw`` on that
+    shared tensor **in parallel** (two threads; one TRT forward + post per head).
     """
 
     def __init__(
@@ -573,6 +696,10 @@ class RfDetrTrtTrashDetector(TrashDetector):
             ),
         ]
         self._use_sv_names = use_sv
+        if self._heads[0][0]._want_cuda_preprocess:
+            logger.info(
+                "RF-DETR preprocess: PyTorch CUDA (set RF_DETR_PREPROCESS_CUDA=cpu for NumPy/OpenCV CPU path)."
+            )
 
     @property
     def engine_batch_size(self) -> int:
