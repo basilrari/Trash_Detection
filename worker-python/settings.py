@@ -22,6 +22,8 @@ Gating (YOLO stride) — default ``GATE_MODE=yolo`` (see ``core/yolo_stride_gate
 
 Environment variables override these values when set (same names as the variables).
 
+Optional: ``YOLO_IMGSZ`` — Ultralytics scene YOLO ``imgsz`` (default **672** for speed experiments vs RF-DETR; set ``640`` to restore typical default).
+
 RF-DETR: the video pipeline uses **TensorRT** engines only — ``weights/trash.engine`` and
 ``weights/cigarette.engine`` (``TRASH_ENGINE_PATH`` / ``CIGARETTE_ENGINE_PATH``) and
 ``TRASH_CONFIDENCE``. Requires ``tensorrt`` and ``pycuda``. Static batch and input size are
@@ -69,6 +71,8 @@ NVENC_CQ = int(os.getenv("NVENC_CQ", "28"))
 
 CHUNK_SECONDS = 5
 YOLO_CONFIDENCE = 0.5
+# Scene YOLO (Ultralytics) inference size; ``640`` is common default, ``672`` matches RF-DETR TRT H×W for experiments.
+YOLO_IMGSZ = max(32, int(os.getenv("YOLO_IMGSZ", "672")))
 PLATE_CONFIDENCE = 0.5
 
 # --- Gating (see module docstring above) ---

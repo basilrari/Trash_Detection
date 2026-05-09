@@ -8,12 +8,18 @@ from core.types import FrameData, Detection
 
 
 class YoloDetector(Detector):
-    def __init__(self, weights_path: str | None = None, conf_threshold: float = 0.5):
+    def __init__(
+        self,
+        weights_path: str | None = None,
+        conf_threshold: float = 0.5,
+        imgsz: int | None = None,
+    ):
         """
         YOLO detector for persons + vehicles.
 
         :param weights_path: Optional custom path to YOLO weights.
         :param conf_threshold: Confidence threshold for detections.
+        :param imgsz: Ultralytics ``imgsz`` (default: ``settings.YOLO_IMGSZ``).
         """
         if weights_path is None:
             # Resolve ../weights/yolo11x.pt relative to this file
@@ -23,6 +29,11 @@ class YoloDetector(Detector):
 
         self.model = YOLO(str(weights_path))
         self.conf_threshold = conf_threshold
+        if imgsz is None:
+            from settings import YOLO_IMGSZ
+
+            imgsz = YOLO_IMGSZ
+        self.imgsz = max(32, int(imgsz))
 
         # COCO subset: person + road vehicles only (no train/boat/bicycle/etc.).
         # 0 person, 2 car, 3 motorcycle, 5 bus, 7 truck
@@ -44,6 +55,7 @@ class YoloDetector(Detector):
             images,
             classes=self.classes,
             conf=self.conf_threshold,
+            imgsz=self.imgsz,
         )
 
         detections_per_frame: List[List[Detection]] = []
