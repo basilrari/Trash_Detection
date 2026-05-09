@@ -73,6 +73,25 @@ def _prep_image(img: np.ndarray) -> np.ndarray:
     return img
 
 
+def _ocr_crop_too_small_or_blurry(bgr: np.ndarray) -> bool:
+    """True if crop should skip Paddle (saves time on tiny / very soft patches)."""
+    try:
+        from settings import OCR_MIN_PLATE_SIDE, OCR_MIN_VARIANCE_LAPLACIAN
+    except Exception:
+        return False
+    if bgr is None or bgr.size == 0:
+        return True
+    h, w = bgr.shape[:2]
+    if min(h, w) < int(OCR_MIN_PLATE_SIDE):
+        return True
+    thr = float(OCR_MIN_VARIANCE_LAPLACIAN)
+    if thr <= 0:
+        return False
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    v = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    return v < thr
+
+
 def _run_ocr_backend(ocr: Any, img: np.ndarray):
     if hasattr(ocr, "predict"):
         return ocr.predict(img)
@@ -123,6 +142,9 @@ def _recognize_with_backend(ocr: Any, crops: List[np.ndarray]) -> List[Tuple[str
     for crop in crops:
         try:
             if crop is None or crop.size == 0:
+                outputs.append(("", 0.0))
+                continue
+            if _ocr_crop_too_small_or_blurry(crop):
                 outputs.append(("", 0.0))
                 continue
             img = _prep_image(crop)

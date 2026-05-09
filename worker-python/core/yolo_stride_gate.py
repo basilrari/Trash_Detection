@@ -1,15 +1,17 @@
 """YOLO-only **gate**: decide which frames run the full detector stack.
 
 This module does **not** run YOLO itself. It answers ``should_run_yolo(frame_idx)`` so the
-pipeline can skip expensive work on many frames.
+pipeline can skip expensive work on many frames — used when ``settings.GATE_MODE == "yolo"``.
+
+**Numeric ``GATE_MODE`` (``"1"``, ``"2"``, …)**  
+Uniform stride + micro-batching is implemented in ``pipelines.test_pipeline`` (not here):
+scene YOLO on ``frame_idx % N == 0`` only, with ``YOLO_MICRO_BATCH_SIZE`` batched ``detect()`` calls.
 
 **Why “gate”?**  
-The gate is the policy layer that opens or closes how often we invoke YOLO (and thus
-LP/OCR that depend on YOLO boxes). ``GATE_MODE=yolo`` (default in ``settings.py``) uses this
-scheduler. ``GATE_MODE=off`` disables the stride gate for the **chunked** path (full YOLO
-inside each time chunk).
+``GATE_MODE=yolo`` (default in older configs) uses this scheduler. ``GATE_MODE=off`` disables the
+stride gate for the **chunked** path (full YOLO inside each time chunk).
 
-**Coarse vs dense**
+**Coarse vs dense** (``YoloStrideGate`` only)
 
 * **Coarse stride** (``coarse_stride`` / ``YOLO_COARSE_STRIDE``): when we are **idle**
   (not in dense mode), we only run YOLO on frames where ``frame_idx % coarse_stride == 0``.

@@ -703,6 +703,9 @@ class RfDetrTrtTrashDetector(TrashDetector):
         class_names: dict[int, str] | None = None,
         conf_threshold: float = 0.4,
     ) -> None:
+        from settings import RF_DETR_CIGARETTE_EVERY_N_BATCHES as _cig_setting
+
+        self._cigarette_every_n_batches = max(1, int(_cig_setting))
         self._class_names = dict(class_names) if class_names else None
         use_sv = class_names is not None
         self._heads: List[Tuple[TensorRTEngineWrapper, str]] = [
@@ -716,6 +719,7 @@ class RfDetrTrtTrashDetector(TrashDetector):
             ),
         ]
         self._use_sv_names = use_sv
+        self._trt_batch_counter = 0
         w0 = self._heads[0][0]
         if w0.uses_cuda_preprocess():
             logger.info(
@@ -760,26 +764,46 @@ class RfDetrTrtTrashDetector(TrashDetector):
             if isinstance(batch_nchw, torch.Tensor):
                 torch.cuda.synchronize()
             preprocess_ms = (time.perf_counter() - t_pre0) * 1000.0
+
+            self._trt_batch_counter += 1
+            run_cigarette = len(self._heads) <= 1 or (
+                (self._trt_batch_counter % self._cigarette_every_n_batches) == 0
+            )
+
             if len(self._heads) > 1:
                 parts: list[list[dict[str, Any]] | None] = [None] * len(self._heads)
-                with ThreadPoolExecutor(max_workers=len(self._heads)) as ex:
-                    futures: dict[Future, int] = {}
-                    for hi in range(len(self._heads)):
-                        label = self._heads[hi][1]
-                        fut = ex.submit(
-                            self._heads[hi][0].decode_batch_nchw,
-                            batch_nchw,
-                            sizes,
-                            box_offsets,
-                            valid,
-                            top_n=50,
-                            preprocess_ms=preprocess_ms if hi == 0 else None,
-                            timing_label=label,
-                        )
-                        futures[fut] = hi
-                    for fut in as_completed(futures):
-                        hi = futures[fut]
-                        parts[hi] = fut.result()
+                if run_cigarette:
+                    with ThreadPoolExecutor(max_workers=len(self._heads)) as ex:
+                        futures: dict[Future, int] = {}
+                        for hi in range(len(self._heads)):
+                            label = self._heads[hi][1]
+                            fut = ex.submit(
+                                self._heads[hi][0].decode_batch_nchw,
+                                batch_nchw,
+                                sizes,
+                                box_offsets,
+                                valid,
+                                top_n=50,
+                                preprocess_ms=preprocess_ms if hi == 0 else None,
+                                timing_label=label,
+                            )
+                            futures[fut] = hi
+                        for fut in as_completed(futures):
+                            hi = futures[fut]
+                            parts[hi] = fut.result()
+                else:
+                    parts[0] = self._heads[0][0].decode_batch_nchw(
+                        batch_nchw,
+                        sizes,
+                        box_offsets,
+                        valid,
+                        top_n=50,
+                        preprocess_ms=preprocess_ms,
+                        timing_label=self._heads[0][1],
+                    )
+                    parts[1] = [
+                        {"boxes": [], "scores": [], "labels": []} for _ in range(valid)
+                    ]
                 for hi, (_, default_lbl) in enumerate(self._heads):
                     per = parts[hi]
                     if per is None or len(per) != valid:

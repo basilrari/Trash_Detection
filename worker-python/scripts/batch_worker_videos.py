@@ -5,9 +5,8 @@ From ``worker-python/``::
 
   python scripts/batch_worker_videos.py
   python scripts/batch_worker_videos.py -i inputs -o outputs
-  python scripts/batch_worker_videos.py -i inputs -o outputs --gate off
 
-Uses the same pipeline as a manual ``python worker.py <video> -o <out>`` run.
+Uses ``settings.GATE_MODE`` (and all other settings) from ``settings.py`` for every run.
 Filenames with spaces are handled via ``subprocess`` argument lists.
 """
 from __future__ import annotations
@@ -51,12 +50,6 @@ def main() -> int:
         help=f"Annotated MP4s written here (default: {WORKER_ROOT / 'outputs'})",
     )
     parser.add_argument(
-        "--gate",
-        choices=("off", "yolo"),
-        default=None,
-        help="Passed to worker.py (default: worker/settings default, usually yolo).",
-    )
-    parser.add_argument(
         "--skip-existing",
         action="store_true",
         help="Skip a clip if the target annotated file already exists.",
@@ -93,8 +86,6 @@ def main() -> int:
             continue
 
         cmd = [sys.executable, str(WORKER_PY), str(vp), "-o", str(out_path)]
-        if args.gate is not None:
-            cmd.extend(["--gate", args.gate])
 
         print(f"\n=== {vp.name} -> {out_path.name} ===", flush=True)
         if args.dry_run:
