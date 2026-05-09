@@ -176,7 +176,7 @@ def _log_pipeline_run_configuration(
         w0 = heads[0][0]
         rf_pre = (
             "PyTorch CUDA → TRT D2D input"
-            if getattr(w0, "_want_cuda_preprocess", False)
+            if w0.uses_cuda_preprocess()
             else "NumPy + OpenCV CPU → TRT H2D"
         )
         b0, b1, b2 = (getattr(w0, "batch", "?"), getattr(w0, "height", "?"), getattr(w0, "width", "?"))
@@ -465,9 +465,9 @@ class PipelineStepTimes:
             )
             console.print(
                 "  [dim]RF-DETR note:[/] ``[RF-DETR] … fps`` logs are per ``detect_trash`` call; "
-                "eff. FPS above is the fair average. Default preprocess is **PyTorch CUDA** when CUDA "
-                "is available (``RF_DETR_PREPROCESS_CUDA=cpu`` for CPU); two TRT heads dominate "
-                "``[TRT]`` forward time once preprocess is small."
+                "eff. FPS above is the fair average. Preprocess **defaults to GPU** (PyTorch CUDA); "
+                "``RF_DETR_PREPROCESS_CUDA=cpu`` forces CPU. Two TRT heads dominate ``[TRT]`` forward "
+                "time once preprocess is small."
             )
         console.print(f"  Peeing (MediaPipe):   {self.peeing_sec:8.2f} s")
         console.print(f"  Annotate (draw only): {self.annotate_draw_sec:8.2f} s")
@@ -1161,7 +1161,7 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         _log_model_ready(
             "RF-DETR TensorRT",
             f"batch={w0.batch}  input {w0.height}×{w0.width}  "
-            f"{'CUDA preprocess' if getattr(w0, '_want_cuda_preprocess', False) else 'CPU preprocess'}",
+            f"{'CUDA preprocess' if w0.uses_cuda_preprocess() else 'CPU preprocess'}",
         )
     else:
         _log_model_ready("RF-DETR", "loaded")

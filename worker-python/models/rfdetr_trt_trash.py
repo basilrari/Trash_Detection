@@ -5,9 +5,9 @@ Requires ``tensorrt`` and ``pycuda`` on the inference machine.
 
 Set ``RF_DETR_TRT_TIMING=1`` to print per-chunk ``[TRT]`` timing (preprocess / forward / postprocess).
 
-**Default:** PyTorch **CUDA** preprocess when ``torch.cuda.is_available()`` (BGR→tile→NCHW on GPU,
-TRT input via D2D). Set ``RF_DETR_PREPROCESS_CUDA=cpu`` (or ``0`` / ``false`` / ``off``) to force
-the NumPy + OpenCV CPU path.
+**Default:** PyTorch **GPU** preprocess (BGR→tile→NCHW on CUDA, TRT input via D2D). If there is no
+CUDA device, preprocessing falls back to NumPy + OpenCV on CPU. Set ``RF_DETR_PREPROCESS_CUDA=cpu``
+(or ``0`` / ``false`` / ``off``) to force the CPU path.
 """
 
 from __future__ import annotations
@@ -38,14 +38,13 @@ def _trt_timing_enabled() -> bool:
 
 
 def _preprocess_use_cuda() -> bool:
-    """Use PyTorch CUDA preprocess when CUDA is available (project default).
+    """Prefer PyTorch GPU preprocess (project default).
 
     ``RF_DETR_PREPROCESS_CUDA=cpu`` / ``0`` / ``false`` / ``off`` / ``no`` — force NumPy + OpenCV CPU.
 
-    Any other value (including **unset**) uses the GPU path when ``torch.cuda.is_available()``.
+    Any other value (including **unset**) prefers the GPU preprocessor; see
+    :meth:`TensorRTEngineWrapper.uses_cuda_preprocess` for whether CUDA actually runs.
     """
-    if not torch.cuda.is_available():
-        return False
     v = os.environ.get("RF_DETR_PREPROCESS_CUDA", "").strip().lower()
     if v in ("0", "false", "no", "off", "cpu"):
         return False
@@ -281,6 +280,10 @@ class TensorRTEngineWrapper:
         self._mean_t: torch.Tensor | None = None
         self._std_t: torch.Tensor | None = None
 
+    def uses_cuda_preprocess(self) -> bool:
+        """True when the GPU preprocessor path runs (default on unless forced CPU; needs CUDA)."""
+        return bool(self._want_cuda_preprocess and torch.cuda.is_available())
+
     def _ensure_torch_norm(self, device: torch.device) -> None:
         # NCHW batch (B,3,H,W) broadcasts with mean/std shape (1,3,1,1).
         if (
@@ -372,7 +375,7 @@ class TensorRTEngineWrapper:
     def _preprocess(
         self, frames_bgr: list[np.ndarray]
     ) -> tuple[Union[np.ndarray, torch.Tensor], np.ndarray, np.ndarray]:
-        if self._want_cuda_preprocess:
+        if self.uses_cuda_preprocess():
             return self._preprocess_cuda(frames_bgr)
         return self._preprocess_cpu(frames_bgr)
 
@@ -682,9 +685,9 @@ def _dict_to_sv(d: dict[str, Any]) -> sv.Detections:
 class RfDetrTrtTrashDetector(TrashDetector):
     """Two TensorRT RF-DETR engines (trash + cigarette); same ``detect_trash`` contract as PyTorch.
 
-    Each batch is **preprocessed once** on the trash head (**PyTorch CUDA** when CUDA is available,
-    else NumPy + OpenCV CPU); both heads then run ``decode_batch_nchw`` on that
-    shared tensor **in parallel** (two threads; one TRT forward + post per head).
+    Each batch is **preprocessed once** on the trash head (**PyTorch GPU** by default; ``cpu`` env
+    forces NumPy + OpenCV; no CUDA device → CPU path). Both heads then run ``decode_batch_nchw`` on
+    that shared tensor **in parallel** (two threads; one TRT forward + post per head).
     """
 
     def __init__(
@@ -708,10 +711,16 @@ class RfDetrTrtTrashDetector(TrashDetector):
             ),
         ]
         self._use_sv_names = use_sv
-        if self._heads[0][0]._want_cuda_preprocess:
+        w0 = self._heads[0][0]
+        if w0.uses_cuda_preprocess():
             logger.info(
-                "RF-DETR preprocess: PyTorch CUDA (default when CUDA is available; "
+                "RF-DETR preprocess: PyTorch CUDA (default GPU; "
                 "RF_DETR_PREPROCESS_CUDA=cpu for NumPy/OpenCV CPU path)."
+            )
+        elif w0._want_cuda_preprocess:
+            logger.info(
+                "RF-DETR preprocess: default is GPU, but CUDA is unavailable — "
+                "using NumPy + OpenCV CPU."
             )
 
     @property
