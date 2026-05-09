@@ -3,12 +3,11 @@
 Engines use static batch (e.g. 8) and input size (e.g. 672×672) baked in at export time.
 Requires ``tensorrt`` and ``pycuda`` on the inference machine.
 
-Set ``RF_DETR_TRT_TIMING=1`` to print per-chunk ``[TRT]`` timing (preprocess / forward / postprocess).
+Configure ``RF_DETR_TRT_TIMING`` and ``RF_DETR_PREPROCESS_CUDA`` in ``settings.py`` (not env).
 
-**Default:** NumPy + OpenCV **CPU** preprocess. Set ``RF_DETR_PREPROCESS_CUDA=1`` (or ``true`` /
-``on`` / ``cuda`` / ``auto``) to use PyTorch CUDA preprocess (BGR→tile→NCHW on GPU, TRT input via
-D2D) when CUDA is available. ``RF_DETR_PREPROCESS_CUDA=cpu`` (or ``0`` / ``false`` / ``off``)
-forces CPU.
+**Default:** NumPy + OpenCV **CPU** preprocess unless ``RF_DETR_PREPROCESS_CUDA`` in settings is
+``"1"`` / ``"true"`` / ``"cuda"`` / ``auto`` (PyTorch CUDA when a GPU exists). ``""`` / ``"cpu"`` /
+``"0"`` / ``false`` / ``off`` → CPU.
 
 Inputs are **letterboxed**: the full frame is scaled (uniform ``cv2.resize`` / bilinear) to fit
 inside the engine H×W, centered on a zero canvas (aspect ratio preserved).
@@ -38,18 +37,21 @@ logger = logging.getLogger(__name__)
 
 
 def _trt_timing_enabled() -> bool:
-    v = os.environ.get("RF_DETR_TRT_TIMING", "").strip().lower()
-    return v in ("1", "true", "yes", "on")
+    from settings import RF_DETR_TRT_TIMING
+
+    if isinstance(RF_DETR_TRT_TIMING, bool):
+        return RF_DETR_TRT_TIMING
+    return str(RF_DETR_TRT_TIMING).strip().lower() in ("1", "true", "yes", "on")
 
 
 def _preprocess_use_cuda() -> bool:
-    """Use PyTorch CUDA preprocess only when explicitly enabled.
+    """Use PyTorch CUDA preprocess only when enabled in ``settings.RF_DETR_PREPROCESS_CUDA``."""
+    from settings import RF_DETR_PREPROCESS_CUDA
 
-    ``RF_DETR_PREPROCESS_CUDA=1`` / ``true`` / ``yes`` / ``on`` / ``cuda`` / ``auto`` — request CUDA.
-    ``RF_DETR_PREPROCESS_CUDA=0`` / ``false`` / ``no`` / ``off`` / ``cpu`` — force CPU.
-    Unset (or unknown values) defaults to CPU.
-    """
-    v = os.environ.get("RF_DETR_PREPROCESS_CUDA", "").strip().lower()
+    if isinstance(RF_DETR_PREPROCESS_CUDA, bool):
+        v = "1" if RF_DETR_PREPROCESS_CUDA else ""
+    else:
+        v = str(RF_DETR_PREPROCESS_CUDA).strip().lower()
     if v in ("1", "true", "yes", "on", "cuda", "auto"):
         return True
     return False
@@ -687,9 +689,10 @@ class RfDetrTrtTrashDetector(TrashDetector):
     """Two TensorRT RF-DETR engines (trash + cigarette); same ``detect_trash`` contract as PyTorch.
 
     Each batch is **preprocessed once** on the trash head: **letterboxed** (uniform resize to fit
-    engine H×W, centered on a zero canvas) so the full frame is preserved; CPU (default) or CUDA
-    (``RF_DETR_PREPROCESS_CUDA=1`` / ``cuda`` / ``auto``). Both heads then run ``decode_batch_nchw``
-    on that shared tensor **in parallel** (two threads; one TRT forward + post per head).
+    engine H×W, centered on a zero canvas) so the full frame is preserved; CPU (default) or
+    PyTorch CUDA when ``settings.RF_DETR_PREPROCESS_CUDA`` opts in (``"1"`` / ``"cuda"`` / ``"auto"`` /
+    ``True``). Both heads then run ``decode_batch_nchw`` on that shared tensor **in parallel**
+    (two threads; one TRT forward + post per head).
     """
 
     def __init__(
@@ -716,12 +719,12 @@ class RfDetrTrtTrashDetector(TrashDetector):
         w0 = self._heads[0][0]
         if w0.uses_cuda_preprocess():
             logger.info(
-                "RF-DETR preprocess: PyTorch CUDA (RF_DETR_PREPROCESS_CUDA enabled)."
+                "RF-DETR preprocess: PyTorch CUDA (settings.RF_DETR_PREPROCESS_CUDA enabled)."
             )
         elif w0._want_cuda_preprocess:
             logger.info(
-                "RF-DETR preprocess: RF_DETR_PREPROCESS_CUDA enabled, but CUDA unavailable — "
-                "using NumPy + OpenCV CPU."
+                "RF-DETR preprocess: settings.RF_DETR_PREPROCESS_CUDA requests CUDA, "
+                "but CUDA is unavailable — using NumPy + OpenCV CPU."
             )
 
     @property

@@ -15,9 +15,8 @@ Run from worker-python/ (put source videos in inputs/, results under outputs/ by
 RF-DETR runs only on frames where YOLO reports a **person or vehicle** at ``YOLO_CONFIDENCE``
 (scene activity), not on every decoded frame.
 
-**Output video** — default ``OUTPUT_VIDEO_ENCODER=auto``: use ``ffmpeg`` ``h264_nvenc`` when
-available, else OpenCV ``mp4v``. Override with ``nvenc`` (fail if unusable) or ``mp4v``. Tune
-``NVENC_PRESET`` / ``NVENC_CQ`` in ``settings.py`` (env vars).
+**Output video** — set ``OUTPUT_VIDEO_ENCODER`` in ``settings.py`` (``auto``, ``nvenc``, ``mp4v``). Tune
+``NVENC_PRESET`` / ``NVENC_CQ`` there as well.
 """
 
 from __future__ import annotations
@@ -74,6 +73,8 @@ from settings import (
     PEEING_WINDOW_SEC,
     PEEING_WRIST_BAND_MIN_VISIBILITY,
     PLATE_CONFIDENCE,
+    RF_DETR_PREPROCESS_CUDA,
+    RF_DETR_TRT_TIMING,
     TRASH_CONFIDENCE,
     TRASH_ENGINE_PATH,
     VIDEO_PATH,
@@ -166,7 +167,7 @@ def _log_pipeline_run_configuration(
     sink_label: str,
     trash: TrashDetector,
 ) -> None:
-    """Gates, thresholds, TRT layout, preprocess, encoder, timing env flags."""
+    """Gates, thresholds, TRT layout, preprocess, encoder, and RF-DETR flags (from ``settings``)."""
     te = Path(TRASH_ENGINE_PATH).resolve()
     ce = Path(CIGARETTE_ENGINE_PATH).resolve()
     rf_pre = "unknown"
@@ -180,8 +181,8 @@ def _log_pipeline_run_configuration(
             else "NumPy + OpenCV CPU → TRT H2D"
         )
         b0, b1, b2 = (getattr(w0, "batch", "?"), getattr(w0, "height", "?"), getattr(w0, "width", "?"))
-    trt_pre_env = os.environ.get("RF_DETR_PREPROCESS_CUDA", "(unset)")
-    trt_tim_env = os.environ.get("RF_DETR_TRT_TIMING", "(unset)")
+    trt_pre_disp = repr(RF_DETR_PREPROCESS_CUDA)
+    trt_tim_disp = repr(RF_DETR_TRT_TIMING)
     console.print("[bold]Run configuration[/]")
     console.print(f"  Video  [dim]{video_path}[/]  →  {width}×{height} @ {fps:.3f} fps, {total_frames} frames")
     if mode == "yolo":
@@ -202,7 +203,7 @@ def _log_pipeline_run_configuration(
     console.print(f"         trash.engine   [dim]{te}[/]")
     console.print(f"         cigarette      [dim]{ce}[/]")
     console.print(
-        f"  Env    RF_DETR_PREPROCESS_CUDA={trt_pre_env!r}  RF_DETR_TRT_TIMING={trt_tim_env!r}"
+        f"  Cfg    RF_DETR_PREPROCESS_CUDA={trt_pre_disp}  RF_DETR_TRT_TIMING={trt_tim_disp}"
     )
     console.print(
         f"  Encode OUTPUT_VIDEO_ENCODER={OUTPUT_VIDEO_ENCODER!r}  "
@@ -465,8 +466,8 @@ class PipelineStepTimes:
             )
             console.print(
                 "  [dim]RF-DETR note:[/] ``[RF-DETR] … fps`` logs are per ``detect_trash`` call; "
-                "eff. FPS above is the fair average. GPU preprocess is opt-in "
-                "(``RF_DETR_PREPROCESS_CUDA=1``); default CPU preprocess + two TRT heads dominate when "
+                "eff. FPS above is the fair average. GPU preprocess is opt-in in ``settings.py`` "
+                "(``RF_DETR_PREPROCESS_CUDA``); default CPU preprocess + two TRT heads dominate when "
                 "``[TRT]`` preprocess ms is high."
             )
         console.print(f"  Peeing (MediaPipe):   {self.peeing_sec:8.2f} s")

@@ -16,8 +16,10 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_paddle_ocr_device() -> str:
-    """Pick Paddle device: env ``PADDLE_OCR_DEVICE`` if set, else ``gpu`` when CUDA is available."""
-    raw = os.environ.get("PADDLE_OCR_DEVICE", "").strip()
+    """Pick Paddle device from ``settings.PADDLE_OCR_DEVICE``, else ``gpu`` when CUDA is available."""
+    from settings import PADDLE_OCR_DEVICE
+
+    raw = str(PADDLE_OCR_DEVICE).strip()
     if raw:
         return raw
     try:
@@ -47,11 +49,14 @@ def _isolate_ocr_process_default(device: str) -> bool:
 
     On Blackwell + GPU OCR we isolate PaddleOCR in a subprocess by default because
     mixed PyTorch + Paddle + TensorRT in one process can poison CUDA context state.
+    Override with ``settings.PADDLE_OCR_ISOLATE_PROCESS`` (``True`` / ``False`` / ``None`` = heuristic).
     """
-    v = os.environ.get("PADDLE_OCR_ISOLATE_PROCESS", "").strip().lower()
-    if v in ("1", "true", "yes", "on"):
+    from settings import PADDLE_OCR_ISOLATE_PROCESS
+
+    v = PADDLE_OCR_ISOLATE_PROCESS
+    if v is True:
         return True
-    if v in ("0", "false", "no", "off"):
+    if v is False:
         return False
     return device.startswith("gpu") and _is_blackwell_visible()
 
