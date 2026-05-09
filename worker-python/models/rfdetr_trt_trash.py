@@ -9,6 +9,9 @@ Set ``RF_DETR_TRT_TIMING=1`` to print per-chunk ``[TRT]`` timing (preprocess / f
 ``on`` / ``cuda`` / ``auto``) to use PyTorch CUDA preprocess (BGR→tile→NCHW on GPU, TRT input via
 D2D) when CUDA is available. ``RF_DETR_PREPROCESS_CUDA=cpu`` (or ``0`` / ``false`` / ``off``)
 forces CPU.
+
+Inputs are **letterboxed**: the full frame is scaled (uniform ``cv2.resize`` / bilinear) to fit
+inside the engine H×W, centered on a zero canvas (aspect ratio preserved).
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import cv2
 import numpy as np
 import supervision as sv
 import torch
+import torch.nn.functional as F
 
 from core.types import Detection, FrameData
 from models.base import TrashDetector
@@ -76,8 +80,9 @@ def _post_process(
     """CPU fallback post-process (same math as :func:`_post_process_gpu`).
 
     ``target_sizes`` is ``(B, 2)`` ``(img_h, img_w)`` per frame (original RGB shape).
-    ``box_offsets`` is ``(B, 2)`` ``(ox, oy)`` such that engine-normalized xyxy maps to
-    original pixels via ``x_orig = x_eng * eng_w + ox`` (and same for y with ``eng_h``).
+    ``box_offsets`` is ``(B, 4)`` ``(ox, oy, gain_x, gain_y)`` such that engine-normalized
+    xyxy maps to original pixels via ``x_orig = x_norm * gain_x + ox`` (and ``y`` with ``gain_y``,
+    ``oy``). See :meth:`TensorRTEngineWrapper._letterbox_layout`.
     """
     with torch.inference_mode():
         bbox_t = torch.from_numpy(out_bbox)
@@ -93,14 +98,18 @@ def _post_process(
         boxes = _box_cxcywh_to_xyxy(bbox_t)
         boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
         _ = sizes_t  # kept for API symmetry / future use
-        ox, oy = off_t.unbind(1)
-        ew = float(eng_w)
-        eh = float(eng_h)
-        scale_fct = torch.tensor(
-            [ew, eh, ew, eh], dtype=boxes.dtype, device=boxes.device
-        ).view(1, 1, 4)
-        off4 = torch.stack([ox, oy, ox, oy], dim=1).unsqueeze(1)
+        ox = off_t[:, 0]
+        oy = off_t[:, 1]
+        gx = off_t[:, 2]
+        gy = off_t[:, 3]
+        scale_fct = torch.stack([gx, gy, gx, gy], dim=-1).unsqueeze(1).to(
+            device=boxes.device, dtype=boxes.dtype
+        )
+        off4 = torch.stack([ox, oy, ox, oy], dim=-1).unsqueeze(1).to(
+            device=boxes.device, dtype=boxes.dtype
+        )
         boxes = boxes * scale_fct + off4
+        _ = eng_w, eng_h  # kept for signature parity with callers
         out: list[dict[str, np.ndarray]] = []
         for score, label, box in zip(topk_values, labels, boxes):
             out.append(
@@ -122,7 +131,10 @@ def _post_process_gpu(
     eng_h: int,
     topk: int = 300,
 ) -> list[dict[str, np.ndarray]]:
-    """Top-k decode + box scaling on GPU; small per-frame arrays copied to CPU last."""
+    """Top-k decode + box scaling on GPU; small per-frame arrays copied to CPU last.
+
+    ``offsets_t`` is ``(B, 4)`` ``(ox, oy, gain_x, gain_y)`` (see :func:`_post_process`).
+    """
     with torch.inference_mode():
         if bbox_t.dtype != torch.float32:
             bbox_t = bbox_t.float()
@@ -142,14 +154,18 @@ def _post_process_gpu(
         boxes = _box_cxcywh_to_xyxy(bbox_t)
         boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
         _ = sizes_t
-        ox, oy = offsets_t.unbind(1)
-        ew = float(eng_w)
-        eh = float(eng_h)
-        scale_fct = torch.tensor(
-            [ew, eh, ew, eh], dtype=boxes.dtype, device=boxes.device
-        ).view(1, 1, 4)
-        off4 = torch.stack([ox, oy, ox, oy], dim=1).unsqueeze(1)
+        ox = offsets_t[:, 0]
+        oy = offsets_t[:, 1]
+        gx = offsets_t[:, 2]
+        gy = offsets_t[:, 3]
+        scale_fct = torch.stack([gx, gy, gx, gy], dim=-1).unsqueeze(1).to(
+            dtype=boxes.dtype, device=boxes.device
+        )
+        off4 = torch.stack([ox, oy, ox, oy], dim=-1).unsqueeze(1).to(
+            dtype=boxes.dtype, device=boxes.device
+        )
         boxes = boxes * scale_fct + off4
+        _ = eng_w, eng_h
 
         out: list[dict[str, np.ndarray]] = []
         for score, label, box in zip(topk_values, labels, boxes):
@@ -161,35 +177,6 @@ def _post_process_gpu(
                 }
             )
         return out
-
-
-def _torch_rgb_to_engine_hw(rgb: torch.Tensor, H: int, W: int) -> torch.Tensor:
-    """Center crop / pad float ``rgb`` (h,w,3) on CUDA to ``(H,W,3)`` (same dtype/device)."""
-    h, w = int(rgb.shape[0]), int(rgb.shape[1])
-    dev, dt = rgb.device, rgb.dtype
-    if h >= H and w >= W:
-        y0 = (h - H) // 2
-        x0 = (w - W) // 2
-        return rgb[y0 : y0 + H, x0 : x0 + W].clone()
-    if h <= H and w <= W:
-        out = torch.zeros((H, W, 3), device=dev, dtype=dt)
-        y0 = (H - h) // 2
-        x0 = (W - w) // 2
-        out[y0 : y0 + h, x0 : x0 + w] = rgb
-        return out
-    if h >= H and w < W:
-        y0 = (h - H) // 2
-        slab = rgb[y0 : y0 + H, :]
-        out = torch.zeros((H, W, 3), device=dev, dtype=dt)
-        x0 = (W - w) // 2
-        out[:, x0 : x0 + w] = slab
-        return out
-    x0 = (w - W) // 2
-    slab = rgb[:, x0 : x0 + W]
-    out = torch.zeros((H, W, 3), device=dev, dtype=dt)
-    y0 = (H - h) // 2
-    out[y0 : y0 + h, :] = slab
-    return out
 
 
 def _tensorrt_deserialize_hint(engine_path: str | Path) -> str:
@@ -329,48 +316,58 @@ class TensorRTEngineWrapper:
             raise RuntimeError("No TensorRT input tensor found.")
 
     @staticmethod
-    def _orig_xy_offset_for_engine_tile(h: int, w: int, H: int, W: int) -> tuple[float, float]:
-        """Original-image pixel ``(x, y)`` of engine input origin ``(0, 0)`` after center crop/pad.
+    def _letterbox_layout(
+        h0: int, w0: int, H: int, W: int
+    ) -> tuple[int, int, int, int, float, float, float, float]:
+        """Scale-to-fit layout: resized content ``nw×nh``, top-left pad ``(pad_x, pad_y)``.
 
-        Maps engine-normalized coords to originals via ``x_orig = x_norm * W + ox`` (and ``y``).
+        Engine normalized coords map to original pixels as
+        ``x_orig = x_norm * gain_x + ox`` (and ``y_orig = y_norm * gain_y + oy``).
         """
-        if h >= H and w >= W:
-            return ((w - W) / 2.0, (h - H) / 2.0)
-        if h <= H and w <= W:
-            return (-((W - w) / 2.0), -((H - h) / 2.0))
-        if h >= H and w < W:
-            return (-((W - w) / 2.0), (h - H) / 2.0)
-        return ((w - W) / 2.0, -((H - h) / 2.0))
+        if h0 <= 0 or w0 <= 0:
+            raise ValueError("letterbox requires positive image height and width")
+        scale = min(W / float(w0), H / float(h0))
+        nw = max(1, int(round(w0 * scale)))
+        nh = max(1, int(round(h0 * scale)))
+        pad_w = W - nw
+        pad_h = H - nh
+        pad_x = pad_w // 2
+        pad_y = pad_h // 2
+        inv_nw = w0 / float(nw)
+        inv_nh = h0 / float(nh)
+        gain_x = float(W * inv_nw)
+        gain_y = float(H * inv_nh)
+        ox = float(-pad_x * inv_nw)
+        oy = float(-pad_y * inv_nh)
+        return nw, nh, pad_x, pad_y, ox, oy, gain_x, gain_y
 
-    def _rgb_to_engine_hw(self, rgb: np.ndarray) -> np.ndarray:
-        """Fit ``rgb`` (H×W×3 RGB) to ``(self.height, self.width)`` by **center crop** and/or
-        **zero pad** only — no ``cv2.resize`` / interpolation (different from typical training
-        letterbox, but matches “no resizing” request).
-        """
+    def _letterbox_rgb_to_engine_hw(
+        self, rgb: np.ndarray
+    ) -> tuple[np.ndarray, tuple[float, float, float, float]]:
         H, W = self.height, self.width
-        h, w = rgb.shape[:2]
+        h0, w0 = int(rgb.shape[0]), int(rgb.shape[1])
+        nw, nh, px, py, ox, oy, gx, gy = self._letterbox_layout(h0, w0, H, W)
+        resized = cv2.resize(rgb, (nw, nh), interpolation=cv2.INTER_LINEAR)
         out = np.zeros((H, W, 3), dtype=rgb.dtype)
-        if h >= H and w >= W:
-            y0 = (h - H) // 2
-            x0 = (w - W) // 2
-            return rgb[y0 : y0 + H, x0 : x0 + W].copy()
-        if h <= H and w <= W:
-            y0 = (H - h) // 2
-            x0 = (W - w) // 2
-            out[y0 : y0 + h, x0 : x0 + w] = rgb
-            return out
-        if h >= H and w < W:
-            y0 = (h - H) // 2
-            slab = rgb[y0 : y0 + H, :]  # (H, w, 3)
-            x0 = (W - w) // 2
-            out[:, x0 : x0 + w] = slab
-            return out
-        # h < H and w >= W
-        x0 = (w - W) // 2
-        slab = rgb[:, x0 : x0 + W]  # (h, W, 3)
-        y0 = (H - h) // 2
-        out[y0 : y0 + h, :] = slab
-        return out
+        out[py : py + nh, px : px + nw] = resized
+        return out, (ox, oy, gx, gy)
+
+    def _letterbox_tensor_rgb(
+        self,
+        rgb: torch.Tensor,
+        nw: int,
+        nh: int,
+        pad_x: int,
+        pad_y: int,
+    ) -> torch.Tensor:
+        """Letterbox float ``rgb`` ``(h,w,3)`` to ``(self.height, self.width, 3)`` on CUDA."""
+        H, W = self.height, self.width
+        x = rgb.permute(2, 0, 1).unsqueeze(0)
+        x = F.interpolate(x, size=(nh, nw), mode="bilinear", align_corners=False)
+        pad_right = W - nw - pad_x
+        pad_bottom = H - nh - pad_y
+        x = F.pad(x, (pad_x, pad_right, pad_y, pad_bottom))
+        return x.squeeze(0).permute(1, 2, 0).contiguous()
 
     def _preprocess(
         self, frames_bgr: list[np.ndarray]
@@ -388,14 +385,14 @@ class TensorRTEngineWrapper:
             z = torch.zeros(
                 (0, 3, self.height, self.width), device=dev, dtype=self._torch_in_dtype
             )
-            return z, np.zeros((0, 2), dtype=np.float32), np.zeros((0, 2), dtype=np.float32)
+            return z, np.zeros((0, 2), dtype=np.float32), np.zeros((0, 4), dtype=np.float32)
 
         dev = torch.device("cuda", torch.cuda.current_device())
         self._ensure_torch_norm(dev)
         H, W = self.height, self.width
         tiles: list[torch.Tensor] = []
         sizes_list: list[tuple[int, int]] = []
-        off_list: list[tuple[float, float]] = []
+        off_list: list[tuple[float, float, float, float]] = []
 
         for frame in frames_bgr:
             if not frame.flags["C_CONTIGUOUS"]:
@@ -405,8 +402,9 @@ class TensorRTEngineWrapper:
             rgb = bgr.flip(-1)
             h0, w0 = int(rgb.shape[0]), int(rgb.shape[1])
             sizes_list.append((h0, w0))
-            off_list.append(self._orig_xy_offset_for_engine_tile(h0, w0, H, W))
-            tiles.append(_torch_rgb_to_engine_hw(rgb, H, W))
+            nw, nh, px, py, ox, oy, gx, gy = self._letterbox_layout(h0, w0, H, W)
+            off_list.append((ox, oy, gx, gy))
+            tiles.append(self._letterbox_tensor_rgb(rgb, nw, nh, px, py))
 
         batch_hwc = torch.stack(tiles, dim=0)
         batch = batch_hwc.permute(0, 3, 1, 2).contiguous()
@@ -419,29 +417,29 @@ class TensorRTEngineWrapper:
         self, frames_bgr: list[np.ndarray]
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        CPU preprocessing without ``cv2.resize``: center **crop** and/or **pad** to engine
-        ``self.height`` × ``self.width``, then batched normalize to NCHW float32.
-        ``sizes`` is ``(B, 2)`` ``(img_h, img_w)``; ``box_offsets`` is ``(B, 2)`` ``(ox, oy)``
-        for :func:`_post_process` / :func:`_post_process_gpu`.
+        CPU **letterbox** preprocess: resize to fit inside engine ``self.height`` × ``self.width``,
+        center on a zero canvas, then batched normalize to NCHW float32.
+        ``sizes`` is ``(B, 2)`` ``(img_h, img_w)``; ``box_offsets`` is ``(B, 4)``
+        ``(ox, oy, gain_x, gain_y)`` for :func:`_post_process` / :func:`_post_process_gpu`.
         """
         if not frames_bgr:
             return (
                 np.empty((0, 3, self.height, self.width), dtype=np.float32),
                 np.zeros((0, 2), dtype=np.float32),
-                np.zeros((0, 2), dtype=np.float32),
+                np.zeros((0, 4), dtype=np.float32),
             )
 
         tiles: list[np.ndarray] = []
         sizes_list: list[tuple[int, int]] = []
-        off_list: list[tuple[float, float]] = []
-        H, W = self.height, self.width
+        off_list: list[tuple[float, float, float, float]] = []
 
         for frame in frames_bgr:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h0, w0 = rgb.shape[:2]
             sizes_list.append((h0, w0))
-            off_list.append(self._orig_xy_offset_for_engine_tile(h0, w0, H, W))
-            tiles.append(self._rgb_to_engine_hw(rgb))
+            tile, off4 = self._letterbox_rgb_to_engine_hw(rgb)
+            tiles.append(tile)
+            off_list.append(off4)
 
         batch_rgb = np.stack(tiles, axis=0)  # (B, H, W, 3)
         batch = batch_rgb.astype(np.float32) / 255.0
@@ -554,6 +552,9 @@ class TensorRTEngineWrapper:
         timing_label: str | None = None,
     ) -> list[dict[str, Any]]:
         """Run TRT + postprocess on a pre-built NCHW batch (``valid`` first rows are real frames).
+
+        ``box_offsets`` is ``(B, 4)`` per batch row: ``(ox, oy, gain_x, gain_y)`` for mapping
+        engine-normalized boxes back to original image pixels (letterbox layout).
 
         ``preprocess_ms`` is optional (for timing logs when the caller timed preprocess separately).
         ``timing_label`` prefixes ``[TRT]`` logs (e.g. ``trash`` / ``cigarette``) when two heads run.
@@ -685,10 +686,10 @@ def _dict_to_sv(d: dict[str, Any]) -> sv.Detections:
 class RfDetrTrtTrashDetector(TrashDetector):
     """Two TensorRT RF-DETR engines (trash + cigarette); same ``detect_trash`` contract as PyTorch.
 
-    Each batch is **preprocessed once** on the trash head (default NumPy + OpenCV CPU; optional
-    PyTorch CUDA via ``RF_DETR_PREPROCESS_CUDA=1`` / ``cuda`` / ``auto``). Both heads then run
-    ``decode_batch_nchw`` on that shared tensor **in parallel** (two threads; one TRT forward + post
-    per head).
+    Each batch is **preprocessed once** on the trash head: **letterboxed** (uniform resize to fit
+    engine H×W, centered on a zero canvas) so the full frame is preserved; CPU (default) or CUDA
+    (``RF_DETR_PREPROCESS_CUDA=1`` / ``cuda`` / ``auto``). Both heads then run ``decode_batch_nchw``
+    on that shared tensor **in parallel** (two threads; one TRT forward + post per head).
     """
 
     def __init__(
@@ -730,7 +731,7 @@ class RfDetrTrtTrashDetector(TrashDetector):
 
     @property
     def engine_input_hw(self) -> tuple[int, int]:
-        """Fixed engine input ``(H, W)`` (e.g. 672, 672); frames are center-cropped/padded to this."""
+        """Fixed engine input ``(H, W)`` (e.g. 672, 672); frames are letterboxed to this size."""
         h0 = self._heads[0][0].height
         w0 = self._heads[0][0].width
         return (h0, w0)
