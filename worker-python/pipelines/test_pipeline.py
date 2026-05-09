@@ -81,7 +81,6 @@ from settings import (
     YOLO_CONFIDENCE,
     YOLO_DENSE_STRIDE,
     YOLO_DENSE_IDLE_MISS_STREAK,
-    YOLO_IMGSZ,
 )
 
 console = Console()
@@ -197,8 +196,7 @@ def _log_pipeline_run_configuration(
             f"RF-DETR only on chunk frames with person/vehicle ≥{YOLO_CONFIDENCE}"
         )
     console.print(
-        f"  Conf   YOLO={YOLO_CONFIDENCE}  YOLO_IMGSZ={YOLO_IMGSZ}  trash_RF={TRASH_CONFIDENCE}  "
-        f"plate={PLATE_CONFIDENCE}"
+        f"  Conf   YOLO={YOLO_CONFIDENCE}  trash_RF={TRASH_CONFIDENCE}  plate={PLATE_CONFIDENCE}"
     )
     console.print(f"  TRT    static batch={b0}  input {b1}×{b2}  preprocess: [cyan]{rf_pre}[/]")
     console.print(f"         trash.engine   [dim]{te}[/]")
@@ -1150,8 +1148,8 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     console.print("[bold]Models ready[/]")
     t0 = time.perf_counter()
     wdir = _worker_weights_dir()
-    yolo = YoloDetector(conf_threshold=YOLO_CONFIDENCE, imgsz=YOLO_IMGSZ)
-    _log_model_ready("Scene YOLO", f"{(wdir / 'yolo11x.pt').resolve()} (Ultralytics imgsz={YOLO_IMGSZ}, COCO person+vehicles)")
+    yolo = YoloDetector(conf_threshold=YOLO_CONFIDENCE)
+    _log_model_ready("Scene YOLO", f"{(wdir / 'yolo11x.pt').resolve()} (Ultralytics, COCO person+vehicles)")
     lp_detector = LpDetector()
     _log_model_ready("License-plate YOLO", f"{(wdir / 'bestlicense.pt').resolve()} (Ultralytics)")
     ocr = Ocr()
