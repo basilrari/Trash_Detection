@@ -63,14 +63,13 @@ In code, see the module docstring at the top of **`worker-python/settings.py`**,
 
 ### RF-DETR trash (required)
 
-Inference uses **TensorRT** only: place **`trash.engine`** and **`cigarette.engine`** under `worker-python/weights/` (or set **`TRASH_ENGINE_PATH`** and **`CIGARETTE_ENGINE_PATH`**). You need **`tensorrt`** and **`pycuda`**. Engine batch size and input resolution are fixed inside each plan file (see `models/rfdetr_trt_trash.py`). Optional archival PyTorch checkpoints **`trash.pth`** / **`cigarette.pth`** may live alongside them but are **not** loaded by this pipeline.
+Inference uses **TensorRT** only: place **`trash.engine`** and **`cigarette.engine`** under `worker-python/weights/` (or set **`TRASH_ENGINE_PATH`** and **`CIGARETTE_ENGINE_PATH`**). You need **`tensorrt`** and **`pycuda`**. Engine batch size and input resolution are fixed inside each plan file (see `models/rfdetr_trt_trash.py`). Each batch is **preprocessed once** (shared NCHW input); trash and cigarette heads then run TensorRT **decode in parallel** (two threads). Optional archival PyTorch checkpoints **`trash.pth`** / **`cigarette.pth`** may live alongside them but are **not** loaded by this pipeline.
 
 | Setting / env | Meaning |
 |---------------|--------|
 | **`TRASH_ENGINE_PATH`** | Path to `trash.engine` (default: `weights/trash.engine`). |
 | **`CIGARETTE_ENGINE_PATH`** | Path to `cigarette.engine` (default: `weights/cigarette.engine`). **Required.** |
 | **`TRASH_CONFIDENCE`** | Confidence threshold for trash boxes (default **0.4**). |
-| **`RF_DETR_PARALLEL_HEADS`** | Default **on** — trash + cigarette heads decode in parallel threads; set `0`/`off` for sequential. |
 
 With **`GATE_MODE=yolo`** (default), trash runs on the same cadence as YOLO (coarse/dense). With **`GATE_MODE=off`**, trash runs on every frame in each chunk.
 

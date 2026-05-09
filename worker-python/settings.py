@@ -27,13 +27,15 @@ RF-DETR: the video pipeline uses **TensorRT** engines only — ``weights/trash.e
 ``TRASH_CONFIDENCE``. Requires ``tensorrt`` and ``pycuda``. Static batch and input size are
 fixed inside each engine (see ``models/rfdetr_trt_trash.py``).
 
-Optional: ``RF_DETR_PARALLEL_HEADS`` — default **on** (trash + cigarette TensorRT heads in
-parallel threads). Set to ``0`` / ``false`` / ``off`` to force sequential head decode on one GPU.
+Trash + cigarette TensorRT heads always decode **in parallel** (two threads; shared preprocess).
 
 Optional: ``RF_DETR_TRT_TIMING`` — set to ``1`` / ``true`` to print per-batch ``[TRT]`` timing from
 ``models/rfdetr_trt_trash.py`` (preprocess when measured by caller, forward, postprocess).
 
 Optional path overrides: ``TRASH_ENGINE_PATH``, ``CIGARETTE_ENGINE_PATH`` (same names as settings).
+
+Optional: ``OUTPUT_VIDEO_ENCODER`` / ``FFMPEG_PATH`` / ``NVENC_PRESET`` / ``NVENC_CQ`` for annotated MP4
+(``auto`` uses ``ffmpeg`` ``h264_nvenc`` when the encoder is available, else OpenCV ``mp4v``).
 """
 import os
 from pathlib import Path
@@ -51,6 +53,15 @@ OUTPUTS_DIR = "outputs"
 # Put test videos in inputs/ (e.g. inputs/Test.mp4). Annotated results go under outputs/ by default.
 VIDEO_PATH = os.getenv("VIDEO_PATH", f"{INPUTS_DIR}/Test.mp4")
 OUTPUT_VIDEO = os.getenv("OUTPUT_VIDEO", f"{OUTPUTS_DIR}/annotated.mp4")
+
+# --- Annotated output encoding (``pipelines.test_pipeline``) ---
+# OUTPUT_VIDEO_ENCODER: ``auto`` (try ``h264_nvenc`` via ffmpeg, else OpenCV ``mp4v``),
+# ``nvenc`` (ffmpeg only; fails fast if unavailable), ``mp4v`` (OpenCV only).
+OUTPUT_VIDEO_ENCODER = os.getenv("OUTPUT_VIDEO_ENCODER", "auto").strip().lower()
+FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
+# NVENC preset p1…p7 (faster…slower); CQ lower = higher quality (typical 18–28).
+NVENC_PRESET = os.getenv("NVENC_PRESET", "p4").strip().lower()
+NVENC_CQ = int(os.getenv("NVENC_CQ", "28"))
 
 CHUNK_SECONDS = 5
 YOLO_CONFIDENCE = 0.5

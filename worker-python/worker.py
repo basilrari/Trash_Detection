@@ -9,8 +9,9 @@ Examples (paths relative to worker-python/):
   python worker.py inputs/clip.mp4 -o outputs/custom.mp4
 
 Gating (default ``GATE_MODE=yolo`` in ``settings.py``):
-  The gate decides how often YOLO runs (and thus LP/OCR, which need YOLO boxes). RF-DETR
-  runs on the same cadence as YOLO when the gate is on. See ``core/yolo_stride_gate.py``.
+  The gate decides how often YOLO runs (and thus LP/OCR, which need YOLO boxes). RF-DETR runs
+  only on YOLO frames where a **person or vehicle** is detected (same confidence as scene
+  activity). See ``core/yolo_stride_gate.py``.
 
   # Full YOLO on every frame inside each time chunk (no stride gate)
   GATE_MODE=off python worker.py inputs/clip.mp4
@@ -45,10 +46,10 @@ def main() -> None:
             "Run YOLO + license-plate detector + OCR on a video file.\n\n"
             "GATE_MODE:\n"
             "  yolo — Default: YOLO-only stride gate (coarse when idle, denser after people/vehicles). "
-            "RF-DETR runs with the same schedule. Tuning: YOLO_COARSE_STRIDE, YOLO_DENSE_STRIDE, "
-            "YOLO_DENSE_IDLE_MISS_STREAK (env or settings.py). See Readme.md § Gating.\n"
+            "RF-DETR runs only on YOLO frames that have a person or vehicle. Tuning: YOLO_COARSE_STRIDE, "
+            "YOLO_DENSE_STRIDE, YOLO_DENSE_IDLE_MISS_STREAK (env or settings.py). See Readme.md § Gating.\n"
             "  off  — No stride gate: within each time chunk (CHUNK_SECONDS), YOLO on every frame; "
-            "RF-DETR runs on every frame in each chunk."
+            "RF-DETR only on frames in that chunk that have a person or vehicle."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

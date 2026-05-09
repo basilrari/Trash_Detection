@@ -23,7 +23,7 @@ import torch
 
 from core.types import Detection, FrameData
 from models.base import TrashDetector
-from models.trash_detector import _parallel_rfdetr_heads_enabled, _sv_to_detections
+from models.trash_detector import _sv_to_detections
 
 logger = logging.getLogger(__name__)
 
@@ -415,10 +415,12 @@ class TensorRTEngineWrapper:
         *,
         top_n: int = 50,
         preprocess_ms: float | None = None,
+        timing_label: str | None = None,
     ) -> list[dict[str, Any]]:
         """Run TRT + postprocess on a pre-built NCHW batch (``valid`` first rows are real frames).
 
         ``preprocess_ms`` is optional (for timing logs when the caller timed preprocess separately).
+        ``timing_label`` prefixes ``[TRT]`` logs (e.g. ``trash`` / ``cigarette``) when two heads run.
         """
         t_fwd0 = time.perf_counter()
         eng_w, eng_h = int(self.width), int(self.height)
@@ -454,13 +456,14 @@ class TensorRTEngineWrapper:
 
         if _trt_timing_enabled():
             bs = int(valid)
+            tag = f"{timing_label} | " if timing_label else ""
             if preprocess_ms is None:
                 print(
-                    f"[TRT] batch_size={bs} | forward={forward_ms:.1f}ms | postprocess={post_ms:.1f}ms"
+                    f"[TRT] {tag}batch_size={bs} | forward={forward_ms:.1f}ms | postprocess={post_ms:.1f}ms"
                 )
             else:
                 print(
-                    f"[TRT] batch_size={bs} | preprocess={float(preprocess_ms):.1f}ms | "
+                    f"[TRT] {tag}batch_size={bs} | preprocess={float(preprocess_ms):.1f}ms | "
                     f"forward={forward_ms:.1f}ms | postprocess={post_ms:.1f}ms"
                 )
         return out
@@ -544,9 +547,9 @@ def _dict_to_sv(d: dict[str, Any]) -> sv.Detections:
 class RfDetrTrtTrashDetector(TrashDetector):
     """Two TensorRT RF-DETR engines (trash + cigarette); same ``detect_trash`` contract as PyTorch.
 
-    When ``_parallel_rfdetr_heads_enabled()`` is true (default), both heads decode the same
-    NCHW batch on worker threads. Set ``RF_DETR_PARALLEL_HEADS=0`` to run heads strictly
-    one after the other.
+    Each batch is **preprocessed once** (BGR→tile→NCHW on the trash head's wrapper); both heads
+    then run ``decode_batch_nchw`` on that shared tensor **in parallel** (two threads; one TRT
+    forward + post per head).
     """
 
     def __init__(
@@ -602,11 +605,12 @@ class RfDetrTrtTrashDetector(TrashDetector):
             t_pre0 = time.perf_counter()
             batch_nchw, sizes, box_offsets = primary._preprocess(padded)
             preprocess_ms = (time.perf_counter() - t_pre0) * 1000.0
-            if _parallel_rfdetr_heads_enabled() and len(self._heads) > 1:
+            if len(self._heads) > 1:
                 parts: list[list[dict[str, Any]] | None] = [None] * len(self._heads)
                 with ThreadPoolExecutor(max_workers=len(self._heads)) as ex:
                     futures: dict[Future, int] = {}
                     for hi in range(len(self._heads)):
+                        label = self._heads[hi][1]
                         fut = ex.submit(
                             self._heads[hi][0].decode_batch_nchw,
                             batch_nchw,
@@ -615,6 +619,7 @@ class RfDetrTrtTrashDetector(TrashDetector):
                             valid,
                             top_n=50,
                             preprocess_ms=preprocess_ms if hi == 0 else None,
+                            timing_label=label,
                         )
                         futures[fut] = hi
                     for fut in as_completed(futures):
@@ -636,14 +641,15 @@ class RfDetrTrtTrashDetector(TrashDetector):
                             )
                         )
             else:
-                for head, default_lbl in self._heads:
+                for hi, (head, default_lbl) in enumerate(self._heads):
                     per = head.decode_batch_nchw(
                         batch_nchw,
                         sizes,
                         box_offsets,
                         valid,
                         top_n=50,
-                        preprocess_ms=preprocess_ms,
+                        preprocess_ms=preprocess_ms if hi == 0 else None,
+                        timing_label=default_lbl,
                     )
                     if len(per) != valid:
                         continue
@@ -667,5 +673,6 @@ class RfDetrTrtTrashDetector(TrashDetector):
         return merged
 
 
-# Timing: export RF_DETR_TRT_TIMING=1 to print ``[TRT] batch_size=... | preprocess=...`` lines
-# from ``decode_batch_nchw`` / ``predict_batch`` (forward = H2D + TRT + D2D + GPU top-k decode).
+# Timing: export RF_DETR_TRT_TIMING=1 to print ``[TRT]`` lines from ``decode_batch_nchw`` /
+# ``predict_batch``. With two heads, expect two ``[TRT] <head> | ...`` lines per batch (shared
+# preprocess is printed only on the trash line).

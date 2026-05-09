@@ -12,20 +12,25 @@ Run from worker-python/ (put source videos in inputs/, results under outputs/ by
   python -m pipelines.test_pipeline   # uses paths from settings.py
 
 **Gate (``GATE_MODE``)** — default ``yolo``; see ``settings.py`` and ``Readme.md`` § Gating.
+RF-DETR runs only on frames where YOLO reports a **person or vehicle** at ``YOLO_CONFIDENCE``
+(scene activity), not on every decoded frame.
 
-**RF-DETR** — TensorRT engines: ``weights/trash.engine`` and ``weights/cigarette.engine``
-(``TRASH_ENGINE_PATH`` / ``CIGARETTE_ENGINE_PATH``); see ``models/rfdetr_trt_trash.py``.
+**Output video** — default ``OUTPUT_VIDEO_ENCODER=auto``: use ``ffmpeg`` ``h264_nvenc`` when
+available, else OpenCV ``mp4v``. Override with ``nvenc`` (fail if unusable) or ``mp4v``. Tune
+``NVENC_PRESET`` / ``NVENC_CQ`` in ``settings.py`` (env vars).
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Sequence
+from typing import Any, List, Protocol, Sequence
 
 import cv2
 import numpy as np
@@ -43,8 +48,12 @@ from core.yolo_stride_gate import YoloStrideGate, YoloStrideGateConfig
 from settings import (
     CHUNK_SECONDS,
     CIGARETTE_ENGINE_PATH,
+    FFMPEG_PATH,
     GATE_MODE,
+    NVENC_CQ,
+    NVENC_PRESET,
     OUTPUT_VIDEO,
+    OUTPUT_VIDEO_ENCODER,
     PEEING_CROP_MARGIN,
     PEEING_GROIN_DIST_MAX,
     PEEING_GROIN_LOOSE_FACTOR,
@@ -134,6 +143,214 @@ def _log_visible_torch_cuda_device() -> None:
     )
 
 
+class VideoWriterSink(Protocol):
+    """Common surface for OpenCV ``VideoWriter`` and ffmpeg-backed writers."""
+
+    def write(self, frame: np.ndarray) -> None: ...
+
+    def release(self) -> None: ...
+
+
+def _ffmpeg_nvenc_smoke_test(ffmpeg_bin: str) -> bool:
+    """Return True if ``ffmpeg`` can run one frame through ``h264_nvenc`` (driver + build).
+
+    Uses 256×256 frames: NVENC rejects very small sizes (e.g. 16×16) with
+    ``Frame Dimension less than the minimum supported value`` even when the encoder exists.
+    """
+    cmd = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=black:s=256x256:d=0.04",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "h264_nvenc",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=20,
+            stdin=subprocess.DEVNULL,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+    return r.returncode == 0
+
+
+class _Cv2Mp4vSink:
+    """OpenCV ``mp4v`` into MP4 (CPU MPEG-4 Part 2; portable fallback)."""
+
+    def __init__(self, path: str, fps: float, width: int, height: int) -> None:
+        self._w = cv2.VideoWriter(
+            path,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+        if not self._w.isOpened():
+            raise RuntimeError(f"OpenCV VideoWriter failed to open: {path!r}")
+
+    def write(self, frame: np.ndarray) -> None:
+        self._w.write(frame)
+
+    def release(self) -> None:
+        self._w.release()
+
+
+class _FfmpegNvencSink:
+    """Stream raw BGR frames into ``ffmpeg`` ``h264_nvenc`` (GPU encoder, usually much faster)."""
+
+    def __init__(
+        self,
+        path: str,
+        fps: float,
+        width: int,
+        height: int,
+        *,
+        ffmpeg_bin: str,
+        preset: str,
+        cq: int,
+    ) -> None:
+        self._width = int(width)
+        self._height = int(height)
+        cmd = [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "bgr24",
+            "-video_size",
+            f"{self._width}x{self._height}",
+            "-framerate",
+            str(fps),
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            "h264_nvenc",
+            "-preset",
+            preset,
+            "-rc",
+            "vbr",
+            "-cq",
+            str(int(cq)),
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            path,
+        ]
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if self._proc.stdin is None:
+            self._proc.kill()
+            raise RuntimeError("ffmpeg did not provide a stdin pipe")
+
+    def write(self, frame: np.ndarray) -> None:
+        if frame.shape[0] != self._height or frame.shape[1] != self._width:
+            raise ValueError(
+                f"Frame shape {frame.shape[:2]} does not match encoder {self._height}x{self._width}"
+            )
+        if frame.dtype != np.uint8:
+            frame = frame.astype(np.uint8, copy=False)
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = np.ascontiguousarray(frame)
+        assert self._proc.stdin is not None
+        self._proc.stdin.write(frame.tobytes())
+
+    def release(self) -> None:
+        if self._proc.stdin is not None:
+            try:
+                self._proc.stdin.close()
+            except BrokenPipeError:
+                pass
+            self._proc.stdin = None
+        rc = self._proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"ffmpeg exited with code {rc} while finishing {self._proc.args!r}")
+
+
+def _open_output_video_sink(
+    output_path: str,
+    *,
+    fps: float,
+    width: int,
+    height: int,
+    encoder_mode: str | None = None,
+) -> tuple[VideoWriterSink, str]:
+    """Open a video sink: NVENC (ffmpeg) when allowed and available, else OpenCV ``mp4v``."""
+    mode = (encoder_mode or OUTPUT_VIDEO_ENCODER or "auto").strip().lower()
+    p = FFMPEG_PATH.strip()
+    ffmpeg_bin = shutil.which(p)
+    if ffmpeg_bin is None and os.path.isabs(p) and os.path.isfile(p) and os.access(p, os.X_OK):
+        ffmpeg_bin = p
+
+    want_nvenc = mode in ("auto", "nvenc")
+    nvenc_ok = bool(ffmpeg_bin and _ffmpeg_nvenc_smoke_test(ffmpeg_bin))
+
+    if want_nvenc and nvenc_ok:
+        try:
+            sink: VideoWriterSink = _FfmpegNvencSink(
+                output_path,
+                fps,
+                width,
+                height,
+                ffmpeg_bin=ffmpeg_bin,
+                preset=NVENC_PRESET,
+                cq=NVENC_CQ,
+            )
+            return (
+                sink,
+                f"ffmpeg h264_nvenc (preset={NVENC_PRESET!r}, cq={NVENC_CQ})",
+            )
+        except Exception as exc:
+            if mode == "nvenc":
+                console.print(
+                    "[red]OUTPUT_VIDEO_ENCODER=nvenc but ffmpeg NVENC writer failed:[/]\n"
+                    f"  [dim]{type(exc).__name__}: {exc}[/]"
+                )
+                raise SystemExit(3) from exc
+            console.print(
+                f"[yellow]ffmpeg h264_nvenc failed ({type(exc).__name__}: {exc}); "
+                "falling back to OpenCV mp4v.[/]"
+            )
+
+    if mode == "nvenc" and not nvenc_ok:
+        console.print(
+            "[red]OUTPUT_VIDEO_ENCODER=nvenc but h264_nvenc is not usable "
+            f"(ffmpeg={ffmpeg_bin!r}). Install ffmpeg with NVENC and a working NVIDIA driver.[/]"
+        )
+        raise SystemExit(3)
+
+    if mode == "auto" and want_nvenc and not nvenc_ok:
+        reason = (
+            "ffmpeg not on PATH"
+            if not ffmpeg_bin
+            else "h264_nvenc smoke test failed (driver / ffmpeg build?)"
+        )
+        console.print(f"[dim]Video encoder:[/] {reason}; using OpenCV mp4v.")
+
+    sink2: VideoWriterSink = _Cv2Mp4vSink(output_path, fps, width, height)
+    return sink2, "OpenCV VideoWriter mp4v (CPU)"
+
+
 @dataclass
 class PipelineStepTimes:
     """Cumulative seconds spent in each stage (wall-clock, ``perf_counter``)."""
@@ -141,6 +358,8 @@ class PipelineStepTimes:
     init_sec: float = 0.0
     yolo_sec: float = 0.0
     trash_sec: float = 0.0
+    # Source frames actually passed into ``detect_trash`` (after person/vehicle filter).
+    rfdetr_input_frames: int = 0
     peeing_sec: float = 0.0
     annotate_draw_sec: float = 0.0
     lp_sec: float = 0.0
@@ -166,6 +385,17 @@ class PipelineStepTimes:
         console.print(f"  Other (I/O, chunks):  {self.other_sec:8.2f} s")
         console.print(f"  YOLO:                 {self.yolo_sec:8.2f} s")
         console.print(f"  RF-DETR (trash):      {self.trash_sec:8.2f} s")
+        if self.rfdetr_input_frames > 0 and self.trash_sec > 0:
+            eff = self.rfdetr_input_frames / self.trash_sec
+            console.print(
+                f"  [dim]RF-DETR inputs:   {self.rfdetr_input_frames:8d} frames "
+                f"→ {eff:5.1f} eff. FPS (inputs ÷ RF-DETR time only)[/]"
+            )
+            console.print(
+                "  [dim]RF-DETR note:[/] ``[RF-DETR] … fps`` logs are per ``detect_trash`` call; "
+                "eff. FPS above is the fair average. CPU preprocess per batch plus two TRT "
+                "forwards (trash + cigarette) dominate when ``[TRT]`` preprocess ms is high."
+            )
         console.print(f"  Peeing (MediaPipe):   {self.peeing_sec:8.2f} s")
         console.print(f"  Annotate (draw only): {self.annotate_draw_sec:8.2f} s")
         console.print(f"  LP detect:            {self.lp_sec:8.2f} s")
@@ -545,10 +775,41 @@ def _annotate_frame(
     times.annotate_draw_sec += time.perf_counter() - t0
 
 
+def _detect_trash_scene_activity_frames_only(
+    trash: TrashDetector,
+    chunk_frames_list: List[FrameData],
+    detections_per_frame: List[List[Detection]],
+    times: PipelineStepTimes,
+) -> List[List[Detection]]:
+    """Run RF-DETR only on frames with person/vehicle at ``YOLO_CONFIDENCE``; others get ``[]``."""
+    n = len(chunk_frames_list)
+    trash_out: List[List[Detection]] = [[] for _ in range(n)]
+    active_frames: List[FrameData] = []
+    active_orig: List[int] = []
+    for i, fd in enumerate(chunk_frames_list):
+        scene = _filter_scene_detections(detections_per_frame[i])
+        if _scene_has_activity(scene, YOLO_CONFIDENCE):
+            active_frames.append(fd)
+            active_orig.append(i)
+    if not active_frames:
+        return trash_out
+    B = _rfdetr_engine_batch(trash)
+    for start in range(0, len(active_frames), B):
+        batch = active_frames[start : start + B]
+        t0 = time.perf_counter()
+        part = trash.detect_trash(batch)
+        times.trash_sec += time.perf_counter() - t0
+        times.rfdetr_input_frames += len(batch)
+        for j in range(len(batch)):
+            oi = active_orig[start + j]
+            trash_out[oi] = list(part[j]) if j < len(part) else []
+    return trash_out
+
+
 def _run_pipeline_chunked(
     *,
     cap: cv2.VideoCapture,
-    out: cv2.VideoWriter,
+    out: VideoWriterSink,
     fps: float,
     total_frames: int,
     chunk_frames: int,
@@ -582,9 +843,9 @@ def _run_pipeline_chunked(
             t0 = time.perf_counter()
             detections_per_frame = yolo.detect(chunk_frames_list)
             times.yolo_sec += time.perf_counter() - t0
-            t0 = time.perf_counter()
-            trash_per_frame = trash.detect_trash(chunk_frames_list)
-            times.trash_sec += time.perf_counter() - t0
+            trash_per_frame = _detect_trash_scene_activity_frames_only(
+                trash, chunk_frames_list, detections_per_frame, times
+            )
 
             n = min(len(chunk_frames_list), len(detections_per_frame), len(trash_per_frame))
             if n == 0:
@@ -644,7 +905,7 @@ def _pad_rfdetr_frame(template: FrameData) -> FrameData:
 def _run_pipeline_yolo_gated(
     *,
     cap: cv2.VideoCapture,
-    out: cv2.VideoWriter,
+    out: VideoWriterSink,
     fps: float,
     total_frames: int,
     yolo: YoloDetector,
@@ -656,11 +917,11 @@ def _run_pipeline_yolo_gated(
     annots: FrameAnnotators,
     peeing: PeeingDetector,
 ) -> None:
-    """YOLO stride gate with **batched** RF-DETR on consecutive YOLO frames (engine batch ``B``).
+    """YOLO stride gate with **batched** RF-DETR on consecutive **scene-active** YOLO frames.
 
-    When ``run_yolo`` is true, frames are queued; ``detect_trash`` runs on each full batch of ``B``
-    real frames. On a non-YOLO frame or at EOF, any remainder ``1..B-1`` is padded once (black
-    frames) so TensorRT always sees a full batch. Frames are written in index order via a stash.
+    When ``run_yolo`` is true and YOLO sees a person or vehicle above ``YOLO_CONFIDENCE``,
+    the frame is queued for RF-DETR; idle YOLO frames drain any partial queue (padded) then
+    emit with empty trash. TensorRT batch size is ``B`` (engine static batch).
     """
     B = _rfdetr_engine_batch(trash)
     pbar = tqdm(total=total_frames, desc="Processing video (YOLO stride gate)")
@@ -696,6 +957,7 @@ def _run_pipeline_yolo_gated(
         rfdetr_q = rfdetr_q[B:]
         fds = [x[0] for x in batch]
         t0 = time.perf_counter()
+        times.rfdetr_input_frames += B
         outs = trash.detect_trash(fds)
         times.trash_sec += time.perf_counter() - t0
         for j in range(B):
@@ -716,6 +978,7 @@ def _run_pipeline_yolo_gated(
         while len(fds) < B:
             fds.append(pad_fd)
         t0 = time.perf_counter()
+        times.rfdetr_input_frames += n
         outs = trash.detect_trash(fds)
         times.trash_sec += time.perf_counter() - t0
         for j in range(n):
@@ -765,9 +1028,14 @@ def _run_pipeline_yolo_gated(
                 console.print(f"[dim]PEEING off[/] frame={frame_idx}")
 
             if run_yolo and fd_opt is not None:
-                rfdetr_q.append((fd_opt, scene_dets, pstate))
-                while len(rfdetr_q) >= B:
-                    flush_one_rfdetr_batch()
+                if _scene_has_activity(scene_dets, YOLO_CONFIDENCE):
+                    rfdetr_q.append((fd_opt, scene_dets, pstate))
+                    while len(rfdetr_q) >= B:
+                        flush_one_rfdetr_batch()
+                else:
+                    drain_rfdetr_before_non_yolo()
+                    stash[frame_idx] = (frame.copy(), [], scene_dets, pstate)
+                    emit_ready()
             else:
                 drain_rfdetr_before_non_yolo()
                 stash[frame_idx] = (frame.copy(), [], scene_dets, pstate)
@@ -832,12 +1100,14 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         console.print(
             f"[cyan]Loaded video[/] {video_path} ({width}x{height} @ {fps:.2f} FPS, {total_frames} frames); "
             f"GATE_MODE=yolo | coarse_stride={YOLO_COARSE_STRIDE} dense_stride={YOLO_DENSE_STRIDE} "
-            f"dense_idle_miss_streak={YOLO_DENSE_IDLE_MISS_STREAK} (YOLO runs w/o person/vehicle to leave dense)"
+            f"dense_idle_miss_streak={YOLO_DENSE_IDLE_MISS_STREAK} | "
+            f"RF-DETR only on YOLO frames with person/vehicle (≥{YOLO_CONFIDENCE:.2f})"
         )
     else:
         console.print(
             f"[cyan]Loaded video[/] {video_path} ({width}x{height} @ {fps:.2f} FPS, {total_frames} frames); "
-            f"chunk={CHUNK_SECONDS}s -> {chunk_frames} frames | GATE_MODE=off"
+            f"chunk={CHUNK_SECONDS}s -> {chunk_frames} frames | GATE_MODE=off | "
+            f"RF-DETR only on frames with person/vehicle (≥{YOLO_CONFIDENCE:.2f})"
         )
     console.print("[cyan]RF-DETR trash/cigarette[/] loaded (required)")
 
@@ -882,12 +1152,13 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    out = cv2.VideoWriter(
+    out, sink_label = _open_output_video_sink(
         output_video,
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
+        fps=float(fps),
+        width=width,
+        height=height,
     )
+    console.print(f"[cyan]Video writer[/] {sink_label} → {output_video}")
     times.other_sec += time.perf_counter() - t_io
 
     try:

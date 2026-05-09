@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any, Dict, List
 
 from core.types import Detection
@@ -69,20 +68,3 @@ def _sv_to_detections(
             label = default_label
         out.append(Detection(bbox=(x1, y1, x2, y2), label=label, confidence=cf))
     return out
-
-
-def _parallel_rfdetr_heads_enabled() -> bool:
-    """When true, trash + cigarette TensorRT heads decode on worker threads in parallel.
-
-    Default is **on**. On a single GPU, kernels may still serialize; set
-    ``RF_DETR_PARALLEL_HEADS=0`` (or ``false`` / ``off``) to force strict sequential
-    inference if you hit driver issues or want deterministic single-thread behavior.
-    """
-    v = os.environ.get("RF_DETR_PARALLEL_HEADS", "").strip().lower()
-    if not v:
-        return True
-    if v in ("0", "false", "no", "off"):
-        return False
-    if v in ("1", "true", "yes", "on"):
-        return True
-    return True
