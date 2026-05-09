@@ -43,6 +43,7 @@ from models.yolo_detector import YoloDetector
 from models.lp_detector import LpDetector
 from models.ocr import Ocr
 from models.peeing_detector import PeeingDetector, PeeingState
+from models.rfdetr_trt_trash import _trt_timing_enabled
 from core.types import Detection, FrameData
 from core.yolo_stride_gate import YoloStrideGate, YoloStrideGateConfig
 from settings import (
@@ -141,6 +142,77 @@ def _log_visible_torch_cuda_device() -> None:
         f"[cyan]CUDA[/] CUDA_VISIBLE_DEVICES={vis}  →  torch cuda:0 = {name!r}  "
         f"capability sm_{cap[0]}{cap[1]}"
     )
+
+
+def _worker_weights_dir() -> Path:
+    """``worker-python/weights`` (same base as default YOLO/LP weights)."""
+    return Path(__file__).resolve().parents[1] / "weights"
+
+
+def _log_model_ready(title: str, detail: str) -> None:
+    console.print(f"  [green]OK[/] [bold]{title}[/]  [dim]— {detail}[/]")
+
+
+def _log_pipeline_run_configuration(
+    *,
+    mode: str,
+    video_path: str,
+    width: int,
+    height: int,
+    fps: float,
+    total_frames: int,
+    chunk_frames: int,
+    output_video: str,
+    sink_label: str,
+    trash: TrashDetector,
+) -> None:
+    """Gates, thresholds, TRT layout, preprocess, encoder, timing env flags."""
+    te = Path(TRASH_ENGINE_PATH).resolve()
+    ce = Path(CIGARETTE_ENGINE_PATH).resolve()
+    rf_pre = "unknown"
+    b0 = b1 = b2 = "?"
+    heads = getattr(trash, "_heads", None)
+    if heads:
+        w0 = heads[0][0]
+        rf_pre = (
+            "PyTorch CUDA → TRT D2D input"
+            if getattr(w0, "_want_cuda_preprocess", False)
+            else "NumPy + OpenCV CPU → TRT H2D"
+        )
+        b0, b1, b2 = (getattr(w0, "batch", "?"), getattr(w0, "height", "?"), getattr(w0, "width", "?"))
+    trt_pre_env = os.environ.get("RF_DETR_PREPROCESS_CUDA", "(unset)")
+    trt_tim_env = os.environ.get("RF_DETR_TRT_TIMING", "(unset)")
+    console.print("[bold]Run configuration[/]")
+    console.print(f"  Video  [dim]{video_path}[/]  →  {width}×{height} @ {fps:.3f} fps, {total_frames} frames")
+    if mode == "yolo":
+        console.print(
+            f"  Gate   [bold]GATE_MODE=yolo[/]  coarse={YOLO_COARSE_STRIDE}  dense={YOLO_DENSE_STRIDE}  "
+            f"dense_idle_miss={YOLO_DENSE_IDLE_MISS_STREAK}  "
+            f"RF-DETR only on YOLO frames with person/vehicle ≥{YOLO_CONFIDENCE}"
+        )
+    else:
+        console.print(
+            f"  Gate   [bold]GATE_MODE=off[/]  CHUNK_SECONDS={CHUNK_SECONDS}  →  {chunk_frames} frames/chunk  "
+            f"RF-DETR only on chunk frames with person/vehicle ≥{YOLO_CONFIDENCE}"
+        )
+    console.print(
+        f"  Conf   YOLO={YOLO_CONFIDENCE}  trash_RF={TRASH_CONFIDENCE}  plate={PLATE_CONFIDENCE}"
+    )
+    console.print(f"  TRT    static batch={b0}  input {b1}×{b2}  preprocess: [cyan]{rf_pre}[/]")
+    console.print(f"         trash.engine   [dim]{te}[/]")
+    console.print(f"         cigarette      [dim]{ce}[/]")
+    console.print(
+        f"  Env    RF_DETR_PREPROCESS_CUDA={trt_pre_env!r}  RF_DETR_TRT_TIMING={trt_tim_env!r}"
+    )
+    console.print(
+        f"  Encode OUTPUT_VIDEO_ENCODER={OUTPUT_VIDEO_ENCODER!r}  "
+        f"NVENC_PRESET={NVENC_PRESET!r}  NVENC_CQ={NVENC_CQ}  FFMPEG_PATH={FFMPEG_PATH!r}"
+    )
+    console.print(f"  Output [dim]{Path(output_video).resolve()}[/]")
+    console.print(f"  Writer [cyan]{sink_label}[/]")
+    console.print(f"  Peeing [dim]{Path(PEEING_POSE_MODEL_PATH).expanduser().resolve()}[/]")
+    if _trt_timing_enabled():
+        console.print("  [yellow]RF_DETR_TRT_TIMING is on[/] — expect extra [TRT] lines per batch.")
 
 
 class VideoWriterSink(Protocol):
@@ -1072,13 +1144,29 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     _ensure_pytorch_cuda_kernels_work()
     _log_visible_torch_cuda_device()
 
+    console.print("[bold]Models ready[/]")
     t0 = time.perf_counter()
+    wdir = _worker_weights_dir()
     yolo = YoloDetector(conf_threshold=YOLO_CONFIDENCE)
+    _log_model_ready("Scene YOLO", f"{(wdir / 'yolo11x.pt').resolve()} (Ultralytics, COCO person+vehicles)")
     lp_detector = LpDetector()
+    _log_model_ready("License-plate YOLO", f"{(wdir / 'bestlicense.pt').resolve()} (Ultralytics)")
     ocr = Ocr()
-    console.print(f"[cyan]PaddleOCR[/] device={ocr.paddle_device}")
+    _log_model_ready("PaddleOCR", f"inference device={ocr.paddle_device}")
     trash = _load_trash_detector_required()
-    times.init_sec = time.perf_counter() - t0
+    heads = getattr(trash, "_heads", None)
+    if heads:
+        w0 = heads[0][0]
+        _log_model_ready(
+            "RF-DETR TensorRT",
+            f"batch={w0.batch}  input {w0.height}×{w0.width}  "
+            f"{'CUDA preprocess' if getattr(w0, '_want_cuda_preprocess', False) else 'CPU preprocess'}",
+        )
+    else:
+        _log_model_ready("RF-DETR", "loaded")
+    t_init_done = time.perf_counter()
+    times.init_sec = t_init_done - t0
+    console.print(f"[dim]Model init wall time: {times.init_sec:.2f}s[/]")
 
     t_io = time.perf_counter()
     cap = cv2.VideoCapture(video_path)
@@ -1095,21 +1183,9 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-
-    if mode == "yolo":
-        console.print(
-            f"[cyan]Loaded video[/] {video_path} ({width}x{height} @ {fps:.2f} FPS, {total_frames} frames); "
-            f"GATE_MODE=yolo | coarse_stride={YOLO_COARSE_STRIDE} dense_stride={YOLO_DENSE_STRIDE} "
-            f"dense_idle_miss_streak={YOLO_DENSE_IDLE_MISS_STREAK} | "
-            f"RF-DETR only on YOLO frames with person/vehicle (≥{YOLO_CONFIDENCE:.2f})"
-        )
-    else:
-        console.print(
-            f"[cyan]Loaded video[/] {video_path} ({width}x{height} @ {fps:.2f} FPS, {total_frames} frames); "
-            f"chunk={CHUNK_SECONDS}s -> {chunk_frames} frames | GATE_MODE=off | "
-            f"RF-DETR only on frames with person/vehicle (≥{YOLO_CONFIDENCE:.2f})"
-        )
-    console.print("[cyan]RF-DETR trash/cigarette[/] loaded (required)")
+    console.print(
+        f"[cyan]Video capture[/] opened  {width}×{height} @ {fps:.2f} fps  ({total_frames} frames)"
+    )
 
     try:
         peeing = PeeingDetector(
@@ -1139,8 +1215,12 @@ def run_pipeline(video_path: str, output_video: str) -> None:
             f"[dim]{exc}[/]"
         )
         raise SystemExit(2) from exc
+    _log_model_ready(
+        "PeeingDetector",
+        f"MediaPipe pose [dim]{Path(PEEING_POSE_MODEL_PATH).expanduser().resolve()}[/]",
+    )
     console.print(
-        "[cyan]Peeing hint:[/] standing + squat cues; straddle penalty; "
+        "[dim]Peeing hint:[/] standing + squat cues; straddle penalty; "
         f"alarm: last {PEEING_WINDOW_SEC:.0f}s of pose hits (score ≥{PEEING_POSE_MATCH_THRESHOLD:.0%}); "
         f"arm when >{PEEING_ALARM_ENTER_HIT_FRACTION:.0%} hits with ≥{PEEING_ALARM_MIN_SAMPLES} samples, "
         f"disarm when <{PEEING_ALARM_EXIT_HIT_FRACTION:.0%} (no per-person IDs)."
@@ -1158,7 +1238,18 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         width=width,
         height=height,
     )
-    console.print(f"[cyan]Video writer[/] {sink_label} → {output_video}")
+    _log_pipeline_run_configuration(
+        mode=mode,
+        video_path=video_path,
+        width=width,
+        height=height,
+        fps=float(fps),
+        total_frames=total_frames,
+        chunk_frames=chunk_frames,
+        output_video=output_video,
+        sink_label=sink_label,
+        trash=trash,
+    )
     times.other_sec += time.perf_counter() - t_io
 
     try:

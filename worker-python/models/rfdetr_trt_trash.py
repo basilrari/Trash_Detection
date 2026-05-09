@@ -276,13 +276,18 @@ class TensorRTEngineWrapper:
         self._std_t: torch.Tensor | None = None
 
     def _ensure_torch_norm(self, device: torch.device) -> None:
-        if self._mean_t is None or self._mean_t.device != device:
+        # NCHW batch (B,3,H,W) broadcasts with mean/std shape (1,3,1,1).
+        if (
+            self._mean_t is None
+            or self._mean_t.device != device
+            or tuple(self._mean_t.shape) != (1, 3, 1, 1)
+        ):
             self._mean_t = torch.tensor(
                 [0.485, 0.456, 0.406], device=device, dtype=torch.float32
-            ).view(1, 1, 1, 3)
+            ).view(1, 3, 1, 1)
             self._std_t = torch.tensor(
                 [0.229, 0.224, 0.225], device=device, dtype=torch.float32
-            ).view(1, 1, 1, 3)
+            ).view(1, 3, 1, 1)
 
     def _setup_bindings(self) -> None:
         trt = self.trt
