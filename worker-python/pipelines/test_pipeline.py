@@ -50,12 +50,16 @@ from models.peeing_detector import PeeingDetector, PeeingState
 from models.rfdetr_trt_trash import _trt_timing_enabled
 from core.types import Detection, FrameData, LicensePlate
 from core.yolo_stride_gate import YoloStrideGate, YoloStrideGateConfig
+from pipelines.lp_batch_coordinator import LpBatchCoordinator, LpQueuedCrop
 from settings import (
     ANNOTATOR_SMART_POSITION,
     CHUNK_SECONDS,
     CIGARETTE_ENGINE_PATH,
     FFMPEG_PATH,
     GATE_MODE,
+    LP_BATCH_ENABLED,
+    LP_BATCH_MAX_CROPS,
+    LP_BATCH_MAX_LATENCY_FRAMES,
     LP_CONFIDENCE,
     LP_ENGINE_PATH,
     LP_LOCK_REFRESH_STRIDE,
@@ -642,6 +646,10 @@ class PipelineStepTimes:
     ocr_sec: float = 0.0
     video_write_sec: float = 0.0
     other_sec: float = 0.0  # open video, build writer, gate setup, chunk assembly
+    # LP cross-frame coordinator (uniform stride + LP_BATCH_ENABLED); optional metrics.
+    lp_coordinator_batches: int = 0
+    lp_coordinator_latency_events: int = 0
+    lp_coordinator_emit_barriers: int = 0
 
     def print_summary(self, *, wall_total_sec: float) -> None:
         ann = (
@@ -729,6 +737,12 @@ class PipelineStepTimes:
                 f"  [dim]LP YOLO batches:[/] {self.lp_batch_launches}  "
                 f"padded (dummy rows): {self.lp_padded_slots}{slack_lp}  "
                 f"avg real crops/batch: {avg_lp:.2f}"
+            )
+        if self.lp_coordinator_batches > 0 or self.lp_coordinator_emit_barriers > 0:
+            console.print(
+                f"  [dim]LP cross-frame:[/] coordinator_batches={self.lp_coordinator_batches}  "
+                f"latency_flushes={self.lp_coordinator_latency_events}  "
+                f"emit_barriers={self.lp_coordinator_emit_barriers}"
             )
         console.print(f"  OCR:                  {self.ocr_sec:8.2f} s")
         console.print(f"  Video write:          {self.video_write_sec:8.2f} s")
@@ -826,6 +840,200 @@ class VehicleLpOcrCache:
         interval = self.lp_lock_refresh_stride if tr.get("locked") else self.stride
         return dt >= interval
 
+    def apply_lp_chunk_results(
+        self,
+        chunk: list[LpQueuedCrop],
+        plates_per_sub: Sequence[Sequence[LicensePlate]],
+        *,
+        lp_detector: LpDetector,
+        ocr: Ocr,
+        times: PipelineStepTimes,
+    ) -> None:
+        _ = lp_detector
+        draw_by_tid: dict[int, list[tuple[float, float, float, float, str]]] = {}
+
+        ocr_crops: list[np.ndarray] = []
+        ocr_owner: list[tuple[int, int, float, tuple[float, float, float, float]]] = []
+        # (tid, frame_idx, lp_conf, global_xyxy)
+
+        for j, qc in enumerate(chunk):
+            tid = qc.tid
+            tr = self._tracks.get(tid)
+            if tr is None:
+                continue
+            frame_idx = qc.frame_idx
+            w, h = qc.frame_w, qc.frame_h
+            vx1, vy1, vx2, vy2 = qc.vx1, qc.vy1, qc.vx2, qc.vy2
+            vcrop = qc.vehicle_crop
+            cw, ch = int(vcrop.shape[1]), int(vcrop.shape[0])
+            if j >= len(plates_per_sub):
+                tr["last_lp"] = frame_idx
+                continue
+            skip_vehicle_ocr = bool(
+                tr.get("locked")
+                and str(tr.get("ocr_text", "")).strip()
+                and (frame_idx - int(tr["last_ocr_frame"])) < self.ocr_refresh_stride
+            )
+            best_plate: LicensePlate | None = None
+            for plate in plates_per_sub[j]:
+                if plate.confidence < LP_CONFIDENCE:
+                    continue
+                if best_plate is None or plate.confidence > best_plate.confidence:
+                    best_plate = plate
+            if best_plate is None:
+                tr["last_lp"] = frame_idx
+                continue
+            plate = best_plate
+            pbox = clamp_bbox(plate.bbox, cw, ch)
+            if pbox is None:
+                tr["last_lp"] = frame_idx
+                continue
+            px1, py1, px2, py2 = pbox
+            plate_crop = vcrop[py1:py2, px1:px2]
+            if plate_crop.size == 0:
+                tr["last_lp"] = frame_idx
+                continue
+            gx1, gy1, gx2, gy2 = vx1 + px1, vy1 + py1, vx1 + px2, vy1 + py2
+            gbox = clamp_bbox((gx1, gy1, gx2, gy2), w, h)
+            if gbox is None:
+                tr["last_lp"] = frame_idx
+                continue
+            gx1, gy1, gx2, gy2 = gbox
+            tr["last_best_lp_conf"] = float(plate.confidence)
+            if not skip_vehicle_ocr:
+                ocr_crops.append(plate_crop)
+                ocr_owner.append((tid, frame_idx, float(plate.confidence), (gx1, gy1, gx2, gy2)))
+            else:
+                tr["last_lp"] = frame_idx
+
+        ocr_out: list[tuple[str, float]] = []
+        if ocr_crops:
+            t_ocr = time.perf_counter()
+            try:
+                ocr_out = ocr.recognize(ocr_crops)
+            except Exception as e:
+                console.print(f"[yellow]OCR error:[/] {str(e)}")
+                ocr_out = [("", 0.0)] * len(ocr_crops)
+            times.ocr_sec += time.perf_counter() - t_ocr
+            if len(ocr_out) != len(ocr_crops):
+                ocr_out = list(ocr_out) + [("", 0.0)] * max(0, len(ocr_crops) - len(ocr_out))
+                ocr_out = ocr_out[: len(ocr_crops)]
+
+        for k, own in enumerate(ocr_owner):
+            tid, frame_idx, lp_conf, gxy = own
+            gx1, gy1, gx2, gy2 = gxy
+            tr = self._tracks[tid]
+            plate_text, ocr_conf = ocr_out[k] if k < len(ocr_out) else ("", 0.0)
+            plate_text_norm = normalize_plate_text(str(plate_text))
+            prev_norm = str(tr.get("ocr_text", "")).strip()
+            if (
+                lp_conf >= self.ocr_lock_confidence
+                and plate_text_norm
+                and ocr_conf >= PLATE_CONFIDENCE
+                and prev_norm == plate_text_norm
+            ):
+                tr["stable_count"] = int(tr.get("stable_count", 0)) + 1
+            elif plate_text_norm and ocr_conf >= PLATE_CONFIDENCE:
+                tr["stable_count"] = 1
+            else:
+                tr["stable_count"] = 0
+            if plate_text_norm and ocr_conf >= PLATE_CONFIDENCE:
+                tr["ocr_text"] = plate_text_norm
+                tr["ocr_conf"] = float(ocr_conf)
+                tr["last_ocr_frame"] = frame_idx
+            if (
+                lp_conf >= self.ocr_lock_confidence
+                and int(tr["stable_count"]) >= self.ocr_stable_observations
+            ):
+                tr["locked"] = True
+            label_str = (
+                f"{plate_text_norm} {ocr_conf:.2f}"
+                if plate_text_norm
+                else (f"{ocr_conf:.2f}" if ocr_conf >= PLATE_CONFIDENCE else f"LP {lp_conf:.2f}")
+            )
+            draw_by_tid[tid] = [(float(gx1), float(gy1), float(gx2), float(gy2), label_str)]
+            tr["last_lp"] = frame_idx
+
+        for tid, rows in draw_by_tid.items():
+            self._tracks[tid]["draw"] = rows
+
+    def enqueue_lp_jobs_from_scene(
+        self,
+        frame: np.ndarray,
+        detections: Sequence[Detection],
+        frame_idx: int,
+        lp_batch: LpBatchCoordinator | None,
+    ) -> None:
+        if lp_batch is None or not lp_batch.enabled:
+            return
+        h, w = frame.shape[:2]
+        scene = _filter_scene_detections(detections)
+        vehicles = [
+            d for d in scene if d.label in VEHICLE_LABELS and d.confidence >= YOLO_CONFIDENCE
+        ]
+        veh_crops: list[tuple[int, int, int, int, np.ndarray, tuple[float, float, float, float]]] = []
+        for v in vehicles:
+            vb = clamp_bbox(v.bbox, w, h)
+            if vb is None:
+                continue
+            vx1, vy1, vx2, vy2 = vb
+            vehicle_crop = frame[vy1:vy2, vx1:vx2]
+            if vehicle_crop.size == 0:
+                continue
+            fx = (float(vx1), float(vy1), float(vx2), float(vy2))
+            veh_crops.append((vx1, vy1, vx2, vy2, vehicle_crop, fx))
+
+        if not veh_crops:
+            self._tracks.clear()
+            return
+
+        used_tids: set[int] = set()
+        track_ids: list[int] = []
+        for (_vx1, _vy1, _vx2, _vy2, _crop, fx) in veh_crops:
+            best_tid: int | None = None
+            best_iou = 0.0
+            for tid, tr in self._tracks.items():
+                if tid in used_tids:
+                    continue
+                iou = _iou_xyxy_f(fx, tr["box"])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_tid = tid
+            if best_tid is not None and best_iou >= 0.3:
+                tid = best_tid
+                used_tids.add(tid)
+                self._tracks[tid]["box"] = fx
+            else:
+                tid = self._next_id
+                self._next_id += 1
+                self._tracks[tid] = self._new_track(fx)
+            track_ids.append(tid)
+
+        need_lp: list[int] = []
+        for vi, tid in enumerate(track_ids):
+            if self._need_lp(tid, frame_idx):
+                need_lp.append(vi)
+
+        for vi in need_lp:
+            vx1, vy1, vx2, vy2, crop, _fx = veh_crops[vi]
+            tid = track_ids[vi]
+            lp_batch.enqueue_vehicle_crop(
+                frame_idx=frame_idx,
+                tid=tid,
+                vx1=vx1,
+                vy1=vy1,
+                vx2=vx2,
+                vy2=vy2,
+                frame_w=w,
+                frame_h=h,
+                vehicle_crop=crop,
+            )
+        lp_batch.after_enqueue(frame_idx)
+
+        stale = [tid for tid in self._tracks if tid not in track_ids]
+        for tid in stale:
+            del self._tracks[tid]
+
     def annotate(
         self,
         frame: np.ndarray,
@@ -837,6 +1045,7 @@ class VehicleLpOcrCache:
         annots: FrameAnnotators,
         times: PipelineStepTimes,
         run_scene_lp_ocr: bool = True,
+        lp_inference: bool = True,
     ) -> None:
         h, w = frame.shape[:2]
         scene = _filter_scene_detections(detections)
@@ -917,7 +1126,7 @@ class VehicleLpOcrCache:
 
         draw_by_tid: dict[int, list[tuple[float, float, float, float, str]]] = {}
 
-        if need_lp:
+        if need_lp and lp_inference:
             fd_list = [
                 FrameData(index=j, timestamp=0.0, image=veh_crops[vi][4])
                 for j, vi in enumerate(need_lp)
@@ -1391,6 +1600,7 @@ def _annotate_frame(
     frame_idx: int,
     lp_cache: VehicleLpOcrCache | None = None,
     run_scene_lp_ocr: bool = True,
+    lp_inference: bool = True,
 ) -> None:
     t0 = time.perf_counter()
     _draw_trash_detections(frame, trash_detections, annots)
@@ -1405,6 +1615,7 @@ def _annotate_frame(
             annots=annots,
             times=times,
             run_scene_lp_ocr=run_scene_lp_ocr,
+            lp_inference=lp_inference,
         )
     else:
         _annotate_yolo_lp_ocr(
@@ -1580,6 +1791,7 @@ def _run_pipeline_uniform_stride_batched(
     peeing: PeeingDetector,
     lp_cache: VehicleLpOcrCache | None,
     stride: int,
+    lp_batch: LpBatchCoordinator | None = None,
 ) -> None:
     """Scene YOLO only on ``frame_idx % stride == 0``, micro-batched.
 
@@ -1603,8 +1815,11 @@ def _run_pipeline_uniform_stride_batched(
     def emit_ready() -> None:
         nonlocal emit_idx
         while emit_idx in stash:
+            if lp_batch is not None and lp_batch.enabled and lp_cache is not None:
+                lp_batch.flush_until_frame_ready(emit_idx)
             img, td, scene, pst = stash.pop(emit_idx)
             lp_run = _scene_has_vehicles_at_conf(scene, YOLO_CONFIDENCE)
+            lp_infer = not (lp_batch is not None and lp_batch.enabled and lp_run)
             _annotate_frame(
                 img,
                 td,
@@ -1617,6 +1832,7 @@ def _run_pipeline_uniform_stride_batched(
                 frame_idx=emit_idx,
                 lp_cache=lp_cache,
                 run_scene_lp_ocr=lp_run,
+                lp_inference=lp_infer,
             )
             t0 = time.perf_counter()
             out.write(img)
@@ -1639,6 +1855,8 @@ def _run_pipeline_uniform_stride_batched(
             fd, scene, pst = batch[j]
             td = list(outs[j]) if j < len(outs) else []
             stash[fd.index] = (fd.image, td, scene, pst)
+            if lp_cache is not None:
+                lp_cache.enqueue_lp_jobs_from_scene(fd.image, scene, fd.index, lp_batch)
         emit_ready()
 
     def flush_rfdetr_padded_tail() -> None:
@@ -1662,6 +1880,8 @@ def _run_pipeline_uniform_stride_batched(
             fd, scene, pst = batch[j]
             td = list(outs[j]) if j < len(outs) else []
             stash[fd.index] = (fd.image, td, scene, pst)
+            if lp_cache is not None:
+                lp_cache.enqueue_lp_jobs_from_scene(fd.image, scene, fd.index, lp_batch)
         emit_ready()
 
     def maybe_flush_rfdetr_latency(anchor_frame_idx: int) -> None:
@@ -1733,6 +1953,8 @@ def _run_pipeline_uniform_stride_batched(
                             flush_one_rfdetr_batch()
                     else:
                         stash[i] = (img.copy(), [], scene_for_stash, pstate)
+                        if lp_cache is not None:
+                            lp_cache.enqueue_lp_jobs_from_scene(img, scene_for_stash, i, lp_batch)
                         maybe_flush_rfdetr_latency(i)
                         emit_ready()
                 else:
@@ -1745,6 +1967,12 @@ def _run_pipeline_uniform_stride_batched(
         while len(rfdetr_q) >= B:
             flush_one_rfdetr_batch()
         flush_rfdetr_padded_tail()
+
+        if lp_batch is not None and lp_batch.enabled:
+            lp_batch.eof_flush()
+            times.lp_coordinator_batches = lp_batch.lp_queue_flushes
+            times.lp_coordinator_latency_events = lp_batch.lp_latency_flushes
+            times.lp_coordinator_emit_barriers = lp_batch.lp_emit_flushes
 
         pbar.close()
     finally:
@@ -2048,6 +2276,15 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         ocr_lock_confidence=OCR_LOCK_CONFIDENCE,
         ocr_stable_observations=OCR_STABLE_OBSERVATIONS,
     )
+    lp_batch = LpBatchCoordinator(
+        lp_detector=lp_detector,
+        ocr=ocr,
+        cache=lp_cache,
+        times=times,
+        max_crops=max(1, int(LP_BATCH_MAX_CROPS)),
+        max_latency_frames=max(0, int(LP_BATCH_MAX_LATENCY_FRAMES)),
+        enabled=bool(LP_BATCH_ENABLED),
+    )
 
     out_dir = os.path.dirname(os.path.abspath(output_video))
     if out_dir:
@@ -2121,6 +2358,7 @@ def run_pipeline(video_path: str, output_video: str) -> None:
                 peeing=peeing,
                 lp_cache=lp_cache,
                 stride=stride_n,
+                lp_batch=lp_batch,
             )
         else:
             _run_pipeline_chunked(

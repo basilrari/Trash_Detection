@@ -47,6 +47,12 @@ LP_TRT_IMAGE_SIZE = 640
 LP_TRT_DYNAMIC = True
 LP_CONFIDENCE = 0.25
 
+# Cross-frame LP batching (see ``pipelines/lp_batch_coordinator.py``). Jobs enqueue when frames
+# enter ``stash``; inference flushes at full batch, latency, or ordered emit (uniform-stride path).
+LP_BATCH_ENABLED = True
+LP_BATCH_MAX_CROPS = LP_TRT_BATCH_SIZE
+LP_BATCH_MAX_LATENCY_FRAMES = 0  # 0 = no latency-only flush (batch / emit / EOF only)
+
 # Plate / OCR lock-in (``VehicleLpOcrCache`` in ``pipelines/test_pipeline``).
 OCR_LOCK_CONFIDENCE = 0.90
 OCR_STABLE_OBSERVATIONS = 2
@@ -69,7 +75,7 @@ YOLO_MICRO_BATCH_SIZE = 8
 #   ``"yolo"`` — coarse/dense stride gate (``YOLO_COARSE_STRIDE`` / ``YOLO_DENSE_STRIDE``).
 #   ``"1"``, ``"2"``, … — uniform scene-YOLO stride: run YOLO only on frames where ``index % N == 0``,
 #     micro-batched in windows of ``N * YOLO_MICRO_BATCH_SIZE`` reads; other frames reuse the last scene boxes.
-GATE_MODE = "2"
+GATE_MODE = "3"
 YOLO_COARSE_STRIDE = 10
 YOLO_DENSE_STRIDE = 2
 YOLO_DENSE_IDLE_MISS_STREAK = 8
