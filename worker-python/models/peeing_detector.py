@@ -48,6 +48,7 @@ class BlazePoseLandmark(IntEnum):
 
 MediaPipeMode = Literal["image", "video"]
 
+PERSON_LABELS = ("person",)
 
 OverlayLandmarks = Tuple[Tuple[NormalizedLandmark, ...], ...]
 PeeingDisplayStatus = Literal["confirmed", "suspected"]
