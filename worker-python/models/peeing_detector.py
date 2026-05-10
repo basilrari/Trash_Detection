@@ -23,7 +23,8 @@ import urllib.request
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
+
 
 import cv2
 import numpy as np
@@ -45,7 +46,8 @@ class BlazePoseLandmark(IntEnum):
     RIGHT_WRIST = 16
 
 
-PERSON_LABELS = ("person",)
+MediaPipeMode = Literal["image", "video"]
+
 
 OverlayLandmarks = Tuple[Tuple[NormalizedLandmark, ...], ...]
 PeeingDisplayStatus = Literal["confirmed", "suspected"]
@@ -109,6 +111,7 @@ class _PersonTrack:
     hits_in_bucket: int = 0
     consecutive_good_seconds: int = 0
     latched_confirm: bool = False
+    last_pose_timestamp_ms: int = -1
 
 
 class PeeingDetector:
@@ -126,6 +129,9 @@ class PeeingDetector:
         model_path: str | None = None,
         model_url: str | None = None,
         debug_timing: bool = False,
+        mediapipe_mode: MediaPipeMode = "image",
+        max_pose_persons_per_frame: int | None = None,
+        min_person_box_height_px: float = 0.0,
     ) -> None:
         self.crop_margin = float(crop_margin)
         self.min_visibility = float(min_visibility)
@@ -135,6 +141,21 @@ class PeeingDetector:
         self.track_iou_threshold = float(track_iou_threshold)
         self.track_max_missed_seconds = float(max(0.5, track_max_missed_seconds))
         self.min_crop_side = int(min_crop_side)
+        mode = str(mediapipe_mode).strip().lower()
+        if mode not in ("image", "video"):
+            raise ValueError(
+                f"mediapipe_mode must be 'image' or 'video', got {mediapipe_mode!r}"
+            )
+        self._mediapipe_mode: MediaPipeMode = mode  # type: ignore[assignment]
+        self.max_pose_persons_per_frame = (
+            int(max_pose_persons_per_frame)
+            if max_pose_persons_per_frame is not None
+            else None
+        )
+        if self.max_pose_persons_per_frame is not None and self.max_pose_persons_per_frame < 1:
+            raise ValueError("max_pose_persons_per_frame must be >= 1 when set")
+        self.min_person_box_height_px = float(max(0.0, min_person_box_height_px))
+
         self._debug_timing = bool(debug_timing)
         self._timing_n = 0
         self._timing_sums: Dict[str, float] = {
@@ -143,12 +164,30 @@ class PeeingDetector:
             "detect": 0.0,
             "heuristic": 0.0,
         }
+        self._dbg_run_yolo_updates = 0
+        self._dbg_person_rows_total = 0
+        self._dbg_pose_calls = 0
+        self._dbg_crop_skips_small = 0
+        self._dbg_hit_cap_skips = 0
+        self._dbg_gate_skipped_short = 0
+        self._dbg_gate_skipped_max_person = 0
 
-        from mediapipe.tasks.python.vision import PoseLandmarker
+        from mediapipe.tasks.python.core import base_options as mp_base_options
+        from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
+            VisionTaskRunningMode,
+        )
+        from mediapipe.tasks.python.vision.pose_landmarker import (
+            PoseLandmarker,
+            PoseLandmarkerOptions,
+        )
         from mediapipe.tasks.python.vision.core import image as mp_image
 
         self._PoseLandmark = BlazePoseLandmark
         self._mp_image_mod = mp_image
+        self._mp_base_options_mod = mp_base_options
+        self._VisionTaskRunningMode = VisionTaskRunningMode
+        self._PoseLandmarkerOptions = PoseLandmarkerOptions
+        self._PoseLandmarker = PoseLandmarker
 
         cache_dir = Path.home() / ".cache" / "trash_detection_worker"
         default_path = cache_dir / "pose_landmarker_lite.task"
@@ -156,15 +195,36 @@ class PeeingDetector:
             "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
             "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
         )
-        resolved_path = _ensure_pose_model_file(
+        self._resolved_model_path = _ensure_pose_model_file(
             model_path=model_path or str(default_path),
             model_url=model_url or default_url,
         )
-        self._landmarker = PoseLandmarker.create_from_model_path(resolved_path)
+
+        self._landmarker: Any = None
+        self._video_lms: Dict[int, Any] = {}
+
+        if self._mediapipe_mode == "image":
+            self._landmarker = PoseLandmarker.create_from_model_path(
+                self._resolved_model_path
+            )
 
         self._tracks: List[_PersonTrack] = []
         self._next_id = 1
         self._had_any_confirmed = False
+
+    def _make_video_landmarker(self) -> Any:
+        opts = self._PoseLandmarkerOptions(
+            base_options=self._mp_base_options_mod.BaseOptions(
+                model_asset_path=self._resolved_model_path
+            ),
+            running_mode=self._VisionTaskRunningMode.VIDEO,
+        )
+        return self._PoseLandmarker.create_from_options(opts)
+
+    def _dispose_track_landmarker(self, track_id: int) -> None:
+        lm = self._video_lms.pop(track_id, None)
+        if lm is not None:
+            lm.close()
 
     def close(self) -> None:
         self._emit_debug_timing_report()
@@ -178,27 +238,51 @@ class PeeingDetector:
         lm = getattr(self, "_landmarker", None)
         if lm is not None:
             lm.close()
-            self._landmarker = None  # type: ignore[assignment]
+            self._landmarker = None
+        for tid in list(self._video_lms.keys()):
+            self._dispose_track_landmarker(tid)
 
     def reset(self) -> None:
+        for tid in list(self._video_lms.keys()):
+            self._dispose_track_landmarker(tid)
         self._tracks.clear()
         self._next_id = 1
         self._had_any_confirmed = False
         self._timing_n = 0
         for k in self._timing_sums:
             self._timing_sums[k] = 0.0
+        self._dbg_run_yolo_updates = 0
+        self._dbg_person_rows_total = 0
+        self._dbg_pose_calls = 0
+        self._dbg_crop_skips_small = 0
+        self._dbg_hit_cap_skips = 0
+        self._dbg_gate_skipped_short = 0
+        self._dbg_gate_skipped_max_person = 0
 
     def _emit_debug_timing_report(self) -> None:
-        """Print timing to stderr when enabled — avoids reliance on logging.basicConfig (INFO is dropped by default)."""
+        """Print timing/counters to stderr when enabled."""
         if not self._debug_timing:
             return
-        if self._timing_n <= 0:
+        print(
+            "[peeing] debug counters: "
+            f"run_yolo_updates={self._dbg_run_yolo_updates}  "
+            f"person_rows_after_gates={self._dbg_person_rows_total}  "
+            f"pose_calls={self._dbg_pose_calls}  "
+            f"crop_too_small={self._dbg_crop_skips_small}  "
+            f"hit_cap_skips={self._dbg_hit_cap_skips}  "
+            f"gate_short_box={self._dbg_gate_skipped_short}  "
+            f"gate_max_person_drop={self._dbg_gate_skipped_max_person}  "
+            f"mediapipe_mode={self._mediapipe_mode}",
+            file=sys.stderr,
+        )
+        if self._timing_n <= 0 and self._dbg_pose_calls <= 0:
             print(
-                "[peeing] PEEING_DEBUG_TIMING: no pose crops recorded — "
-                "no person boxes past YOLO_CONFIDENCE on sampled frames, "
-                "or every crop was smaller than min_crop_side after padding.",
+                "[peeing] PEEING_DEBUG_TIMING: no pose inference ran — "
+                "no qualifying person rows, all crops too small, or only hit-cap skips.",
                 file=sys.stderr,
             )
+            return
+        if self._timing_n <= 0:
             return
         n = float(self._timing_n)
         ms = {k: 1000.0 * v / n for k, v in self._timing_sums.items()}
@@ -278,7 +362,14 @@ class PeeingDetector:
                 return True
         return False
 
-    def _peeing_pose_hit(self, crop_bgr: np.ndarray) -> bool:
+    def _infer_pose_on_crop(
+        self,
+        crop_bgr: np.ndarray,
+        landmarker: Any,
+        tr: _PersonTrack,
+        timestamp_sec: float,
+    ) -> bool:
+        """Run MediaPipe on one person crop; IMAGE uses ``detect``, VIDEO uses ``detect_for_video``."""
         if crop_bgr.size == 0 or crop_bgr.shape[0] < 16 or crop_bgr.shape[1] < 16:
             return False
         dbg = self._debug_timing
@@ -289,7 +380,14 @@ class PeeingDetector:
         t1 = time.perf_counter()
         mp_image = self._mp_image_mod.Image(self._mp_image_mod.ImageFormat.SRGB, rgb)
         t2 = time.perf_counter()
-        result = self._landmarker.detect(mp_image)
+        if self._mediapipe_mode == "video":
+            ts_ms = int(timestamp_sec * 1000)
+            if ts_ms <= tr.last_pose_timestamp_ms:
+                ts_ms = tr.last_pose_timestamp_ms + 1
+            tr.last_pose_timestamp_ms = ts_ms
+            result = landmarker.detect_for_video(mp_image, ts_ms)
+        else:
+            result = landmarker.detect(mp_image)
         t3 = time.perf_counter()
         if not result.pose_landmarks:
             if dbg:
@@ -316,6 +414,8 @@ class PeeingDetector:
         for tr in self._tracks:
             if timestamp_sec - tr.last_sample_ts <= self.track_max_missed_seconds:
                 alive.append(tr)
+            else:
+                self._dispose_track_landmarker(tr.track_id)
         self._tracks = alive
 
     def _score_progress(self) -> float:
@@ -393,10 +493,33 @@ class PeeingDetector:
                 mark_bboxes_suspected=mark_s,
             )
 
-        persons = sorted(
+        persons_raw = sorted(
             self._person_detections(detections, yolo_conf),
             key=lambda d: -d.confidence,
         )
+        gated: List[Detection] = []
+        min_h = self.min_person_box_height_px
+        for d in persons_raw:
+            if min_h > 1e-6:
+                x1, y1, x2, y2 = d.bbox
+                if float(y2) - float(y1) < min_h:
+                    self._dbg_gate_skipped_short += 1
+                    continue
+            gated.append(d)
+
+        if (
+            self.max_pose_persons_per_frame is not None
+            and len(gated) > self.max_pose_persons_per_frame
+        ):
+            drop = len(gated) - self.max_pose_persons_per_frame
+            self._dbg_gate_skipped_max_person += drop
+            persons = gated[: self.max_pose_persons_per_frame]
+        else:
+            persons = gated
+
+        self._dbg_run_yolo_updates += 1
+        self._dbg_person_rows_total += len(persons)
+
         used_track_ids: set[int] = set()
         frame_any_hit = False
 
@@ -424,16 +547,33 @@ class PeeingDetector:
                 )
                 self._next_id += 1
                 self._tracks.append(tr)
+                if self._mediapipe_mode == "video":
+                    self._video_lms[tr.track_id] = self._make_video_landmarker()
 
             self._advance_bucket(tr, sec)
             tr.samples_in_bucket += 1
 
+            if tr.hits_in_bucket >= self.min_hits_per_second:
+                self._dbg_hit_cap_skips += 1
+                continue
+
             box = self._clamp_crop(bbox, w, h)
-            hit = False
-            if box is not None:
-                x1, y1, x2, y2 = box
-                crop = frame_bgr[y1:y2, x1:x2]
-                hit = self._peeing_pose_hit(crop)
+            if box is None:
+                self._dbg_crop_skips_small += 1
+                continue
+
+            if self._mediapipe_mode == "image":
+                pose_lm = self._landmarker
+            else:
+                pose_lm = self._video_lms.get(tr.track_id)
+                if pose_lm is None:
+                    pose_lm = self._make_video_landmarker()
+                    self._video_lms[tr.track_id] = pose_lm
+
+            x1, y1, x2, y2 = box
+            crop = frame_bgr[y1:y2, x1:x2]
+            self._dbg_pose_calls += 1
+            hit = self._infer_pose_on_crop(crop, pose_lm, tr, ts)
             if hit:
                 tr.hits_in_bucket += 1
                 frame_any_hit = True

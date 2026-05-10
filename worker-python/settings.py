@@ -122,7 +122,17 @@ PEEING_MIN_HITS_PER_SECOND = 3
 PEEING_TRACK_IOU_THRESHOLD = 0.35
 PEEING_TRACK_MAX_MISSED_SECONDS = 3.0
 
-# Log average per-step pose latency at PeeingDetector shutdown (prints to stderr; does not rely on logging config).
+# MediaPipe Tasks backend: ``image`` (single ``detect()`` per crop) or ``video``
+# (one ``PoseLandmarker`` per IoU track, ``detect_for_video()`` — may reduce work when tracking is stable).
+PEEING_MEDIAPIPE_MODE: str = "image"  # ``image`` | ``video``
+
+# Limit expensive pose crops per sampled frame (after sorting by YOLO confidence). ``None`` = no limit.
+PEEING_MAX_POSE_PERSONS_PER_FRAME: int | None = None
+
+# Skip person boxes shorter than this height in pixels (0 = disabled).
+PEEING_MIN_PERSON_BOX_HEIGHT_PX = 0.0
+
+# Log average per-step pose latency + call counters at PeeingDetector shutdown (stderr).
 PEEING_DEBUG_TIMING = False
 
 PEEING_POSE_MODEL_PATH = str(

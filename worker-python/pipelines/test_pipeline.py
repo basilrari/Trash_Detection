@@ -74,7 +74,10 @@ from settings import (
     PEEING_CROP_MARGIN,
     PEEING_DEBUG_TIMING,
     PEEING_HAND_GROIN_Y_THRESHOLD,
+    PEEING_MAX_POSE_PERSONS_PER_FRAME,
+    PEEING_MEDIAPIPE_MODE,
     PEEING_MIN_HITS_PER_SECOND,
+    PEEING_MIN_PERSON_BOX_HEIGHT_PX,
     PEEING_MIN_VISIBILITY,
     PEEING_POSE_MODEL_PATH,
     PEEING_POSE_MODEL_URL,
@@ -1850,6 +1853,9 @@ def run_pipeline(video_path: str, output_video: str) -> None:
             model_path=PEEING_POSE_MODEL_PATH,
             model_url=PEEING_POSE_MODEL_URL,
             debug_timing=PEEING_DEBUG_TIMING,
+            mediapipe_mode=PEEING_MEDIAPIPE_MODE,
+            max_pose_persons_per_frame=PEEING_MAX_POSE_PERSONS_PER_FRAME,
+            min_person_box_height_px=PEEING_MIN_PERSON_BOX_HEIGHT_PX,
         )
     except Exception as exc:
         console.print(
@@ -1865,7 +1871,8 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     console.print(
         "[dim]Peeing hint:[/] standing + hand near groin (MediaPipe Tasks); "
         f"≥{PEEING_MIN_HITS_PER_SECOND} sampled pose hits per calendar second for "
-        f"{PEEING_SECONDS_REQUIRED} consecutive seconds; IoU person tracks."
+        f"{PEEING_SECONDS_REQUIRED} consecutive seconds; IoU person tracks; "
+        f"MediaPipe mode [cyan]{PEEING_MEDIAPIPE_MODE}[/]."
     )
 
     annots = _make_frame_annotators(width, height)
