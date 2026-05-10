@@ -75,15 +75,24 @@ from settings import (
     PEEING_DEBUG_TIMING,
     PEEING_HAND_GROIN_Y_THRESHOLD,
     PEEING_MAX_POSE_PERSONS_PER_FRAME,
+    PEEING_MEDIAPIPE_DELEGATE,
     PEEING_MEDIAPIPE_MODE,
     PEEING_MIN_HITS_PER_SECOND,
-    PEEING_MIN_PERSON_BOX_HEIGHT_PX,
     PEEING_MIN_VISIBILITY,
+    PEEING_POSE_BACKEND,
     PEEING_POSE_MODEL_PATH,
     PEEING_POSE_MODEL_URL,
     PEEING_SECONDS_REQUIRED,
     PEEING_TRACK_IOU_THRESHOLD,
     PEEING_TRACK_MAX_MISSED_SECONDS,
+    PEEING_YOLO_POSE_BATCH_SIZE,
+    PEEING_YOLO_POSE_CROSS_FRAME_BATCH,
+    PEEING_YOLO_POSE_DEVICE,
+    PEEING_YOLO_POSE_IMGSZ,
+    PEEING_YOLO_POSE_MODEL,
+    PEEING_YOLO_POSE_PREFETCH_DEBUG,
+    PEEING_YOLO_POSE_TRT_DYNAMIC,
+    PEEING_YOLO_POSE_TRT_TIMING,
     PIPELINE_READ_AHEAD_QUEUE_SIZE,
     PIPELINE_WRITE_QUEUE_SIZE,
     PLATE_CONFIDENCE,
@@ -243,7 +252,10 @@ def _log_pipeline_run_configuration(
     console.print(f"         trash head     [dim]{te}[/]")
     console.print(f"         cigarette head [dim]{ce}[/]")
     console.print(
-        f"  Cfg    RF_DETR_PREPROCESS_CUDA={trt_pre_disp}  RF_DETR_TRT_TIMING={trt_tim_disp}"
+        f"  Cfg    RF_DETR_PREPROCESS_CUDA={trt_pre_disp}  RF_DETR_TRT_TIMING={trt_tim_disp}  "
+        f"PEEING_YOLO_POSE_TRT_TIMING={repr(PEEING_YOLO_POSE_TRT_TIMING)}  "
+        f"PEEING_YOLO_POSE_CROSS_FRAME_BATCH={repr(PEEING_YOLO_POSE_CROSS_FRAME_BATCH)}  "
+        f"PEEING_YOLO_POSE_PREFETCH_DEBUG={repr(PEEING_YOLO_POSE_PREFETCH_DEBUG)}"
     )
     console.print(
         f"  Encode OUTPUT_VIDEO_ENCODER={OUTPUT_VIDEO_ENCODER!r}  "
@@ -251,9 +263,26 @@ def _log_pipeline_run_configuration(
     )
     console.print(f"  Output [dim]{Path(output_video).resolve()}[/]")
     console.print(f"  Writer [cyan]{sink_label}[/]")
-    console.print(f"  Peeing [dim]{Path(PEEING_POSE_MODEL_PATH).expanduser().resolve()}[/]")
-    if _trt_timing_enabled():
-        console.print("  [yellow]RF_DETR_TRT_TIMING is on[/] — expect extra [TRT] lines per batch.")
+    _pee_cfg = (
+        (
+            f"{Path(PEEING_YOLO_POSE_MODEL).expanduser().resolve()}  "
+            f"batch={PEEING_YOLO_POSE_BATCH_SIZE}  backend=yolo"
+        )
+        if PEEING_POSE_BACKEND == "yolo"
+        else f"{Path(PEEING_POSE_MODEL_PATH).expanduser().resolve()}  backend=mediapipe"
+    )
+    console.print(f"  Peeing [dim]{_pee_cfg}[/]")
+    if _trt_timing_enabled() or (
+        PEEING_POSE_BACKEND == "yolo" and bool(PEEING_YOLO_POSE_TRT_TIMING)
+    ):
+        parts = []
+        if _trt_timing_enabled():
+            parts.append("RF-DETR ``[TRT]``")
+        if PEEING_POSE_BACKEND == "yolo" and bool(PEEING_YOLO_POSE_TRT_TIMING):
+            parts.append("YOLO pose ``[pose-TRT]``")
+        console.print(
+            f"  [yellow]Verbose TRT timing is on[/] — expect extra lines: {', '.join(parts)}."
+        )
     console.print(
         f"  Pipeline YOLO_MICRO_BATCH_SIZE={YOLO_MICRO_BATCH_SIZE}  "
         f"LP_VEHICLE_LP_STRIDE={LP_VEHICLE_LP_STRIDE}  "
@@ -603,6 +632,14 @@ class PipelineStepTimes:
     lp_padded_slots: int = 0
     lp_max_batch_slack: int = 0
     peeing_sec: float = 0.0
+    peeing_pose_input_crops: int = 0
+    peeing_pose_batch_launches: int = 0
+    peeing_pose_padded_slots: int = 0
+    peeing_pose_max_batch_slack: int = 0
+    peeing_pose_prefetch_windows: int = 0
+    peeing_pose_prefetch_frames: int = 0
+    peeing_pose_prefetch_crops: int = 0
+    peeing_pose_prefetch_unused_hits: int = 0
     annotate_draw_sec: float = 0.0
     lp_sec: float = 0.0
     ocr_sec: float = 0.0
@@ -674,7 +711,39 @@ class PipelineStepTimes:
                 f"  [dim]RF-DETR TRT batches:[/] {self.rfdetr_trt_batches}  padded slots: "
                 f"{self.rfdetr_trt_padded_slots}  avg real frames/batch: {avg_real:.2f}"
             )
-        console.print(f"  Peeing (MediaPipe):   {self.peeing_sec:8.2f} s")
+        console.print(f"  Peeing (pose):        {self.peeing_sec:8.2f} s")
+        if self.peeing_pose_input_crops > 0 and self.peeing_sec > 0:
+            eff_p = self.peeing_pose_input_crops / self.peeing_sec
+            console.print(
+                f"  [dim]YOLO pose inputs:  {self.peeing_pose_input_crops:8d} person crops "
+                f"→ {eff_p:5.1f} eff. FPS (crops ÷ Peeing time only)[/]"
+            )
+            console.print(
+                "  [dim]YOLO pose note:[/] ``padded (dummy rows)`` only when "
+                "``PEEING_YOLO_POSE_TRT_DYNAMIC=False`` (static TRT batch). "
+                "``max_batch_slack`` sums per-launch headroom vs ``PEEING_YOLO_POSE_BATCH_SIZE`` when dynamic; "
+                "``PEEING_YOLO_POSE_TRT_TIMING`` prints ``[pose-TRT]`` per Ultralytics forward."
+            )
+        if self.peeing_pose_batch_launches > 0:
+            avg_pc = self.peeing_pose_input_crops / max(self.peeing_pose_batch_launches, 1)
+            slack_pp = (
+                f"  max-batch slack: {self.peeing_pose_max_batch_slack}"
+                if self.peeing_pose_max_batch_slack > 0
+                else ""
+            )
+            console.print(
+                f"  [dim]YOLO pose batches:[/] {self.peeing_pose_batch_launches}  "
+                f"padded (dummy rows): {self.peeing_pose_padded_slots}{slack_pp}  "
+                f"avg real crops/batch: {avg_pc:.2f}"
+            )
+        if self.peeing_pose_prefetch_windows > 0:
+            console.print(
+                "  [dim]YOLO pose cross-frame:[/] "
+                f"windows={self.peeing_pose_prefetch_windows}  "
+                f"sampled_frames={self.peeing_pose_prefetch_frames}  "
+                f"prefetched_crops={self.peeing_pose_prefetch_crops}  "
+                f"unused_hits={self.peeing_pose_prefetch_unused_hits}"
+            )
         console.print(f"  Annotate (draw only): {self.annotate_draw_sec:8.2f} s")
         console.print(f"  LP detect:            {self.lp_sec:8.2f} s")
         if self.lp_input_crops > 0 and self.lp_sec > 0:
@@ -712,7 +781,9 @@ class PipelineStepTimes:
         console.print(f"  [bold]Wall clock total:   {wall_total_sec:8.2f} s[/]")
 
 
-def _ingest_ultralytics_pipeline_stats(times: PipelineStepTimes, yolo: YoloDetector, lp: LpDetector) -> None:
+def _ingest_ultralytics_pipeline_stats(
+    times: PipelineStepTimes, yolo: YoloDetector, lp: LpDetector, peeing: PeeingDetector
+) -> None:
     ys = yolo.get_inference_batch_stats()
     times.yolo_input_frames = ys.input_units
     times.yolo_batch_launches = ys.batch_launches
@@ -723,6 +794,16 @@ def _ingest_ultralytics_pipeline_stats(times: PipelineStepTimes, yolo: YoloDetec
     times.lp_batch_launches = ls.batch_launches
     times.lp_padded_slots = ls.padded_slots
     times.lp_max_batch_slack = ls.max_batch_slack
+    ps = peeing.get_inference_batch_stats()
+    times.peeing_pose_input_crops = ps.input_units
+    times.peeing_pose_batch_launches = ps.batch_launches
+    times.peeing_pose_padded_slots = ps.padded_slots
+    times.peeing_pose_max_batch_slack = ps.max_batch_slack
+    pw, pf, pc, pu = peeing.get_pose_cross_frame_prefetch_stats()
+    times.peeing_pose_prefetch_windows = pw
+    times.peeing_pose_prefetch_frames = pf
+    times.peeing_pose_prefetch_crops = pc
+    times.peeing_pose_prefetch_unused_hits = pu
 
 
 # Match Ultralytics COCO names for YOLO ``classes=[0,2,3,5,7]`` (person + road vehicles).
@@ -1222,8 +1303,9 @@ class VehicleLpOcrCache:
 
 @dataclass(frozen=True)
 class FrameAnnotators:
-    """Supervision label stack (text only; boxes are not drawn)."""
+    """Supervision annotators for boxes + labels on RF-DETR trash/cigarette."""
 
+    trash_box: Any
     trash_label: Any
     yolo_label: Any
     plate_label: Any
@@ -1233,10 +1315,11 @@ class FrameAnnotators:
 
 
 def _make_frame_annotators(width: int, height: int) -> FrameAnnotators:
-    """Label sizing from supervision heuristics; trash head style (red) for trash + cigarette."""
+    """Trash/cigarette: colored boxes + labels; colors follow ``ColorLookup.INDEX`` on class_id."""
     wh = (int(width), int(height))
     base_thickness = int(sv.calculate_optimal_line_thickness(resolution_wh=wh))
     line_thickness = max(2, (base_thickness * 2 + 2) // 3)
+    box_thickness = max(2, line_thickness)
 
     base_text_scale = float(sv.calculate_optimal_text_scale(resolution_wh=wh))
     text_scale = 0.5 * max(0.45, base_text_scale * 1.4)
@@ -1246,8 +1329,14 @@ def _make_frame_annotators(width: int, height: int) -> FrameAnnotators:
     lookup = sv.ColorLookup.INDEX
     sp = bool(ANNOTATOR_SMART_POSITION)
 
+    trash_palette = sv.ColorPalette([sv.Color.RED, sv.Color.YELLOW])
+    trash_box = sv.BoxAnnotator(
+        color=trash_palette,
+        thickness=box_thickness,
+        color_lookup=lookup,
+    )
     trash_label = sv.LabelAnnotator(
-        color=sv.Color.RED,
+        color=trash_palette,
         text_color=sv.Color.BLACK,
         text_scale=text_scale,
         text_thickness=text_thickness,
@@ -1271,12 +1360,44 @@ def _make_frame_annotators(width: int, height: int) -> FrameAnnotators:
         color_lookup=lookup,
     )
     return FrameAnnotators(
+        trash_box=trash_box,
         trash_label=trash_label,
         yolo_label=yolo_label,
         plate_label=plate_label,
         label_text_scale=text_scale,
         label_text_thickness=text_thickness,
     )
+
+
+def _trash_detections_to_sv(
+    detections: Sequence[Detection], width: int, height: int
+) -> tuple[sv.Detections, list[str]]:
+    """RF-DETR labels: class_id 0 = trash (red), 1 = cigarette (yellow) for :class:`sv.BoxAnnotator`."""
+    xyxy_list: list[list[float]] = []
+    conf_list: list[float] = []
+    cls_list: list[int] = []
+    labels: list[str] = []
+    for det in detections:
+        try:
+            x1, y1, x2, y2 = map(float, det.bbox)
+        except Exception:
+            continue
+        bbox = clamp_bbox((int(x1), int(y1), int(x2), int(y2)), width, height)
+        if bbox is None:
+            continue
+        x1, y1, x2, y2 = bbox
+        xyxy_list.append([float(x1), float(y1), float(x2), float(y2)])
+        conf_list.append(float(det.confidence))
+        lab_lower = str(det.label).lower()
+        cls_list.append(1 if "cigarette" in lab_lower else 0)
+        labels.append(f"{det.label} {det.confidence:.2f}")
+    if not xyxy_list:
+        empty = np.zeros((0, 4), dtype=np.float32)
+        return sv.Detections(xyxy=empty), []
+    xyxy = np.asarray(xyxy_list, dtype=np.float32)
+    conf = np.asarray(conf_list, dtype=np.float32)
+    class_id = np.asarray(cls_list, dtype=np.int64)
+    return sv.Detections(xyxy=xyxy, confidence=conf, class_id=class_id), labels
 
 
 def _detections_to_sv(
@@ -1382,11 +1503,12 @@ def _draw_trash_detections(
     trash_detections: Sequence[Detection],
     annots: FrameAnnotators,
 ) -> None:
-    """Draw RF-DETR trash + cigarette in red (same trash head style)."""
+    """Draw RF-DETR trash (red box) + cigarette (yellow box) with confidence labels."""
     h, w = frame.shape[:2]
-    sv_dets, labels = _detections_to_sv(trash_detections, w, h)
+    sv_dets, labels = _trash_detections_to_sv(trash_detections, w, h)
     if not labels:
         return
+    annots.trash_box.annotate(frame, sv_dets)
     annots.trash_label.annotate(frame, sv_dets, labels=labels)
 
 
@@ -1495,17 +1617,20 @@ def _annotate_yolo_lp_ocr(
 
 
 def _draw_peeing_overlay(frame: np.ndarray, state: PeeingState) -> None:
-    """Bounding boxes only; drawn on stride/inference frames only (blinks like scene-YOLO cadence)."""
+    """Thick red boxes when a peeing cue is active (confirmed or suspected) on sampled frames."""
     if not state.sampled:
         return
+    red_bgr = (0, 0, 255)
+    thick_confirmed = 6
+    thick_suspect = 4
     for x1, y1, x2, y2 in state.mark_bboxes:
         p1 = (int(round(x1)), int(round(y1)))
         p2 = (int(round(x2)), int(round(y2)))
-        cv2.rectangle(frame, p1, p2, (40, 40, 255), 2)
+        cv2.rectangle(frame, p1, p2, red_bgr, thick_confirmed)
     for x1, y1, x2, y2 in state.mark_bboxes_suspected:
         p1 = (int(round(x1)), int(round(y1)))
         p2 = (int(round(x2)), int(round(y2)))
-        cv2.rectangle(frame, p1, p2, (0, 200, 255), 2)
+        cv2.rectangle(frame, p1, p2, red_bgr, thick_suspect)
 
 
 def _annotate_frame(
@@ -1709,6 +1834,23 @@ def _run_pipeline_uniform_stride_batched(
                         scene_by_idx[fd.index] = _filter_scene_detections(list(lst))
                 times.yolo_sec += time.perf_counter() - t_y
 
+            pose_prefetch_by_idx: dict[int, list[bool | None]] = {}
+            if (
+                PEEING_POSE_BACKEND == "yolo"
+                and PEEING_YOLO_POSE_CROSS_FRAME_BATCH
+                and sampled_fds
+            ):
+                pref_items = [
+                    (i, img, scene_by_idx[i])
+                    for (i, img) in window
+                    if (i % stride) == 0 and i in scene_by_idx
+                ]
+                if pref_items:
+                    pose_prefetch_by_idx = peeing.prefetch_yolo_pose_hits_for_window(
+                        pref_items,
+                        YOLO_CONFIDENCE,
+                    )
+
             for i, img in window:
                 if i in scene_by_idx:
                     carry_peeing = list(scene_by_idx[i])
@@ -1721,12 +1863,20 @@ def _run_pipeline_uniform_stride_batched(
 
                 t_p = time.perf_counter()
                 ts = i / fps
+                pre_hits: list[bool | None] | None = None
+                if (
+                    run_yolo
+                    and PEEING_POSE_BACKEND == "yolo"
+                    and PEEING_YOLO_POSE_CROSS_FRAME_BATCH
+                ):
+                    pre_hits = pose_prefetch_by_idx.get(i)
                 pstate = peeing.update(
                     img,
                     scene_peeing,
                     run_yolo=run_yolo,
                     yolo_conf=YOLO_CONFIDENCE,
                     timestamp_sec=ts,
+                    precomputed_yolo_pose_hits=pre_hits,
                 )
                 times.peeing_sec += time.perf_counter() - t_p
                 if pstate.edge_enter:
@@ -1850,29 +2000,56 @@ def run_pipeline(video_path: str, output_video: str) -> None:
             seconds_required=PEEING_SECONDS_REQUIRED,
             track_iou_threshold=PEEING_TRACK_IOU_THRESHOLD,
             track_max_missed_seconds=PEEING_TRACK_MAX_MISSED_SECONDS,
+            pose_backend=PEEING_POSE_BACKEND,
             model_path=PEEING_POSE_MODEL_PATH,
             model_url=PEEING_POSE_MODEL_URL,
-            debug_timing=PEEING_DEBUG_TIMING,
             mediapipe_mode=PEEING_MEDIAPIPE_MODE,
+            mediapipe_delegate=PEEING_MEDIAPIPE_DELEGATE,
+            yolo_pose_model=PEEING_YOLO_POSE_MODEL,
+            yolo_pose_imgsz=PEEING_YOLO_POSE_IMGSZ,
+            yolo_pose_batch_size=PEEING_YOLO_POSE_BATCH_SIZE,
+            yolo_pose_trt_dynamic=PEEING_YOLO_POSE_TRT_DYNAMIC,
+            yolo_pose_device=PEEING_YOLO_POSE_DEVICE,
+            yolo_pose_trt_timing=PEEING_YOLO_POSE_TRT_TIMING,
+            yolo_pose_prefetch_debug=PEEING_YOLO_POSE_PREFETCH_DEBUG,
+            debug_timing=PEEING_DEBUG_TIMING,
             max_pose_persons_per_frame=PEEING_MAX_POSE_PERSONS_PER_FRAME,
-            min_person_box_height_px=PEEING_MIN_PERSON_BOX_HEIGHT_PX,
         )
     except Exception as exc:
         console.print(
             "[red]PeeingDetector failed to initialize (required).[/]\n"
-            "Install MediaPipe in this environment, e.g. [bold]pip install mediapipe[/].\n"
+            "If pose_backend is [bold]yolo[/]: ensure ``pip install ultralytics torch`` and a pose "
+            "``PEEING_YOLO_POSE_MODEL`` TensorRT ``.engine`` path.\n"
+            "If pose_backend is [bold]mediapipe[/]: ``pip install mediapipe`` and the Tasks pose bundle.\n"
             f"[dim]{exc}[/]"
         )
         raise SystemExit(2) from exc
+    _pee_ready = (
+        f"YOLO pose [dim]{Path(PEEING_YOLO_POSE_MODEL).expanduser().resolve()}[/]"
+        if PEEING_POSE_BACKEND == "yolo"
+        else f"MediaPipe pose [dim]{Path(PEEING_POSE_MODEL_PATH).expanduser().resolve()}[/]"
+    )
     _log_model_ready(
         "PeeingDetector",
-        f"MediaPipe pose [dim]{Path(PEEING_POSE_MODEL_PATH).expanduser().resolve()}[/]",
+        _pee_ready,
     )
+    if PEEING_POSE_BACKEND == "yolo":
+        _pee_hint_extra = (
+            f"YOLO pose TensorRT/default: [dim]{Path(PEEING_YOLO_POSE_MODEL).name}[/]  "
+            f"batch={PEEING_YOLO_POSE_BATCH_SIZE}  imgsz={PEEING_YOLO_POSE_IMGSZ}"
+        )
+        if PEEING_YOLO_POSE_DEVICE:
+            _pee_hint_extra += f"; device={PEEING_YOLO_POSE_DEVICE!r}"
+    else:
+        _pee_hint_extra = (
+            f"MediaPipe Tasks; mode [cyan]{PEEING_MEDIAPIPE_MODE}[/], "
+            f"delegate [cyan]{PEEING_MEDIAPIPE_DELEGATE}[/]"
+        )
     console.print(
-        "[dim]Peeing hint:[/] standing + hand near groin (MediaPipe Tasks); "
+        "[dim]Peeing hint:[/] standing + hand near groin; "
         f"≥{PEEING_MIN_HITS_PER_SECOND} sampled pose hits per calendar second for "
         f"{PEEING_SECONDS_REQUIRED} consecutive seconds; IoU person tracks; "
-        f"MediaPipe mode [cyan]{PEEING_MEDIAPIPE_MODE}[/]."
+        f"{_pee_hint_extra}."
     )
 
     annots = _make_frame_annotators(width, height)
@@ -1920,6 +2097,7 @@ def run_pipeline(video_path: str, output_video: str) -> None:
 
     yolo.reset_inference_batch_stats()
     lp_detector.reset_inference_batch_stats()
+    peeing.reset_inference_batch_stats()
 
     try:
         _run_pipeline_uniform_stride_batched(
@@ -1956,7 +2134,7 @@ def run_pipeline(video_path: str, output_video: str) -> None:
             pass
 
     wall_total = time.perf_counter() - wall_start
-    _ingest_ultralytics_pipeline_stats(times, yolo, lp_detector)
+    _ingest_ultralytics_pipeline_stats(times, yolo, lp_detector, peeing)
     times.print_summary(wall_total_sec=wall_total)
 
 

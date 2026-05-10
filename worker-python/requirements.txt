@@ -17,4 +17,7 @@ paddleocr>=2.7.0
 # Blackwell PaddleOCR: https://paddlepaddle.github.io/PaddleOCR/main/en/version3.x/pipeline_usage/PaddleOCR-VL-NVIDIA-Blackwell.html
 torch  # install wheel matching your CUDA from https://pytorch.org/get-started/locally/
 supervision>=0.24.0
-mediapipe>=0.10.0
+# TensorRT ``.engine`` for scene YOLO / LP YOLO / peeing pose: requires NVIDIA TensorRT matching your CUDA driver.
+# Peeing pose default: ``weights/yolo11n-pose_b8_fp16.engine`` (TensorRT; path from ``PEEING_YOLO_POSE_MODEL``).
+mediapipe>=0.10.0  # Only needed when ``PEEING_POSE_BACKEND=mediapipe`` (default peeing pose is YOLO).
+# MediaPipe GPU delegate on Linux often needs DISPLAY / WAYLAND_DISPLAY for EGL (see peeing_detector).

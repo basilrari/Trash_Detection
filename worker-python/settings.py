@@ -110,7 +110,7 @@ LP_VEHICLE_LP_STRIDE = 3
 PIPELINE_READ_AHEAD_QUEUE_SIZE = 8
 PIPELINE_WRITE_QUEUE_SIZE = 8
 
-# --- Peeing heuristic (MediaPipe Pose Tasks on scene-YOLO person crops; stride-sampled) ---
+# --- Peeing heuristic (pose on scene-YOLO person crops; stride-sampled; IoU tracks) ---
 # Standing + wrist near mid-groin (normalized Y). Temporal rule uses **calendar seconds**:
 # ≥ ``PEEING_MIN_HITS_PER_SECOND`` pose hits among sampled frames in that second, repeated
 # ``PEEING_SECONDS_REQUIRED`` consecutive seconds → per-person confirmation (IoU tracking).
@@ -122,15 +122,33 @@ PEEING_MIN_HITS_PER_SECOND = 3
 PEEING_TRACK_IOU_THRESHOLD = 0.35
 PEEING_TRACK_MAX_MISSED_SECONDS = 3.0
 
+# Pose model backend: ``yolo`` (Ultralytics COCO keypoints; default TensorRT ``.engine`` + batching) or ``mediapipe``.
+PEEING_POSE_BACKEND: str = "yolo"  # ``yolo`` | ``mediapipe``
+
 # MediaPipe Tasks backend: ``image`` (single ``detect()`` per crop) or ``video``
 # (one ``PoseLandmarker`` per IoU track, ``detect_for_video()`` — may reduce work when tracking is stable).
 PEEING_MEDIAPIPE_MODE: str = "video"  # ``image`` | ``video``
 
+# TensorFlow Lite GPU delegate (MediaPipe only): ``cpu``, ``gpu``, or ``auto``.
+# Not PyTorch CUDA. On some Linux + NVIDIA stacks the TFLite GPU / EGL path can **SIGSEGV during init**.
+PEEING_MEDIAPIPE_DELEGATE: str = "cpu"
+
+# YOLO pose: **TensorRT .engine only** (fixed batch, under ``weights/``). No PyTorch checkpoint path.
+PEEING_YOLO_POSE_MODEL = str(_w / "yolo11n-pose_b8_fp16.engine")
+PEEING_YOLO_POSE_BATCH_SIZE = 8
+# ``False``: pad short batches to ``PEEING_YOLO_POSE_BATCH_SIZE`` (matches static TRT export).
+PEEING_YOLO_POSE_TRT_DYNAMIC = False
+PEEING_YOLO_POSE_IMGSZ = 640
+PEEING_YOLO_POSE_DEVICE: str | None = None  # ``None`` → cuda:0 if available, else cpu
+# Per-batch stderr lines from ``PeeingDetector`` (``[pose-TRT] …``): real crops, dummy padding, slack, ms.
+PEEING_YOLO_POSE_TRT_TIMING = False
+# Batch YOLO pose crops across all stride-sampled frames in each pipeline read window (before per-frame peeing updates).
+PEEING_YOLO_POSE_CROSS_FRAME_BATCH = True
+# Extra stderr line per window: ``[pose-prefetch]`` crop counts (off by default).
+PEEING_YOLO_POSE_PREFETCH_DEBUG = False
+
 # Limit expensive pose crops per sampled frame (after sorting by YOLO confidence). ``None`` = no limit.
 PEEING_MAX_POSE_PERSONS_PER_FRAME: int | None = None
-
-# Skip person boxes shorter than this height in pixels (0 = disabled).
-PEEING_MIN_PERSON_BOX_HEIGHT_PX = 0.0
 
 # Log average per-step pose latency + call counters at PeeingDetector shutdown (stderr).
 PEEING_DEBUG_TIMING = True
