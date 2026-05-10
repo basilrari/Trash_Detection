@@ -53,9 +53,8 @@ LP_BATCH_MAX_CROPS = LP_TRT_BATCH_SIZE
 LP_BATCH_MAX_LATENCY_FRAMES = 0  # 0 = no latency-only flush (batch / emit / EOF only)
 
 # Plate / OCR lock-in (``VehicleLpOcrCache`` in ``pipelines/test_pipeline``).
+# OCR text confidence at/above this locks the best text and skips future OCR while the LP box location matches.
 OCR_LOCK_CONFIDENCE = 0.90
-OCR_STABLE_OBSERVATIONS = 2
-OCR_REFRESH_STRIDE = 20
 LP_LOCK_REFRESH_STRIDE = 10
 
 # LabelAnnotator ``smart_position`` adds layout work; set False for faster drawing.

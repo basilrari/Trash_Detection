@@ -67,8 +67,6 @@ from settings import (
     NVENC_CQ,
     NVENC_PRESET,
     OCR_LOCK_CONFIDENCE,
-    OCR_REFRESH_STRIDE,
-    OCR_STABLE_OBSERVATIONS,
     OUTPUT_VIDEO,
     OUTPUT_VIDEO_ENCODER,
     PEEING_CROP_MARGIN,
@@ -298,8 +296,8 @@ def _log_pipeline_run_configuration(
         f"max_batch={LP_TRT_BATCH_SIZE}  dynamic={LP_TRT_DYNAMIC}  imgsz={LP_TRT_IMAGE_SIZE}  conf≥{LP_CONFIDENCE}"
     )
     console.print(
-        f"  OCR lock  LP≥{OCR_LOCK_CONFIDENCE}  stable_obs={OCR_STABLE_OBSERVATIONS}  "
-        f"ocr_refresh={OCR_REFRESH_STRIDE}  lp_lock_refresh={LP_LOCK_REFRESH_STRIDE}"
+        f"  OCR lock  text_conf≥{OCR_LOCK_CONFIDENCE}  requires internal '-'  "
+        f"lp_location_refresh={LP_LOCK_REFRESH_STRIDE}"
     )
     console.print(
         f"  LP batch  enabled={LP_BATCH_ENABLED}  max_crops={LP_BATCH_MAX_CROPS}  "
@@ -829,6 +827,12 @@ def normalize_plate_text(raw: str) -> str:
     return s
 
 
+def _plate_text_has_internal_dash(text: str) -> bool:
+    """True when normalized OCR retained a separator between plate groups."""
+    s = str(text).strip()
+    return "-" in s[1:-1] if len(s) >= 3 else False
+
+
 def _iou_xyxy_f(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
     ax1, ay1, ax2, ay2 = a
     bx1, by1, bx2, by2 = b
@@ -845,35 +849,30 @@ def _iou_xyxy_f(a: tuple[float, float, float, float], b: tuple[float, float, flo
 
 
 class VehicleLpOcrCache:
-    """Vehicle tracks with LP stride, high-confidence plate lock, and OCR refresh rules."""
+    """Vehicle tracks with LP stride and high-confidence OCR text lock."""
 
     def __init__(
         self,
         stride: int,
         *,
         lp_lock_refresh_stride: int,
-        ocr_refresh_stride: int,
         ocr_lock_confidence: float,
-        ocr_stable_observations: int,
     ) -> None:
         self.stride = max(1, int(stride))
         self.lp_lock_refresh_stride = max(1, int(lp_lock_refresh_stride))
-        self.ocr_refresh_stride = max(1, int(ocr_refresh_stride))
         self.ocr_lock_confidence = float(ocr_lock_confidence)
-        self.ocr_stable_observations = max(1, int(ocr_stable_observations))
         self._next_id = 0
         self._tracks: dict[int, dict[str, Any]] = {}
 
     def _new_track(self, fx: tuple[float, float, float, float]) -> dict[str, Any]:
         return {
             "box": fx,
+            "plate_box": None,
             "last_lp": -10**9,
             "draw": [],
             "locked": False,
-            "stable_count": 0,
             "ocr_text": "",
             "ocr_conf": 0.0,
-            "last_ocr_frame": -10**9,
             "last_best_lp_conf": 0.0,
         }
 
@@ -882,6 +881,69 @@ class VehicleLpOcrCache:
         dt = frame_idx - int(tr["last_lp"])
         interval = self.lp_lock_refresh_stride if tr.get("locked") else self.stride
         return dt >= interval
+
+    def _same_plate_location(
+        self,
+        tr: dict[str, Any],
+        plate_box: tuple[float, float, float, float],
+    ) -> bool:
+        prev = tr.get("plate_box")
+        if prev is None:
+            return False
+        try:
+            px1, py1, px2, py2 = map(float, prev)
+            gx1, gy1, gx2, gy2 = map(float, plate_box)
+        except Exception:
+            return False
+        iou = _iou_xyxy_f((px1, py1, px2, py2), (gx1, gy1, gx2, gy2))
+        if iou >= 0.15:
+            return True
+        pcx, pcy = (px1 + px2) * 0.5, (py1 + py2) * 0.5
+        gcx, gcy = (gx1 + gx2) * 0.5, (gy1 + gy2) * 0.5
+        scale = max(8.0, px2 - px1, py2 - py1, gx2 - gx1, gy2 - gy1)
+        return abs(pcx - gcx) <= 0.75 * scale and abs(pcy - gcy) <= 0.75 * scale
+
+    def _can_reuse_locked_ocr(
+        self,
+        tr: dict[str, Any],
+        plate_box: tuple[float, float, float, float],
+    ) -> bool:
+        return bool(
+            tr.get("locked")
+            and str(tr.get("ocr_text", "")).strip()
+            and float(tr.get("ocr_conf", 0.0)) >= self.ocr_lock_confidence
+            and self._same_plate_location(tr, plate_box)
+        )
+
+    def _record_ocr_result(
+        self,
+        tr: dict[str, Any],
+        *,
+        lp_conf: float,
+        plate_box: tuple[float, float, float, float],
+        raw_text: str,
+        ocr_conf: float,
+    ) -> str:
+        plate_text_norm = normalize_plate_text(str(raw_text))
+        valid_text = bool(plate_text_norm) and ocr_conf >= PLATE_CONFIDENCE
+
+        if valid_text and float(ocr_conf) >= float(tr.get("ocr_conf", 0.0)):
+            tr["ocr_text"] = plate_text_norm
+            tr["ocr_conf"] = float(ocr_conf)
+
+        tr["plate_box"] = tuple(float(v) for v in plate_box)
+        best_text = str(tr.get("ocr_text", "")).strip()
+        best_conf = float(tr.get("ocr_conf", 0.0))
+        if (
+            best_text
+            and best_conf >= self.ocr_lock_confidence
+            and _plate_text_has_internal_dash(best_text)
+        ):
+            tr["locked"] = True
+
+        if best_text:
+            return f"{best_text} {best_conf:.2f}"
+        return f"{ocr_conf:.2f}" if ocr_conf >= PLATE_CONFIDENCE else f"LP {lp_conf:.2f}"
 
     def apply_lp_chunk_results(
         self,
@@ -912,11 +974,6 @@ class VehicleLpOcrCache:
             if j >= len(plates_per_sub):
                 tr["last_lp"] = frame_idx
                 continue
-            skip_vehicle_ocr = bool(
-                tr.get("locked")
-                and str(tr.get("ocr_text", "")).strip()
-                and (frame_idx - int(tr["last_ocr_frame"])) < self.ocr_refresh_stride
-            )
             best_plate: LicensePlate | None = None
             for plate in plates_per_sub[j]:
                 if plate.confidence < LP_CONFIDENCE:
@@ -943,10 +1000,24 @@ class VehicleLpOcrCache:
                 continue
             gx1, gy1, gx2, gy2 = gbox
             tr["last_best_lp_conf"] = float(plate.confidence)
+            skip_vehicle_ocr = self._can_reuse_locked_ocr(
+                tr,
+                (float(gx1), float(gy1), float(gx2), float(gy2)),
+            )
             if not skip_vehicle_ocr:
                 ocr_crops.append(plate_crop)
-                ocr_owner.append((tid, frame_idx, float(plate.confidence), (gx1, gy1, gx2, gy2)))
+                ocr_owner.append(
+                    (tid, frame_idx, float(plate.confidence), (gx1, gy1, gx2, gy2))
+                )
             else:
+                label_str = (
+                    f"{str(tr.get('ocr_text', '')).strip()} "
+                    f"{float(tr.get('ocr_conf', 0.0)):.2f}"
+                )
+                draw_by_tid[tid] = [
+                    (float(gx1), float(gy1), float(gx2), float(gy2), label_str)
+                ]
+                tr["plate_box"] = (float(gx1), float(gy1), float(gx2), float(gy2))
                 tr["last_lp"] = frame_idx
 
         ocr_out: list[tuple[str, float]] = []
@@ -967,32 +1038,12 @@ class VehicleLpOcrCache:
             gx1, gy1, gx2, gy2 = gxy
             tr = self._tracks[tid]
             plate_text, ocr_conf = ocr_out[k] if k < len(ocr_out) else ("", 0.0)
-            plate_text_norm = normalize_plate_text(str(plate_text))
-            prev_norm = str(tr.get("ocr_text", "")).strip()
-            if (
-                lp_conf >= self.ocr_lock_confidence
-                and plate_text_norm
-                and ocr_conf >= PLATE_CONFIDENCE
-                and prev_norm == plate_text_norm
-            ):
-                tr["stable_count"] = int(tr.get("stable_count", 0)) + 1
-            elif plate_text_norm and ocr_conf >= PLATE_CONFIDENCE:
-                tr["stable_count"] = 1
-            else:
-                tr["stable_count"] = 0
-            if plate_text_norm and ocr_conf >= PLATE_CONFIDENCE:
-                tr["ocr_text"] = plate_text_norm
-                tr["ocr_conf"] = float(ocr_conf)
-                tr["last_ocr_frame"] = frame_idx
-            if (
-                lp_conf >= self.ocr_lock_confidence
-                and int(tr["stable_count"]) >= self.ocr_stable_observations
-            ):
-                tr["locked"] = True
-            label_str = (
-                f"{plate_text_norm} {ocr_conf:.2f}"
-                if plate_text_norm
-                else (f"{ocr_conf:.2f}" if ocr_conf >= PLATE_CONFIDENCE else f"LP {lp_conf:.2f}")
+            label_str = self._record_ocr_result(
+                tr,
+                lp_conf=lp_conf,
+                plate_box=(float(gx1), float(gy1), float(gx2), float(gy2)),
+                raw_text=str(plate_text),
+                ocr_conf=float(ocr_conf),
             )
             draw_by_tid[tid] = [(float(gx1), float(gy1), float(gx2), float(gy2), label_str)]
             tr["last_lp"] = frame_idx
@@ -1189,11 +1240,6 @@ class VehicleLpOcrCache:
                 if j >= len(plates_per_sub):
                     tr["last_lp"] = frame_idx
                     continue
-                skip_vehicle_ocr = bool(
-                    tr.get("locked")
-                    and str(tr.get("ocr_text", "")).strip()
-                    and (frame_idx - int(tr["last_ocr_frame"])) < self.ocr_refresh_stride
-                )
                 best_plate: LicensePlate | None = None
                 for plate in plates_per_sub[j]:
                     if plate.confidence < LP_CONFIDENCE:
@@ -1220,11 +1266,24 @@ class VehicleLpOcrCache:
                     continue
                 gx1, gy1, gx2, gy2 = gbox
                 tr["last_best_lp_conf"] = float(plate.confidence)
+                skip_vehicle_ocr = self._can_reuse_locked_ocr(
+                    tr,
+                    (float(gx1), float(gy1), float(gx2), float(gy2)),
+                )
                 if not skip_vehicle_ocr:
                     ocr_crops.append(plate_crop)
-                    ocr_owner.append((tid, j, float(plate.confidence), (gx1, gy1, gx2, gy2)))
+                    ocr_owner.append(
+                        (tid, j, float(plate.confidence), (gx1, gy1, gx2, gy2))
+                    )
                 else:
-                    # Keep prior draw; LP was refreshed for lock timing only.
+                    label_str = (
+                        f"{str(tr.get('ocr_text', '')).strip()} "
+                        f"{float(tr.get('ocr_conf', 0.0)):.2f}"
+                    )
+                    draw_by_tid[tid] = [
+                        (float(gx1), float(gy1), float(gx2), float(gy2), label_str)
+                    ]
+                    tr["plate_box"] = (float(gx1), float(gy1), float(gx2), float(gy2))
                     tr["last_lp"] = frame_idx
 
             ocr_out: list[tuple[str, float]] = []
@@ -1245,32 +1304,12 @@ class VehicleLpOcrCache:
                 gx1, gy1, gx2, gy2 = gxy
                 tr = self._tracks[tid]
                 plate_text, ocr_conf = ocr_out[k] if k < len(ocr_out) else ("", 0.0)
-                plate_text_norm = normalize_plate_text(str(plate_text))
-                prev_norm = str(tr.get("ocr_text", "")).strip()
-                if (
-                    lp_conf >= self.ocr_lock_confidence
-                    and plate_text_norm
-                    and ocr_conf >= PLATE_CONFIDENCE
-                    and prev_norm == plate_text_norm
-                ):
-                    tr["stable_count"] = int(tr.get("stable_count", 0)) + 1
-                elif plate_text_norm and ocr_conf >= PLATE_CONFIDENCE:
-                    tr["stable_count"] = 1
-                else:
-                    tr["stable_count"] = 0
-                if plate_text_norm and ocr_conf >= PLATE_CONFIDENCE:
-                    tr["ocr_text"] = plate_text_norm
-                    tr["ocr_conf"] = float(ocr_conf)
-                    tr["last_ocr_frame"] = frame_idx
-                if (
-                    lp_conf >= self.ocr_lock_confidence
-                    and int(tr["stable_count"]) >= self.ocr_stable_observations
-                ):
-                    tr["locked"] = True
-                label_str = (
-                    f"{plate_text_norm} {ocr_conf:.2f}"
-                    if plate_text_norm
-                    else (f"{ocr_conf:.2f}" if ocr_conf >= PLATE_CONFIDENCE else f"LP {lp_conf:.2f}")
+                label_str = self._record_ocr_result(
+                    tr,
+                    lp_conf=lp_conf,
+                    plate_box=(float(gx1), float(gy1), float(gx2), float(gy2)),
+                    raw_text=str(plate_text),
+                    ocr_conf=float(ocr_conf),
                 )
                 draw_by_tid[tid] = [(float(gx1), float(gy1), float(gx2), float(gy2), label_str)]
                 tr["last_lp"] = frame_idx
@@ -1617,20 +1656,15 @@ def _annotate_yolo_lp_ocr(
 
 
 def _draw_peeing_overlay(frame: np.ndarray, state: PeeingState) -> None:
-    """Thick red boxes when a peeing cue is active (confirmed or suspected) on sampled frames."""
+    """Thick red boxes only for confirmed peeing (latched), on sampled frames."""
     if not state.sampled:
         return
     red_bgr = (0, 0, 255)
-    thick_confirmed = 6
-    thick_suspect = 4
+    thick = 6
     for x1, y1, x2, y2 in state.mark_bboxes:
         p1 = (int(round(x1)), int(round(y1)))
         p2 = (int(round(x2)), int(round(y2)))
-        cv2.rectangle(frame, p1, p2, red_bgr, thick_confirmed)
-    for x1, y1, x2, y2 in state.mark_bboxes_suspected:
-        p1 = (int(round(x1)), int(round(y1)))
-        p2 = (int(round(x2)), int(round(y2)))
-        cv2.rectangle(frame, p1, p2, red_bgr, thick_suspect)
+        cv2.rectangle(frame, p1, p2, red_bgr, thick)
 
 
 def _annotate_frame(
@@ -2056,9 +2090,7 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     lp_cache = VehicleLpOcrCache(
         LP_VEHICLE_LP_STRIDE,
         lp_lock_refresh_stride=LP_LOCK_REFRESH_STRIDE,
-        ocr_refresh_stride=OCR_REFRESH_STRIDE,
         ocr_lock_confidence=OCR_LOCK_CONFIDENCE,
-        ocr_stable_observations=OCR_STABLE_OBSERVATIONS,
     )
     lp_batch = LpBatchCoordinator(
         lp_detector=lp_detector,

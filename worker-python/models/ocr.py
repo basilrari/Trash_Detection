@@ -105,6 +105,10 @@ def _pick_best_text_score(res: Any) -> tuple[str, float]:
     if not res:
         return ("", 0.0)
 
+    # PaddleOCR ``predict`` on a batch returns one dict per image; single-image path may return ``[dict]``.
+    if isinstance(res, dict):
+        res = [res]
+
     if isinstance(res, list) and len(res) > 0 and isinstance(res[0], dict):
         page_res = res[0]
         rec_texts = page_res.get("rec_texts", [])
@@ -138,20 +142,47 @@ def _pick_best_text_score(res: Any) -> tuple[str, float]:
 
 
 def _recognize_with_backend(ocr: Any, crops: List[np.ndarray]) -> List[Tuple[str, float]]:
-    outputs: List[Tuple[str, float]] = []
-    for crop in crops:
+    """Run PaddleOCR on all valid crops in one ``predict([...])`` call when possible."""
+    n = len(crops)
+    outputs: List[Tuple[str, float]] = [("", 0.0)] * n
+    valid_idx: List[int] = []
+    images: List[np.ndarray] = []
+    for i, crop in enumerate(crops):
+        if crop is None or crop.size == 0:
+            continue
+        if _ocr_crop_too_small_or_blurry(crop):
+            continue
         try:
-            if crop is None or crop.size == 0:
-                outputs.append(("", 0.0))
-                continue
-            if _ocr_crop_too_small_or_blurry(crop):
-                outputs.append(("", 0.0))
-                continue
-            img = _prep_image(crop)
-            res = _run_ocr_backend(ocr, img)
-            outputs.append(_pick_best_text_score(res))
+            images.append(_prep_image(crop))
+            valid_idx.append(i)
         except Exception:
-            outputs.append(("", 0.0))
+            continue
+    if not images:
+        return outputs
+
+    def fallback_per_crop() -> None:
+        for i, img_rgb in zip(valid_idx, images):
+            try:
+                res = _run_ocr_backend(ocr, img_rgb)
+                outputs[i] = _pick_best_text_score(res)
+            except Exception:
+                outputs[i] = ("", 0.0)
+
+    try:
+        if hasattr(ocr, "predict"):
+            raw = ocr.predict(images)
+        else:
+            fallback_per_crop()
+            return outputs
+        if not isinstance(raw, list):
+            raw = [raw]
+        if len(raw) != len(images):
+            fallback_per_crop()
+            return outputs
+        for slot, idx in enumerate(valid_idx):
+            outputs[idx] = _pick_best_text_score(raw[slot])
+    except Exception:
+        fallback_per_crop()
     return outputs
 
 
