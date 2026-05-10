@@ -70,6 +70,6 @@ Optional: **`YOLO_MICRO_BATCH_MAX_BUFFER`** — cap how many frames may be held 
 
 ## Related code
 
-- Pipeline: `worker-python/pipelines/test_pipeline.py` (`run_pipeline`, uniform `FRAME_SAMPLE_STRIDE`)
+- Pipeline: `worker-python/pipelines/test_pipeline.py` (`run_pipeline`, FPS-derived or overridden stride)
 - YOLO wrapper: `worker-python/models/yolo_detector.py`
 - Defaults: `worker-python/settings.py`

@@ -5,7 +5,7 @@ Local video pipeline configuration.
 **Single source of truth:** edit the literals in this file. The app does not read the OS
 environment for these values.
 
-**Inputs:** production feeds are expected at **10–60 FPS** (nominal container FPS). Values outside
+**Inputs:** production feeds are expected at **5–60 FPS** (nominal container FPS). Values outside
 that range still run but trigger a warning when opening the video (see ``run_pipeline``).
 """
 from pathlib import Path
@@ -18,7 +18,7 @@ VIDEO_PATH = f"{INPUTS_DIR}/Test.mp4"
 OUTPUT_VIDEO = f"{OUTPUTS_DIR}/annotated.mp4"
 
 # Expected nominal FPS range from inputs (warning only if ``cv2`` reports outside).
-INPUT_VIDEO_FPS_MIN = 10
+INPUT_VIDEO_FPS_MIN = 5
 INPUT_VIDEO_FPS_MAX = 60
 
 # --- Annotated output encoding (``pipelines.test_pipeline``) ---
@@ -69,10 +69,18 @@ OCR_MIN_VARIANCE_LAPLACIAN = 0.0  # >0 to skip very blurry crops (e.g. 30.0); 0 
 YOLO_MICRO_BATCH_SIZE = 8
 
 # --- Frame sampling (uniform stride) ---
-# Scene YOLO runs on decoded frames where ``frame_index % FRAME_SAMPLE_STRIDE == 0``.
+# Scene YOLO runs on decoded frames where ``frame_index % stride == 0``.
 # Other frames reuse the last sampled scene boxes (peeing carry, cached LP redraw).
-# With nominal FPS in [10, 60], stride ``N`` gives about ``FPS / N`` scene-YOLO samples per second.
-FRAME_SAMPLE_STRIDE = 3
+#
+# **Automatic stride (default):** target ``SCENE_YOLO_TARGET_FRAMES_PER_SECOND`` scene-YOLO runs
+# per **second of video time** (e.g. 10 FPS → stride 2 → five frames/sec; 60 FPS → stride 12 → five/sec).
+# ``stride = max(1, round(fps_for_stride / SCENE_YOLO_TARGET_FRAMES_PER_SECOND))`` where ``fps_for_stride``
+# is reported FPS clamped to ``[INPUT_VIDEO_FPS_MIN, INPUT_VIDEO_FPS_MAX]``.
+# When FPS does not divide evenly, the realized rate is approximate but stays near the target.
+#
+# **Override:** set ``FRAME_SAMPLE_STRIDE_OVERRIDE`` to an integer ≥ 1 to skip automatic stride.
+SCENE_YOLO_TARGET_FRAMES_PER_SECOND = 5
+FRAME_SAMPLE_STRIDE_OVERRIDE: int | None = None  # e.g. ``3`` for fixed stride; ``None`` = automatic
 
 # --- RF-DETR trash / cigarette (TensorRT engines only) ---
 TRASH_ENGINE_PATH = str(_w / "trash_fp16_tensorRT.engine")
@@ -102,23 +110,21 @@ LP_VEHICLE_LP_STRIDE = 3
 PIPELINE_READ_AHEAD_QUEUE_SIZE = 8
 PIPELINE_WRITE_QUEUE_SIZE = 8
 
-# --- Peeing heuristic (MediaPipe Pose on YOLO person crops; always on) ---
-PEEING_POSE_STRIDE = 2
+# --- Peeing heuristic (MediaPipe Pose Tasks on scene-YOLO person crops; stride-sampled) ---
+# Standing + wrist near mid-groin (normalized Y). Temporal rule uses **calendar seconds**:
+# ≥ ``PEEING_MIN_HITS_PER_SECOND`` pose hits among sampled frames in that second, repeated
+# ``PEEING_SECONDS_REQUIRED`` consecutive seconds → per-person confirmation (IoU tracking).
 PEEING_CROP_MARGIN = 0.12
 PEEING_MIN_VISIBILITY = 0.45
-PEEING_GROIN_DIST_MAX = 0.145
-PEEING_GROIN_LOOSE_FACTOR = 1.28
-PEEING_WRIST_BAND_MIN_VISIBILITY = 0.44
-PEEING_PELVIC_BAND_Y_ABOVE = -0.06
-PEEING_PELVIC_BAND_Y_BELOW = 0.17
-PEEING_STANDING_Y_MARGIN = 0.03
-PEEING_WINDOW_SEC = 5.0
-PEEING_POSE_MATCH_THRESHOLD = 0.6
-PEEING_ALARM_ENTER_HIT_FRACTION = 0.65
-PEEING_ALARM_EXIT_HIT_FRACTION = 0.45
-PEEING_ALARM_MIN_SAMPLES = 13
-PEEING_SQUAT_HIP_KNEE_GAP_MAX = 0.09
-PEEING_SQUAT_DEPTH_SCALE = 0.11
+PEEING_HAND_GROIN_Y_THRESHOLD = 0.1
+PEEING_SECONDS_REQUIRED = 6
+PEEING_MIN_HITS_PER_SECOND = 3
+PEEING_TRACK_IOU_THRESHOLD = 0.35
+PEEING_TRACK_MAX_MISSED_SECONDS = 3.0
+
+# Log average per-step pose latency at PeeingDetector shutdown (see worker logs).
+PEEING_DEBUG_TIMING = False
+
 PEEING_POSE_MODEL_PATH = str(
     Path.home() / ".cache" / "trash_detection_worker" / "pose_landmarker_lite.task"
 )

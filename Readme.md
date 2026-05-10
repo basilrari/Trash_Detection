@@ -6,11 +6,15 @@ This repository analyzes CCTV-style videos using computer-vision models. The lay
 
 ## What runs today
 
-The **Python** package under `worker-python/` streams a video, runs **scene YOLO** on a **uniform stride** (`FRAME_SAMPLE_STRIDE` in `settings.py` — every *N*th decoded frame, micro-batched with `YOLO_MICRO_BATCH_SIZE`), **RF-DETR** litter heads via **TensorRT** (paths from `TRASH_ENGINE_PATH` / `CIGARETTE_ENGINE_PATH` in `settings.py`), **license-plate YOLO** on vehicle crops, **PaddleOCR** on plate crops, and writes an **annotated MP4**.
+The **Python** package under `worker-python/` streams a video, runs **scene YOLO** on a **uniform stride**
+(stride is **automatic**: target **`SCENE_YOLO_TARGET_FRAMES_PER_SECOND`** scene-YOLO frames per **second of video**
+from reported FPS—see `settings.py`, unless **`FRAME_SAMPLE_STRIDE_OVERRIDE`** is set), micro-batched with `YOLO_MICRO_BATCH_SIZE`, **RF-DETR** litter heads via **TensorRT** (paths from `TRASH_ENGINE_PATH` / `CIGARETTE_ENGINE_PATH` in `settings.py`), **license-plate YOLO** on vehicle crops, **PaddleOCR** on plate crops, and writes an **annotated MP4**.
 
-Production inputs are expected at **10–60 FPS** (nominal container FPS). Values outside that range still run but **log a warning** when the file is opened.
+Production inputs are expected at **5–60 FPS** (nominal container FPS). Values outside that range still run but **log a warning** when the file is opened.
 
-Planned extensions (from the original design): pose/behavior, CSV export — not all are wired yet.
+Planned extensions (from the original design): CSV export and further behavior rules — not all are wired yet.
+
+**Peeing cue** (always on): **MediaPipe Pose (Tasks)** on **scene-YOLO person** crops, **stride-aligned** with scene YOLO (only `run_yolo` frames add temporal samples). Rule: standing + hand near groin; per tracked person, **≥ `PEEING_MIN_HITS_PER_SECOND`** pose hits in a **calendar second**, repeated **`PEEING_SECONDS_REQUIRED`** consecutive seconds → confirm. Tunables: `PEEING_*` in `settings.py` (IoU tracking, crop margin, pose model path). **Overlay:** boxes only on stride frames (no top banner). **`PEEING_DEBUG_TIMING`:** log average per-step MediaPipe time at the end of a run.
 
 ## Running
 
@@ -30,15 +34,21 @@ python worker.py inputs/myvideo.mp4 -o outputs/custom.mp4
 python worker.py --help
 ```
 
-### Scene YOLO sampling (`FRAME_SAMPLE_STRIDE`)
+### Scene YOLO stride (automatic + optional override)
 
-**Scene YOLO** runs only on decoded frames where `frame_index % FRAME_SAMPLE_STRIDE == 0`. Other frames reuse the **last sampled** scene boxes (peeing carry, cached plate redraw). **RF-DETR** runs on sampled frames that have person/vehicle activity at `YOLO_CONFIDENCE`. **LP/OCR** follow the same sampling rules as in `pipelines/test_pipeline.py`.
+**Scene YOLO** runs only on decoded frames where `frame_index % stride == 0`. The effective **stride** is:
+
+- **`FRAME_SAMPLE_STRIDE_OVERRIDE`** — if set to an integer ≥ **1**, that stride is used (fixed).
+- Otherwise **automatic:** `stride = max(1, round(fps_for_stride / SCENE_YOLO_TARGET_FRAMES_PER_SECOND))`, where **`fps_for_stride`** is the reported FPS **clamped** to **`[INPUT_VIDEO_FPS_MIN, INPUT_VIDEO_FPS_MAX]`**. Default **`SCENE_YOLO_TARGET_FRAMES_PER_SECOND = 5`** ⇒ at **10 FPS** stride **2** (every other frame); at **60 FPS** stride **12** (five scene-YOLO frames each second of video). Integer stride cannot hit exactly five for every FPS; the realized rate stays **near** the target.
+
+Approximate scene-YOLO frames per second of video ≈ **`fps_for_stride / stride`** (≈ **`SCENE_YOLO_TARGET_FRAMES_PER_SECOND`** when FPS divides cleanly). Other frames reuse the **last sampled** scene boxes. **RF-DETR** runs on sampled frames that have person/vehicle activity at `YOLO_CONFIDENCE`.
 
 | Setting | Meaning |
 |---------|--------|
-| **`FRAME_SAMPLE_STRIDE`** | Integer ≥ **1**. Scene YOLO on indices `0, N, 2N, …`. With nominal FPS in **[10, 60]**, stride `N` implies about **FPS/N** scene-YOLO evaluations per second. |
+| **`SCENE_YOLO_TARGET_FRAMES_PER_SECOND`** | Target scene-YOLO runs **per second of video** when stride is automatic (default **5**). |
+| **`FRAME_SAMPLE_STRIDE_OVERRIDE`** | **`None`** for automatic stride; or an integer ≥ **1** to force a fixed stride. |
 | **`YOLO_MICRO_BATCH_SIZE`** | Batched `detect()` calls: up to this many **sampled** frames per launch. |
-| **`INPUT_VIDEO_FPS_MIN`** / **`INPUT_VIDEO_FPS_MAX`** | **10** / **60** — expected nominal input FPS; **warning only** if OpenCV reports FPS outside this range. |
+| **`INPUT_VIDEO_FPS_MIN`** / **`INPUT_VIDEO_FPS_MAX`** | **5** / **60** — nominal FPS band; **warning** if OpenCV reports outside it; also used to **clamp** FPS for automatic stride. |
 
 Edit **`worker-python/settings.py`** — literals only; the app does **not** read these from the shell environment.
 

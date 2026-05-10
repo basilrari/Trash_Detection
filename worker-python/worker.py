@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Local video pipeline: YOLO (uniform ``FRAME_SAMPLE_STRIDE``) → RF-DETR trash → license plate → OCR → annotated MP4.
+Local video pipeline: scene YOLO (automatic stride from FPS, or optional fixed override in ``settings.py``)
+→ RF-DETR trash → license plate → OCR → annotated MP4.
 
 Examples (paths relative to worker-python/):
 
@@ -8,8 +9,9 @@ Examples (paths relative to worker-python/):
   python worker.py inputs/clip.mp4
   python worker.py inputs/clip.mp4 -o outputs/custom.mp4
 
-Scene YOLO sampling (``settings.py`` only — no CLI overrides): ``FRAME_SAMPLE_STRIDE`` runs scene YOLO on
-decoded frames where ``index % FRAME_SAMPLE_STRIDE == 0``. Inputs are expected at **10–60 FPS**
+Scene YOLO stride is configured in ``settings.py`` only (no CLI overrides): by default
+``SCENE_YOLO_TARGET_FRAMES_PER_SECOND`` (default **5**) and reported FPS determine stride—``stride ≈ fps/5``
+after FPS clamping—unless ``FRAME_SAMPLE_STRIDE_OVERRIDE`` is set to a fixed integer. Inputs are expected at **5–60 FPS**
 nominal; other FPS values still run but log a warning (see ``pipelines.test_pipeline``).
 
   If PyTorch reports ``no kernel image`` on a very new GPU (e.g. Blackwell) but another GPU works,

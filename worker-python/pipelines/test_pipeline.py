@@ -9,10 +9,11 @@ Run from worker-python/:
   python worker.py inputs/myvideo.mp4
   python -m pipelines.test_pipeline
 
-**Scheduling:** ``FRAME_SAMPLE_STRIDE`` in ``settings.py`` — scene YOLO only on frames where
-``frame_idx % FRAME_SAMPLE_STRIDE == 0``, micro-batched with ``YOLO_MICRO_BATCH_SIZE``.
+**Scheduling:** automatic stride targets ``SCENE_YOLO_TARGET_FRAMES_PER_SECOND`` scene-YOLO frames
+per **second of video** (FPS clamped for the formula), unless ``FRAME_SAMPLE_STRIDE_OVERRIDE`` is set.
+Scene YOLO only on frames where ``frame_idx % stride == 0``, micro-batched with ``YOLO_MICRO_BATCH_SIZE``.
 Skipped frames reuse carried scene boxes for peeing and cached plate redraw.
-Production inputs are expected at **10–60 FPS** nominal (warning if the container reports otherwise).
+Production inputs are expected at **5–60 FPS** nominal (warning if the container reports otherwise).
 
 **Output video** — ``OUTPUT_VIDEO_ENCODER`` in ``settings.py`` (``auto``, ``nvenc``, ``mp4v``).
 """
@@ -49,7 +50,8 @@ from settings import (
     ANNOTATOR_SMART_POSITION,
     CIGARETTE_ENGINE_PATH,
     FFMPEG_PATH,
-    FRAME_SAMPLE_STRIDE,
+    FRAME_SAMPLE_STRIDE_OVERRIDE,
+    SCENE_YOLO_TARGET_FRAMES_PER_SECOND,
     INPUT_VIDEO_FPS_MAX,
     INPUT_VIDEO_FPS_MIN,
     LP_BATCH_ENABLED,
@@ -69,24 +71,16 @@ from settings import (
     OCR_STABLE_OBSERVATIONS,
     OUTPUT_VIDEO,
     OUTPUT_VIDEO_ENCODER,
-    PEEING_ALARM_ENTER_HIT_FRACTION,
-    PEEING_ALARM_EXIT_HIT_FRACTION,
-    PEEING_ALARM_MIN_SAMPLES,
     PEEING_CROP_MARGIN,
-    PEEING_GROIN_DIST_MAX,
-    PEEING_GROIN_LOOSE_FACTOR,
+    PEEING_DEBUG_TIMING,
+    PEEING_HAND_GROIN_Y_THRESHOLD,
+    PEEING_MIN_HITS_PER_SECOND,
     PEEING_MIN_VISIBILITY,
-    PEEING_PELVIC_BAND_Y_ABOVE,
-    PEEING_PELVIC_BAND_Y_BELOW,
-    PEEING_POSE_MATCH_THRESHOLD,
     PEEING_POSE_MODEL_PATH,
     PEEING_POSE_MODEL_URL,
-    PEEING_POSE_STRIDE,
-    PEEING_SQUAT_DEPTH_SCALE,
-    PEEING_SQUAT_HIP_KNEE_GAP_MAX,
-    PEEING_STANDING_Y_MARGIN,
-    PEEING_WINDOW_SEC,
-    PEEING_WRIST_BAND_MIN_VISIBILITY,
+    PEEING_SECONDS_REQUIRED,
+    PEEING_TRACK_IOU_THRESHOLD,
+    PEEING_TRACK_MAX_MISSED_SECONDS,
     PIPELINE_READ_AHEAD_QUEUE_SIZE,
     PIPELINE_WRITE_QUEUE_SIZE,
     PLATE_CONFIDENCE,
@@ -175,9 +169,24 @@ def _log_model_ready(title: str, detail: str) -> None:
     console.print(f"  [green]OK[/] [bold]{title}[/]  [dim]— {detail}[/]")
 
 
-def _parse_frame_sample_stride() -> int:
-    """Decoded-frame stride for scene YOLO (minimum 1)."""
-    return max(1, int(FRAME_SAMPLE_STRIDE))
+def _resolve_frame_sample_stride(fps: float) -> tuple[int, str]:
+    """Pick decoded-frame stride: optional fixed override, else ~``fps/target`` frames sampled per second."""
+    if FRAME_SAMPLE_STRIDE_OVERRIDE is not None:
+        n = max(1, int(FRAME_SAMPLE_STRIDE_OVERRIDE))
+        return n, f"fixed ``FRAME_SAMPLE_STRIDE_OVERRIDE={n}``"
+    target = float(SCENE_YOLO_TARGET_FRAMES_PER_SECOND)
+    if target <= 0:
+        target = 5.0
+    lo = float(INPUT_VIDEO_FPS_MIN)
+    hi = float(INPUT_VIDEO_FPS_MAX)
+    fps_clamped = min(max(float(fps), lo), hi)
+    n = max(1, int(round(fps_clamped / target)))
+    approx_per_sec = fps_clamped / float(n)
+    return n, (
+        f"automatic: reported FPS={fps:.3f}; clamp [{lo:.0f},{hi:.0f}] → {fps_clamped:.2f}; "
+        f"``SCENE_YOLO_TARGET_FRAMES_PER_SECOND={target:g}`` → stride={n} "
+        f"(~{approx_per_sec:.2f} scene-YOLO frames/s of video)"
+    )
 
 
 def _log_pipeline_run_configuration(
@@ -191,6 +200,7 @@ def _log_pipeline_run_configuration(
     sink_label: str,
     trash: TrashDetector,
     frame_stride: int,
+    stride_detail: str,
 ) -> None:
     """TRT layout, thresholds, encoder, and RF-DETR flags (from ``settings``)."""
     te = Path(TRASH_ENGINE_PATH).resolve()
@@ -217,11 +227,12 @@ def _log_pipeline_run_configuration(
         "(warning only if container FPS is outside)"
     )
     console.print(
-        f"  Gate   [bold]FRAME_SAMPLE_STRIDE={frame_stride}[/]  uniform scene-YOLO every {frame_stride} decoded "
+        f"  Gate   [bold]effective stride={frame_stride}[/]  uniform scene-YOLO every {frame_stride} decoded "
         f"frame(s); read windows ≤{win} frames; ``YOLO_MICRO_BATCH_SIZE={ymb}`` batches sampled frames per "
         f"``detect()``; non-sampled frames reuse last scene boxes; RF-DETR only when scene activity "
         f"≥{YOLO_CONFIDENCE} on a sampled frame"
     )
+    console.print(f"         [dim]{stride_detail}[/]")
     console.print(
         f"  Conf   YOLO={YOLO_CONFIDENCE}  trash_RF={TRASH_CONFIDENCE}  plate={PLATE_CONFIDENCE}"
     )
@@ -1480,59 +1491,18 @@ def _annotate_yolo_lp_ocr(
     times.annotate_draw_sec += time.perf_counter() - t_plate
 
 
-def _draw_peeing_overlay(
-    frame: np.ndarray,
-    state: PeeingState,
-    *,
-    text_scale: float,
-    text_thickness: int,
-) -> None:
-    """Top-left single line: algorithmic status (not human verification)."""
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = float(max(0.22, min(0.95, text_scale)))
-    thick = max(1, min(3, int(round(text_thickness * 0.55))))
-
-    tier = state.status
-    tier_word = {"confirmed": "CONFIRMED", "suspected": "SUSPECTED"}.get(
-        tier, "SUSPECTED"
-    )
-    text = f"PEEING {tier_word}  |  window {state.score:.0%}  (auto)"
-    colors = {
-        "confirmed": ((50, 255, 255), (0, 0, 0)),
-        "suspected": ((60, 180, 255), (0, 0, 0)),
-    }
-    fill, outline = colors.get(tier, colors["suspected"])
-
-    (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
-    pad_x, pad_y = 8, 6
-    ox = 10
-    top = 8
-    baseline = top + pad_y + th
-    left = ox - pad_x
-    right = ox + tw + pad_x
-    box_top = top
-    box_bottom = int(baseline + bl + pad_y)
-
-    roi = frame[box_top : box_bottom + 1, left : right + 1]
-    if roi.size == 0:
+def _draw_peeing_overlay(frame: np.ndarray, state: PeeingState) -> None:
+    """Bounding boxes only; drawn on stride/inference frames only (blinks like scene-YOLO cadence)."""
+    if not state.sampled:
         return
-    overlay = np.zeros_like(roi)
-    cv2.rectangle(overlay, (0, 0), (roi.shape[1] - 1, roi.shape[0] - 1), (24, 24, 24), -1)
-    cv2.addWeighted(overlay, 0.78, roi, 0.22, 0, roi)
-    cv2.rectangle(frame, (left, box_top), (right, box_bottom), (80, 80, 80), 1)
-
-    for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-        cv2.putText(
-            frame,
-            text,
-            (ox + dx, baseline + dy),
-            font,
-            scale,
-            outline,
-            thick + 1,
-            cv2.LINE_AA,
-        )
-    cv2.putText(frame, text, (ox, baseline), font, scale, fill, thick, cv2.LINE_AA)
+    for x1, y1, x2, y2 in state.mark_bboxes:
+        p1 = (int(round(x1)), int(round(y1)))
+        p2 = (int(round(x2)), int(round(y2)))
+        cv2.rectangle(frame, p1, p2, (40, 40, 255), 2)
+    for x1, y1, x2, y2 in state.mark_bboxes_suspected:
+        p1 = (int(round(x1)), int(round(y1)))
+        p2 = (int(round(x2)), int(round(y2)))
+        cv2.rectangle(frame, p1, p2, (0, 200, 255), 2)
 
 
 def _annotate_frame(
@@ -1575,12 +1545,7 @@ def _annotate_frame(
             times=times,
         )
     t0 = time.perf_counter()
-    _draw_peeing_overlay(
-        frame,
-        peeing_state,
-        text_scale=annots.label_text_scale,
-        text_thickness=annots.label_text_thickness,
-    )
+    _draw_peeing_overlay(frame, peeing_state)
     times.annotate_draw_sec += time.perf_counter() - t0
 
 
@@ -1625,7 +1590,7 @@ def _run_pipeline_uniform_stride_batched(
     ymb = max(1, int(YOLO_MICRO_BATCH_SIZE))
     window_size = max(stride * ymb, ymb)
 
-    pbar = tqdm(total=total_frames, desc=f"Processing video (FRAME_SAMPLE_STRIDE={stride})")
+    pbar = tqdm(total=total_frames, desc=f"Processing video (stride={stride})")
     frame_idx = 0
     emit_idx = 0
     stash: dict[int, tuple[np.ndarray, List[Detection], List[Detection], PeeingState]] = {}
@@ -1806,7 +1771,6 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     """Process ``video_path`` and write annotated video to ``output_video``."""
     wall_start = time.perf_counter()
     times = PipelineStepTimes()
-    stride_n = _parse_frame_sample_stride()
 
     if not os.path.exists(video_path):
         console.print(f"[red]Video not found:[/] {video_path}")
@@ -1860,8 +1824,10 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     if fps < float(INPUT_VIDEO_FPS_MIN) or fps > float(INPUT_VIDEO_FPS_MAX):
         console.print(
             f"[yellow]Warning:[/] reported FPS {fps:.2f} is outside the nominal input range "
-            f"[{INPUT_VIDEO_FPS_MIN}, {INPUT_VIDEO_FPS_MAX}] — timing and stride semantics assume 10–60 fps."
+            f"[{INPUT_VIDEO_FPS_MIN}, {INPUT_VIDEO_FPS_MAX}] — timing/stride math assumes {INPUT_VIDEO_FPS_MIN}–{INPUT_VIDEO_FPS_MAX} fps."
         )
+
+    stride_n, stride_detail = _resolve_frame_sample_stride(fps)
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
@@ -1874,24 +1840,16 @@ def run_pipeline(video_path: str, output_video: str) -> None:
 
     try:
         peeing = PeeingDetector(
-            pose_stride=PEEING_POSE_STRIDE,
             crop_margin=PEEING_CROP_MARGIN,
             min_visibility=PEEING_MIN_VISIBILITY,
-            groin_dist_max=PEEING_GROIN_DIST_MAX,
-            groin_loose_factor=PEEING_GROIN_LOOSE_FACTOR,
-            wrist_band_min_visibility=PEEING_WRIST_BAND_MIN_VISIBILITY,
-            pelvic_band_y_above=PEEING_PELVIC_BAND_Y_ABOVE,
-            pelvic_band_y_below=PEEING_PELVIC_BAND_Y_BELOW,
-            standing_y_margin=PEEING_STANDING_Y_MARGIN,
-            window_sec=PEEING_WINDOW_SEC,
-            pose_match_threshold=PEEING_POSE_MATCH_THRESHOLD,
-            alarm_enter_hit_fraction=PEEING_ALARM_ENTER_HIT_FRACTION,
-            alarm_exit_hit_fraction=PEEING_ALARM_EXIT_HIT_FRACTION,
-            alarm_min_samples=PEEING_ALARM_MIN_SAMPLES,
-            squat_hip_knee_gap_max=PEEING_SQUAT_HIP_KNEE_GAP_MAX,
-            squat_depth_scale=PEEING_SQUAT_DEPTH_SCALE,
+            hand_groin_y_threshold=PEEING_HAND_GROIN_Y_THRESHOLD,
+            min_hits_per_second=PEEING_MIN_HITS_PER_SECOND,
+            seconds_required=PEEING_SECONDS_REQUIRED,
+            track_iou_threshold=PEEING_TRACK_IOU_THRESHOLD,
+            track_max_missed_seconds=PEEING_TRACK_MAX_MISSED_SECONDS,
             model_path=PEEING_POSE_MODEL_PATH,
             model_url=PEEING_POSE_MODEL_URL,
+            debug_timing=PEEING_DEBUG_TIMING,
         )
     except Exception as exc:
         console.print(
@@ -1905,10 +1863,9 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         f"MediaPipe pose [dim]{Path(PEEING_POSE_MODEL_PATH).expanduser().resolve()}[/]",
     )
     console.print(
-        "[dim]Peeing hint:[/] standing + squat cues; straddle penalty; "
-        f"alarm: last {PEEING_WINDOW_SEC:.0f}s of pose hits (score ≥{PEEING_POSE_MATCH_THRESHOLD:.0%}); "
-        f"arm when >{PEEING_ALARM_ENTER_HIT_FRACTION:.0%} hits with ≥{PEEING_ALARM_MIN_SAMPLES} samples, "
-        f"disarm when <{PEEING_ALARM_EXIT_HIT_FRACTION:.0%} (no per-person IDs)."
+        "[dim]Peeing hint:[/] standing + hand near groin (MediaPipe Tasks); "
+        f"≥{PEEING_MIN_HITS_PER_SECOND} sampled pose hits per calendar second for "
+        f"{PEEING_SECONDS_REQUIRED} consecutive seconds; IoU person tracks."
     )
 
     annots = _make_frame_annotators(width, height)
@@ -1950,6 +1907,7 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         sink_label=sink_label,
         trash=trash,
         frame_stride=stride_n,
+        stride_detail=stride_detail,
     )
     times.other_sec += time.perf_counter() - t_io
 
