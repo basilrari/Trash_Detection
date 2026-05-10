@@ -122,7 +122,7 @@ PEEING_MIN_HITS_PER_SECOND = 3
 PEEING_TRACK_IOU_THRESHOLD = 0.35
 PEEING_TRACK_MAX_MISSED_SECONDS = 3.0
 
-# Log average per-step pose latency at PeeingDetector shutdown (see worker logs).
+# Log average per-step pose latency at PeeingDetector shutdown (prints to stderr; does not rely on logging config).
 PEEING_DEBUG_TIMING = False
 
 PEEING_POSE_MODEL_PATH = str(

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -166,21 +167,7 @@ class PeeingDetector:
         self._had_any_confirmed = False
 
     def close(self) -> None:
-        if self._debug_timing and self._timing_n > 0:
-            n = float(self._timing_n)
-            ms = {k: 1000.0 * v / n for k, v in self._timing_sums.items()}
-            total_ms = sum(ms.values())
-            logger.info(
-                "Peeing MediaPipe pose timing (avg ms over %d crops): "
-                "bgr_to_rgb+contiguous=%.2f  mp_Image()=%.2f  detect()=%.2f  "
-                "standing_groin_heuristic=%.2f  sum=%.2f",
-                self._timing_n,
-                ms["to_rgb"],
-                ms["wrap_image"],
-                ms["detect"],
-                ms["heuristic"],
-                total_ms,
-            )
+        self._emit_debug_timing_report()
         # Finalize partial calendar-second buckets (EOF may land mid-second).
         for tr in list(self._tracks):
             if tr.bucket_sec is not None:
@@ -200,6 +187,31 @@ class PeeingDetector:
         self._timing_n = 0
         for k in self._timing_sums:
             self._timing_sums[k] = 0.0
+
+    def _emit_debug_timing_report(self) -> None:
+        """Print timing to stderr when enabled — avoids reliance on logging.basicConfig (INFO is dropped by default)."""
+        if not self._debug_timing:
+            return
+        if self._timing_n <= 0:
+            print(
+                "[peeing] PEEING_DEBUG_TIMING: no pose crops recorded — "
+                "no person boxes past YOLO_CONFIDENCE on sampled frames, "
+                "or every crop was smaller than min_crop_side after padding.",
+                file=sys.stderr,
+            )
+            return
+        n = float(self._timing_n)
+        ms = {k: 1000.0 * v / n for k, v in self._timing_sums.items()}
+        total_ms = sum(ms.values())
+        msg = (
+            f"[peeing] MediaPipe pose timing (avg ms over {self._timing_n} crops): "
+            f"bgr_to_rgb+contiguous={ms['to_rgb']:.2f}  "
+            f"mp_Image()={ms['wrap_image']:.2f}  "
+            f"detect()={ms['detect']:.2f}  "
+            f"standing_groin_heuristic={ms['heuristic']:.2f}  "
+            f"sum={total_ms:.2f}"
+        )
+        print(msg, file=sys.stderr)
 
     def _person_detections(
         self, detections: Sequence[Detection], yolo_conf: float

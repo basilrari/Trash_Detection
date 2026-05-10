@@ -14,7 +14,7 @@ Production inputs are expected at **5–60 FPS** (nominal container FPS). Values
 
 Planned extensions (from the original design): CSV export and further behavior rules — not all are wired yet.
 
-**Peeing cue** (always on): **MediaPipe Pose (Tasks)** on **scene-YOLO person** crops, **stride-aligned** with scene YOLO (only `run_yolo` frames add temporal samples). Rule: standing + hand near groin; per tracked person, **≥ `PEEING_MIN_HITS_PER_SECOND`** pose hits in a **calendar second**, repeated **`PEEING_SECONDS_REQUIRED`** consecutive seconds → confirm. Tunables: `PEEING_*` in `settings.py` (IoU tracking, crop margin, pose model path). **Overlay:** boxes only on stride frames (no top banner). **`PEEING_DEBUG_TIMING`:** log average per-step MediaPipe time at the end of a run.
+**Peeing cue** (always on): **MediaPipe Pose (Tasks)** on **scene-YOLO person** crops, **stride-aligned** with scene YOLO (only `run_yolo` frames add temporal samples). Rule: standing + hand near groin; per tracked person, **≥ `PEEING_MIN_HITS_PER_SECOND`** pose hits in a **calendar second**, repeated **`PEEING_SECONDS_REQUIRED`** consecutive seconds → confirm. Tunables: `PEEING_*` in `settings.py` (IoU tracking, crop margin, pose model path). **Overlay:** boxes only on stride frames (no top banner). **`PEEING_DEBUG_TIMING`:** prints per-step MediaPipe averages to **stderr** when the detector closes (no extra logging configuration required).
 
 ## Running
 
