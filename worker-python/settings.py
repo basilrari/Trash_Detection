@@ -117,14 +117,14 @@ PIPELINE_WRITE_QUEUE_SIZE = 8
 PEEING_CROP_MARGIN = 0.12
 PEEING_MIN_VISIBILITY = 0.45
 PEEING_HAND_GROIN_Y_THRESHOLD = 0.1
-PEEING_SECONDS_REQUIRED = 6
+PEEING_SECONDS_REQUIRED = 10
 PEEING_MIN_HITS_PER_SECOND = 3
 PEEING_TRACK_IOU_THRESHOLD = 0.35
 PEEING_TRACK_MAX_MISSED_SECONDS = 3.0
 
 # MediaPipe Tasks backend: ``image`` (single ``detect()`` per crop) or ``video``
 # (one ``PoseLandmarker`` per IoU track, ``detect_for_video()`` — may reduce work when tracking is stable).
-PEEING_MEDIAPIPE_MODE: str = "image"  # ``image`` | ``video``
+PEEING_MEDIAPIPE_MODE: str = "video"  # ``image`` | ``video``
 
 # Limit expensive pose crops per sampled frame (after sorting by YOLO confidence). ``None`` = no limit.
 PEEING_MAX_POSE_PERSONS_PER_FRAME: int | None = None
@@ -133,7 +133,7 @@ PEEING_MAX_POSE_PERSONS_PER_FRAME: int | None = None
 PEEING_MIN_PERSON_BOX_HEIGHT_PX = 0.0
 
 # Log average per-step pose latency + call counters at PeeingDetector shutdown (stderr).
-PEEING_DEBUG_TIMING = False
+PEEING_DEBUG_TIMING = True
 
 PEEING_POSE_MODEL_PATH = str(
     Path.home() / ".cache" / "trash_detection_worker" / "pose_landmarker_lite.task"

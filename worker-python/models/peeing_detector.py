@@ -123,7 +123,7 @@ class PeeingDetector:
         min_visibility: float = 0.45,
         hand_groin_y_threshold: float = 0.1,
         min_hits_per_second: int = 3,
-        seconds_required: int = 6,
+        seconds_required: int = 10,
         track_iou_threshold: float = 0.35,
         track_max_missed_seconds: float = 3.0,
         min_crop_side: int = 48,
