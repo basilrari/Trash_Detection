@@ -1,7 +1,7 @@
 # worker-python/models/base.py
 from abc import ABC, abstractmethod
 from typing import List, Tuple
-from core.types import FrameData, Detection, LicensePlate, PoseResult
+from models.types import FrameData, Detection, LicensePlate, PoseResult
 
 class Detector(ABC):
     @abstractmethod

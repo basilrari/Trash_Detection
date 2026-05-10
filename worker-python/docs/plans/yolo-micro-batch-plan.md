@@ -70,7 +70,6 @@ Optional: **`YOLO_MICRO_BATCH_MAX_BUFFER`** — cap how many frames may be held 
 
 ## Related code
 
-- Gate: `worker-python/core/yolo_stride_gate.py`
-- Gated pipeline: `worker-python/pipelines/test_pipeline.py` (`_run_pipeline_yolo_gated`)
+- Pipeline: `worker-python/pipelines/test_pipeline.py` (`run_pipeline`, uniform `FRAME_SAMPLE_STRIDE`)
 - YOLO wrapper: `worker-python/models/yolo_detector.py`
 - Defaults: `worker-python/settings.py`

@@ -6,7 +6,7 @@ from ultralytics import YOLO
 
 from models.base import Detector
 from models.ultralytics_call_stats import UltralyticsCallStats
-from core.types import FrameData, Detection
+from models.types import FrameData, Detection
 
 
 def _worker_root() -> Path:
@@ -24,13 +24,11 @@ def _resolve_path(p: str | Path) -> Path:
 
 
 class YoloDetector(Detector):
-    """Scene YOLO: PyTorch ``.pt`` or TensorRT ``.engine`` (see ``settings.YOLO_RUNTIME``)."""
+    """Scene YOLO via TensorRT ``.engine`` (Ultralytics ``YOLO`` wrapper)."""
 
-    def __init__(self, weights_path: str | None = None, conf_threshold: float = 0.5):
+    def __init__(self, *, engine_path: str | None = None, conf_threshold: float = 0.5):
         from settings import (
             YOLO_ENGINE_PATH,
-            YOLO_MODEL_PATH,
-            YOLO_RUNTIME,
             YOLO_TRT_BATCH_SIZE,
             YOLO_TRT_DYNAMIC,
             YOLO_TRT_IMAGE_SIZE,
@@ -38,30 +36,16 @@ class YoloDetector(Detector):
 
         self.conf_threshold = conf_threshold
         self.classes = [0, 2, 3, 5, 7]
-        mode = str(YOLO_RUNTIME).strip().lower()
-
-        if mode in ("pt", "pytorch", "ultralytics", ".pt"):
-            wp = weights_path or YOLO_MODEL_PATH
-            w = _resolve_path(wp)
-            if not w.is_file():
-                raise FileNotFoundError(f"Scene YOLO weights not found: {w}")
-            self.model = YOLO(str(w))
-            self._use_engine = False
-            self._imgsz = 0
-            self._trt_batch = 1
-            self._dynamic = True
-        else:
-            self._imgsz = int(YOLO_TRT_IMAGE_SIZE)
-            self._trt_batch = max(1, int(YOLO_TRT_BATCH_SIZE))
-            self._dynamic = bool(YOLO_TRT_DYNAMIC)
-            eng = _resolve_path(YOLO_ENGINE_PATH)
-            if not eng.is_file():
-                raise FileNotFoundError(
-                    f"Scene YOLO TensorRT engine not found: {eng}\n"
-                    "Set YOLO_ENGINE_PATH or use YOLO_RUNTIME=\"pt\" with YOLO_MODEL_PATH."
-                )
-            self.model = YOLO(str(eng))
-            self._use_engine = True
+        self._imgsz = int(YOLO_TRT_IMAGE_SIZE)
+        self._trt_batch = max(1, int(YOLO_TRT_BATCH_SIZE))
+        self._dynamic = bool(YOLO_TRT_DYNAMIC)
+        eng = _resolve_path(engine_path or YOLO_ENGINE_PATH)
+        if not eng.is_file():
+            raise FileNotFoundError(
+                f"Scene YOLO TensorRT engine not found: {eng}\n"
+                "Set YOLO_ENGINE_PATH in settings.py."
+            )
+        self.model = YOLO(str(eng))
 
         self._call_stats_in = 0
         self._call_stats_launches = 0
@@ -88,17 +72,6 @@ class YoloDetector(Detector):
 
         images = [f.image for f in frames]
         self._call_stats_in += len(images)
-
-        if not self._use_engine:
-            self._call_stats_launches += 1
-            results = self.model(
-                images,
-                classes=self.classes,
-                conf=self.conf_threshold,
-            )
-            if not isinstance(results, list):
-                results = list(results)
-            return self._results_to_detections(results)
 
         B = self._trt_batch
         out_all: List[List[Detection]] = []

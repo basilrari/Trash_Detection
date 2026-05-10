@@ -29,7 +29,7 @@ import supervision as sv
 import torch
 import torch.nn.functional as F
 
-from core.types import Detection, FrameData
+from models.types import Detection, FrameData
 from models.base import TrashDetector
 from models.trash_detector import _sv_to_detections
 

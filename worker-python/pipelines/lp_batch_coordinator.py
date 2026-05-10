@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from core.types import FrameData
+from models.types import FrameData
 
 
 @dataclass(frozen=True)

@@ -1,25 +1,20 @@
 #!/usr/bin/env python3
 """
 YOLO → RF-DETR trash → LP → OCR on a local video; writes an annotated MP4.
-LP and OCR are **batched per frame** across all vehicle crops (fewer small GPU calls).
-Labels only (no bounding boxes) for trash, YOLO, and plates; YOLO is person + road vehicles.
+LP and OCR are batched; labels only (no bounding boxes). Scene YOLO is **person + road vehicles**.
 
-Run from worker-python/ (put source videos in inputs/, results under outputs/ by default):
+Run from worker-python/:
 
   python worker.py
   python worker.py inputs/myvideo.mp4
-  python worker.py inputs/myvideo.mp4 -o outputs/custom.mp4
-  python -m pipelines.test_pipeline   # uses paths from settings.py
+  python -m pipelines.test_pipeline
 
-Gating (``settings.GATE_MODE`` only — edit ``settings.py``):
-  ``off`` — time-chunk path (YOLO on every frame, sub-batched). ``yolo`` — coarse/dense stride gate
-  (``core/yolo_stride_gate.py``). ``1``, ``2``, ``3``, … — uniform stride: scene YOLO only on
-  ``frame_idx %% N == 0``, batched with ``YOLO_MICRO_BATCH_SIZE`` inside read windows of
-  ``N * YOLO_MICRO_BATCH_SIZE`` frames; skipped frames reuse the last scene boxes for LP;
-  RF-DETR runs only on sampled frames that have person/vehicle (same as the ``yolo`` path).
+**Scheduling:** ``FRAME_SAMPLE_STRIDE`` in ``settings.py`` — scene YOLO only on frames where
+``frame_idx % FRAME_SAMPLE_STRIDE == 0``, micro-batched with ``YOLO_MICRO_BATCH_SIZE``.
+Skipped frames reuse carried scene boxes for peeing and cached plate redraw.
+Production inputs are expected at **10–60 FPS** nominal (warning if the container reports otherwise).
 
-**Output video** — set ``OUTPUT_VIDEO_ENCODER`` in ``settings.py`` (``auto``, ``nvenc``, ``mp4v``). Tune
-``NVENC_PRESET`` / ``NVENC_CQ`` there as well.
+**Output video** — ``OUTPUT_VIDEO_ENCODER`` in ``settings.py`` (``auto``, ``nvenc``, ``mp4v``).
 """
 
 from __future__ import annotations
@@ -48,23 +43,21 @@ from models.lp_detector import LpDetector
 from models.ocr import Ocr
 from models.peeing_detector import PeeingDetector, PeeingState
 from models.rfdetr_trt_trash import _trt_timing_enabled
-from core.types import Detection, FrameData, LicensePlate
-from core.yolo_stride_gate import YoloStrideGate, YoloStrideGateConfig
+from models.types import Detection, FrameData, LicensePlate
 from pipelines.lp_batch_coordinator import LpBatchCoordinator, LpQueuedCrop
 from settings import (
     ANNOTATOR_SMART_POSITION,
-    CHUNK_SECONDS,
     CIGARETTE_ENGINE_PATH,
     FFMPEG_PATH,
-    GATE_MODE,
+    FRAME_SAMPLE_STRIDE,
+    INPUT_VIDEO_FPS_MAX,
+    INPUT_VIDEO_FPS_MIN,
     LP_BATCH_ENABLED,
     LP_BATCH_MAX_CROPS,
     LP_BATCH_MAX_LATENCY_FRAMES,
     LP_CONFIDENCE,
     LP_ENGINE_PATH,
     LP_LOCK_REFRESH_STRIDE,
-    LP_MODEL_PATH,
-    LP_RUNTIME,
     LP_TRT_BATCH_SIZE,
     LP_TRT_DYNAMIC,
     LP_TRT_IMAGE_SIZE,
@@ -76,12 +69,12 @@ from settings import (
     OCR_STABLE_OBSERVATIONS,
     OUTPUT_VIDEO,
     OUTPUT_VIDEO_ENCODER,
-    PEEING_CROP_MARGIN,
-    PEEING_GROIN_DIST_MAX,
-    PEEING_GROIN_LOOSE_FACTOR,
     PEEING_ALARM_ENTER_HIT_FRACTION,
     PEEING_ALARM_EXIT_HIT_FRACTION,
     PEEING_ALARM_MIN_SAMPLES,
+    PEEING_CROP_MARGIN,
+    PEEING_GROIN_DIST_MAX,
+    PEEING_GROIN_LOOSE_FACTOR,
     PEEING_MIN_VISIBILITY,
     PEEING_PELVIC_BAND_Y_ABOVE,
     PEEING_PELVIC_BAND_Y_BELOW,
@@ -104,33 +97,15 @@ from settings import (
     TRASH_CONFIDENCE,
     TRASH_ENGINE_PATH,
     VIDEO_PATH,
-    YOLO_COARSE_STRIDE,
     YOLO_CONFIDENCE,
     YOLO_ENGINE_PATH,
-    YOLO_MODEL_PATH,
-    YOLO_DENSE_STRIDE,
-    YOLO_DENSE_IDLE_MISS_STREAK,
     YOLO_MICRO_BATCH_SIZE,
-    YOLO_RUNTIME,
     YOLO_TRT_BATCH_SIZE,
     YOLO_TRT_DYNAMIC,
     YOLO_TRT_IMAGE_SIZE,
 )
 
 console = Console()
-
-
-def _worker_python_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def _settings_asset_path(p: str) -> Path:
-    """Resolve a path from ``settings`` (relative to ``worker-python/`` or absolute)."""
-    pp = Path(p)
-    if pp.is_file():
-        return pp
-    cand = _worker_python_root() / p
-    return cand if cand.is_file() else pp
 
 
 def _ensure_pytorch_cuda_kernels_work() -> None:
@@ -200,36 +175,24 @@ def _log_model_ready(title: str, detail: str) -> None:
     console.print(f"  [green]OK[/] [bold]{title}[/]  [dim]— {detail}[/]")
 
 
-def _parse_gate_mode_value(raw: str) -> tuple[str, int | None]:
-    """Return ``("off", None)``, ``("yolo", None)``, or ``("stride", N)`` for numeric ``GATE_MODE``."""
-    g = str(raw).strip().lower()
-    if g == "off":
-        return "off", None
-    if g == "yolo":
-        return "yolo", None
-    if g.isdigit():
-        n = int(g)
-        if n < 1:
-            return "yolo", None
-        return "stride", n
-    return "yolo", None
+def _parse_frame_sample_stride() -> int:
+    """Decoded-frame stride for scene YOLO (minimum 1)."""
+    return max(1, int(FRAME_SAMPLE_STRIDE))
 
 
 def _log_pipeline_run_configuration(
     *,
-    mode: str,
     video_path: str,
     width: int,
     height: int,
     fps: float,
     total_frames: int,
-    chunk_frames: int,
     output_video: str,
     sink_label: str,
     trash: TrashDetector,
-    uniform_stride: int | None = None,
+    frame_stride: int,
 ) -> None:
-    """Gates, thresholds, TRT layout, preprocess, encoder, and RF-DETR flags (from ``settings``)."""
+    """TRT layout, thresholds, encoder, and RF-DETR flags (from ``settings``)."""
     te = Path(TRASH_ENGINE_PATH).resolve()
     ce = Path(CIGARETTE_ENGINE_PATH).resolve()
     rf_pre = "unknown"
@@ -245,27 +208,20 @@ def _log_pipeline_run_configuration(
         b0, b1, b2 = (getattr(w0, "batch", "?"), getattr(w0, "height", "?"), getattr(w0, "width", "?"))
     trt_pre_disp = repr(RF_DETR_PREPROCESS_CUDA)
     trt_tim_disp = repr(RF_DETR_TRT_TIMING)
+    ymb = max(1, int(YOLO_MICRO_BATCH_SIZE))
+    win = max(frame_stride * ymb, ymb)
     console.print("[bold]Run configuration[/]")
     console.print(f"  Video  [dim]{video_path}[/]  →  {width}×{height} @ {fps:.3f} fps, {total_frames} frames")
-    if mode == "yolo":
-        console.print(
-            f"  Gate   [bold]GATE_MODE=yolo[/]  coarse={YOLO_COARSE_STRIDE}  dense={YOLO_DENSE_STRIDE}  "
-            f"dense_idle_miss={YOLO_DENSE_IDLE_MISS_STREAK}  "
-            f"RF-DETR only on YOLO frames with person/vehicle ≥{YOLO_CONFIDENCE}"
-        )
-    elif mode == "stride" and uniform_stride is not None:
-        console.print(
-            f"  Gate   [bold]GATE_MODE={uniform_stride}[/]  uniform scene-YOLO stride (every {uniform_stride} frame(s)); "
-            f"read windows ≤{uniform_stride * max(1, int(YOLO_MICRO_BATCH_SIZE))} frames; "
-            f"``YOLO_MICRO_BATCH_SIZE={YOLO_MICRO_BATCH_SIZE}`` batches sampled frames per ``detect()``; "
-            f"non-sampled frames reuse last scene boxes; RF-DETR only when scene activity ≥{YOLO_CONFIDENCE} "
-            f"on a sampled frame (same as ``yolo`` gate path)"
-        )
-    else:
-        console.print(
-            f"  Gate   [bold]GATE_MODE=off[/]  CHUNK_SECONDS={CHUNK_SECONDS}  →  {chunk_frames} frames/chunk  "
-            f"RF-DETR only on chunk frames with person/vehicle ≥{YOLO_CONFIDENCE}"
-        )
+    console.print(
+        f"  Input    nominal FPS [{INPUT_VIDEO_FPS_MIN}, {INPUT_VIDEO_FPS_MAX}] "
+        "(warning only if container FPS is outside)"
+    )
+    console.print(
+        f"  Gate   [bold]FRAME_SAMPLE_STRIDE={frame_stride}[/]  uniform scene-YOLO every {frame_stride} decoded "
+        f"frame(s); read windows ≤{win} frames; ``YOLO_MICRO_BATCH_SIZE={ymb}`` batches sampled frames per "
+        f"``detect()``; non-sampled frames reuse last scene boxes; RF-DETR only when scene activity "
+        f"≥{YOLO_CONFIDENCE} on a sampled frame"
+    )
     console.print(
         f"  Conf   YOLO={YOLO_CONFIDENCE}  trash_RF={TRASH_CONFIDENCE}  plate={PLATE_CONFIDENCE}"
     )
@@ -286,33 +242,25 @@ def _log_pipeline_run_configuration(
         console.print("  [yellow]RF_DETR_TRT_TIMING is on[/] — expect extra [TRT] lines per batch.")
     console.print(
         f"  Pipeline YOLO_MICRO_BATCH_SIZE={YOLO_MICRO_BATCH_SIZE}  "
-        "(``off``: sub-batches within each time chunk; ``yolo``: gate still runs one frame per "
-        "scheduled YOLO call; numeric ``GATE_MODE``: batches sampled frames per ``detect()``)"
-    )
-    console.print(
-        f"  Pipeline LP_VEHICLE_LP_STRIDE={LP_VEHICLE_LP_STRIDE}  "
+        f"LP_VEHICLE_LP_STRIDE={LP_VEHICLE_LP_STRIDE}  "
         f"PIPELINE_READ_AHEAD_QUEUE_SIZE={PIPELINE_READ_AHEAD_QUEUE_SIZE}  "
         f"PIPELINE_WRITE_QUEUE_SIZE={PIPELINE_WRITE_QUEUE_SIZE}"
     )
-    y_rt = str(YOLO_RUNTIME).strip().lower()
-    if y_rt in ("pt", "pytorch", "ultralytics", ".pt"):
-        console.print(f"  Scene YOLO (PyTorch) [dim]{_settings_asset_path(YOLO_MODEL_PATH)}[/]")
-    else:
-        console.print(
-            f"  Scene YOLO TensorRT  [dim]{Path(YOLO_ENGINE_PATH).resolve()}[/]  "
-            f"max_batch={YOLO_TRT_BATCH_SIZE}  dynamic={YOLO_TRT_DYNAMIC}  imgsz={YOLO_TRT_IMAGE_SIZE}"
-        )
-    lp_rt = str(LP_RUNTIME).strip().lower()
-    if lp_rt in ("pt", "pytorch", "ultralytics", ".pt"):
-        console.print(f"  LP YOLO (PyTorch)    [dim]{_settings_asset_path(LP_MODEL_PATH)}[/]  conf≥{LP_CONFIDENCE}")
-    else:
-        console.print(
-            f"  LP YOLO TensorRT     [dim]{Path(LP_ENGINE_PATH).resolve()}[/]  "
-            f"max_batch={LP_TRT_BATCH_SIZE}  dynamic={LP_TRT_DYNAMIC}  imgsz={LP_TRT_IMAGE_SIZE}  conf≥{LP_CONFIDENCE}"
-        )
+    console.print(
+        f"  Scene YOLO TensorRT  [dim]{Path(YOLO_ENGINE_PATH).resolve()}[/]  "
+        f"max_batch={YOLO_TRT_BATCH_SIZE}  dynamic={YOLO_TRT_DYNAMIC}  imgsz={YOLO_TRT_IMAGE_SIZE}"
+    )
+    console.print(
+        f"  LP YOLO TensorRT     [dim]{Path(LP_ENGINE_PATH).resolve()}[/]  "
+        f"max_batch={LP_TRT_BATCH_SIZE}  dynamic={LP_TRT_DYNAMIC}  imgsz={LP_TRT_IMAGE_SIZE}  conf≥{LP_CONFIDENCE}"
+    )
     console.print(
         f"  OCR lock  LP≥{OCR_LOCK_CONFIDENCE}  stable_obs={OCR_STABLE_OBSERVATIONS}  "
         f"ocr_refresh={OCR_REFRESH_STRIDE}  lp_lock_refresh={LP_LOCK_REFRESH_STRIDE}"
+    )
+    console.print(
+        f"  LP batch  enabled={LP_BATCH_ENABLED}  max_crops={LP_BATCH_MAX_CROPS}  "
+        f"max_latency_frames={LP_BATCH_MAX_LATENCY_FRAMES}"
     )
 
 
@@ -1636,134 +1584,6 @@ def _annotate_frame(
     times.annotate_draw_sec += time.perf_counter() - t0
 
 
-def _detect_trash_scene_activity_frames_only(
-    trash: TrashDetector,
-    chunk_frames_list: List[FrameData],
-    detections_per_frame: List[List[Detection]],
-    times: PipelineStepTimes,
-) -> List[List[Detection]]:
-    """Run RF-DETR only on frames with person/vehicle at ``YOLO_CONFIDENCE``; others get ``[]``."""
-    n = len(chunk_frames_list)
-    trash_out: List[List[Detection]] = [[] for _ in range(n)]
-    active_frames: List[FrameData] = []
-    active_orig: List[int] = []
-    for i, fd in enumerate(chunk_frames_list):
-        scene = _filter_scene_detections(detections_per_frame[i])
-        if _scene_has_activity(scene, YOLO_CONFIDENCE):
-            active_frames.append(fd)
-            active_orig.append(i)
-    if not active_frames:
-        return trash_out
-    eb = _rfdetr_engine_batch(trash)
-    for start in range(0, len(active_frames), eb):
-        batch = active_frames[start : start + eb]
-        t0 = time.perf_counter()
-        part = trash.detect_trash(batch)
-        times.trash_sec += time.perf_counter() - t0
-        times.rfdetr_trt_batches += 1
-        times.rfdetr_input_frames += len(batch)
-        times.rfdetr_trt_padded_slots += max(0, eb - len(batch))
-        for j in range(len(batch)):
-            oi = active_orig[start + j]
-            trash_out[oi] = list(part[j]) if j < len(part) else []
-    return trash_out
-
-
-def _run_pipeline_chunked(
-    *,
-    cap: cv2.VideoCapture,
-    out: VideoWriterSink,
-    fps: float,
-    total_frames: int,
-    chunk_frames: int,
-    yolo: YoloDetector,
-    lp_detector: LpDetector,
-    ocr: Ocr,
-    trash: TrashDetector,
-    times: PipelineStepTimes,
-    annots: FrameAnnotators,
-    peeing: PeeingDetector,
-    lp_cache: VehicleLpOcrCache | None = None,
-) -> None:
-    pbar = tqdm(total=total_frames, desc="Processing video")
-    frame_idx = 0
-    try:
-        while True:
-            chunk_frames_list: List[FrameData] = []
-            t_read = time.perf_counter()
-            for _ in range(chunk_frames):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                timestamp = frame_idx / fps
-                chunk_frames_list.append(FrameData(index=frame_idx, timestamp=timestamp, image=frame))
-                frame_idx += 1
-            times.other_sec += time.perf_counter() - t_read
-
-            if not chunk_frames_list:
-                break
-
-            t0 = time.perf_counter()
-            detections_per_frame: List[List[Detection]] = []
-            ymb = max(1, int(YOLO_MICRO_BATCH_SIZE))
-            for sub_start in range(0, len(chunk_frames_list), ymb):
-                sub_chunk = chunk_frames_list[sub_start : sub_start + ymb]
-                detections_per_frame.extend(yolo.detect(sub_chunk))
-            times.yolo_sec += time.perf_counter() - t0
-            trash_per_frame = _detect_trash_scene_activity_frames_only(
-                trash, chunk_frames_list, detections_per_frame, times
-            )
-
-            n = min(len(chunk_frames_list), len(detections_per_frame), len(trash_per_frame))
-            if n == 0:
-                pbar.update(len(chunk_frames_list))
-                continue
-
-            for i in range(n):
-                frame_data = chunk_frames_list[i]
-                frame = frame_data.image
-                scene_dets = _filter_scene_detections(detections_per_frame[i])
-                t_p = time.perf_counter()
-                pstate = peeing.update(
-                    frame,
-                    scene_dets,
-                    run_yolo=True,
-                    yolo_conf=YOLO_CONFIDENCE,
-                    timestamp_sec=frame_data.timestamp,
-                )
-                times.peeing_sec += time.perf_counter() - t_p
-                if pstate.edge_enter:
-                    console.print(f"[bold magenta]PEEING[/] frame={frame_data.index}")
-                if pstate.edge_exit:
-                    console.print(f"[dim]PEEING off[/] frame={frame_data.index}")
-                _annotate_frame(
-                    frame,
-                    trash_per_frame[i],
-                    scene_dets,
-                    lp_detector=lp_detector,
-                    ocr=ocr,
-                    annots=annots,
-                    peeing_state=pstate,
-                    times=times,
-                    frame_idx=frame_data.index,
-                    lp_cache=lp_cache,
-                    run_scene_lp_ocr=_scene_has_vehicles_at_conf(
-                        scene_dets, YOLO_CONFIDENCE
-                    ),
-                )
-                t0 = time.perf_counter()
-                out.write(frame)
-                times.video_write_sec += time.perf_counter() - t0
-                pbar.update(1)
-
-        pbar.close()
-    finally:
-        try:
-            pbar.close()
-        except Exception:
-            pass
-
-
 def _rfdetr_engine_batch(trash: TrashDetector) -> int:
     """TensorRT engines use a static batch; PyTorch path may omit ``engine_batch_size``."""
     bs = getattr(trash, "engine_batch_size", None)
@@ -1798,14 +1618,14 @@ def _run_pipeline_uniform_stride_batched(
     Peeing still uses **carried** scene boxes between samples. LP/OCR and scene YOLO labels for
     plates run only on sampled frames where scene YOLO reports a vehicle at ``YOLO_CONFIDENCE``;
     other frames redraw **cached** plate text from :class:`VehicleLpOcrCache` without new LP/OCR calls.
-    RF-DETR runs only on sampled frames with person/vehicle activity (same as the ``yolo`` gate path).
+    RF-DETR runs only on sampled frames with person/vehicle activity (same threshold as scene YOLO).
     """
     B = _rfdetr_engine_batch(trash)
     max_queue_latency = max(0, int(RF_DETR_MAX_QUEUE_LATENCY_FRAMES))
     ymb = max(1, int(YOLO_MICRO_BATCH_SIZE))
     window_size = max(stride * ymb, ymb)
 
-    pbar = tqdm(total=total_frames, desc=f"Processing video (GATE_MODE={stride})")
+    pbar = tqdm(total=total_frames, desc=f"Processing video (FRAME_SAMPLE_STRIDE={stride})")
     frame_idx = 0
     emit_idx = 0
     stash: dict[int, tuple[np.ndarray, List[Detection], List[Detection], PeeingState]] = {}
@@ -1982,189 +1802,15 @@ def _run_pipeline_uniform_stride_batched(
             pass
 
 
-def _run_pipeline_yolo_gated(
-    *,
-    cap: cv2.VideoCapture,
-    out: VideoWriterSink,
-    fps: float,
-    total_frames: int,
-    yolo: YoloDetector,
-    lp_detector: LpDetector,
-    ocr: Ocr,
-    gate: YoloStrideGate,
-    trash: TrashDetector,
-    times: PipelineStepTimes,
-    annots: FrameAnnotators,
-    peeing: PeeingDetector,
-    lp_cache: VehicleLpOcrCache | None = None,
-) -> None:
-    """YOLO stride gate with **batched** RF-DETR: queues real frames across idle/non-YOLO frames.
-
-    Partial RF-DETR queues are **not** padded-flushed just because YOLO skipped or saw no activity;
-    TensorRT only launches at full ``B`` (engine batch), end of video, or
-    ``RF_DETR_MAX_QUEUE_LATENCY_FRAMES`` when set. Output order is preserved via ``stash`` + ``emit_ready``.
-
-    LP/OCR run only when scene YOLO ran and reported a vehicle at ``YOLO_CONFIDENCE``; skipped YOLO
-    frames stash an empty scene list and redraw cached plate text only.
-    """
-    B = _rfdetr_engine_batch(trash)
-    max_queue_latency = max(0, int(RF_DETR_MAX_QUEUE_LATENCY_FRAMES))
-    pbar = tqdm(total=total_frames, desc="Processing video (YOLO stride gate)")
-    frame_idx = 0
-    emit_idx = 0
-    stash: dict[int, tuple[np.ndarray, List[Detection], List[Detection], PeeingState]] = {}
-    rfdetr_q: list[tuple[FrameData, List[Detection], PeeingState]] = []
-
-    def emit_ready() -> None:
-        nonlocal emit_idx
-        while emit_idx in stash:
-            img, td, scene, pst = stash.pop(emit_idx)
-            lp_run = _scene_has_vehicles_at_conf(scene, YOLO_CONFIDENCE)
-            _annotate_frame(
-                img,
-                td,
-                scene,
-                lp_detector=lp_detector,
-                ocr=ocr,
-                annots=annots,
-                peeing_state=pst,
-                times=times,
-                frame_idx=emit_idx,
-                lp_cache=lp_cache,
-                run_scene_lp_ocr=lp_run,
-            )
-            t0 = time.perf_counter()
-            out.write(img)
-            times.video_write_sec += time.perf_counter() - t0
-            emit_idx += 1
-
-    def flush_one_rfdetr_batch() -> None:
-        nonlocal rfdetr_q
-        if len(rfdetr_q) < B:
-            return
-        batch = rfdetr_q[:B]
-        rfdetr_q = rfdetr_q[B:]
-        fds = [x[0] for x in batch]
-        times.rfdetr_trt_batches += 1
-        times.rfdetr_input_frames += B
-        t0 = time.perf_counter()
-        outs = trash.detect_trash(fds)
-        times.trash_sec += time.perf_counter() - t0
-        for j in range(B):
-            fd, scene, pst = batch[j]
-            td = list(outs[j]) if j < len(outs) else []
-            stash[fd.index] = (fd.image, td, scene, pst)
-        emit_ready()
-
-    def flush_rfdetr_padded_tail() -> None:
-        nonlocal rfdetr_q
-        n = len(rfdetr_q)
-        if n == 0:
-            return
-        batch = list(rfdetr_q)
-        rfdetr_q.clear()
-        fds = [b[0] for b in batch]
-        pad_fd = _pad_rfdetr_frame(fds[-1])
-        while len(fds) < B:
-            fds.append(pad_fd)
-        times.rfdetr_trt_batches += 1
-        times.rfdetr_input_frames += n
-        times.rfdetr_trt_padded_slots += max(0, B - n)
-        t0 = time.perf_counter()
-        outs = trash.detect_trash(fds)
-        times.trash_sec += time.perf_counter() - t0
-        for j in range(n):
-            fd, scene, pst = batch[j]
-            td = list(outs[j]) if j < len(outs) else []
-            stash[fd.index] = (fd.image, td, scene, pst)
-        emit_ready()
-
-    def maybe_flush_rfdetr_latency(anchor_frame_idx: int) -> None:
-        if max_queue_latency <= 0 or not rfdetr_q:
-            return
-        oldest = rfdetr_q[0][0].index
-        if anchor_frame_idx - oldest >= max_queue_latency:
-            flush_rfdetr_padded_tail()
-
-    try:
-        while True:
-            t_read = time.perf_counter()
-            ret, frame = cap.read()
-            times.other_sec += time.perf_counter() - t_read
-            if not ret:
-                break
-
-            run_yolo = gate.should_run_yolo(frame_idx)
-            scene_dets: List[Detection] = []
-            fd_opt: FrameData | None = None
-            if run_yolo:
-                fd_opt = FrameData(index=frame_idx, timestamp=frame_idx / fps, image=frame.copy())
-                t0 = time.perf_counter()
-                dets_list = yolo.detect([fd_opt])
-                times.yolo_sec += time.perf_counter() - t0
-                detections = dets_list[0] if dets_list else []
-                scene_dets = _filter_scene_detections(detections)
-                gate.observe(frame_idx, _scene_has_activity(scene_dets, YOLO_CONFIDENCE))
-
-            t_p = time.perf_counter()
-            ts = frame_idx / fps
-            pstate = peeing.update(
-                frame,
-                scene_dets,
-                run_yolo=run_yolo,
-                yolo_conf=YOLO_CONFIDENCE,
-                timestamp_sec=ts,
-            )
-            times.peeing_sec += time.perf_counter() - t_p
-            if pstate.edge_enter:
-                console.print(f"[bold magenta]PEEING[/] frame={frame_idx}")
-            if pstate.edge_exit:
-                console.print(f"[dim]PEEING off[/] frame={frame_idx}")
-
-            if run_yolo and fd_opt is not None:
-                if _scene_has_activity(scene_dets, YOLO_CONFIDENCE):
-                    rfdetr_q.append((fd_opt, scene_dets, pstate))
-                    while len(rfdetr_q) >= B:
-                        flush_one_rfdetr_batch()
-                else:
-                    stash[frame_idx] = (frame.copy(), [], scene_dets, pstate)
-                    maybe_flush_rfdetr_latency(frame_idx)
-                    emit_ready()
-            else:
-                stash[frame_idx] = (frame.copy(), [], scene_dets, pstate)
-                maybe_flush_rfdetr_latency(frame_idx)
-                emit_ready()
-
-            frame_idx += 1
-            pbar.update(1)
-
-        while len(rfdetr_q) >= B:
-            flush_one_rfdetr_batch()
-        flush_rfdetr_padded_tail()
-
-        pbar.close()
-    finally:
-        try:
-            pbar.close()
-        except Exception:
-            pass
-
-
 def run_pipeline(video_path: str, output_video: str) -> None:
     """Process ``video_path`` and write annotated video to ``output_video``."""
     wall_start = time.perf_counter()
     times = PipelineStepTimes()
+    stride_n = _parse_frame_sample_stride()
 
     if not os.path.exists(video_path):
         console.print(f"[red]Video not found:[/] {video_path}")
         sys.exit(2)
-
-    gate_kind, stride_n = _parse_gate_mode_value(GATE_MODE)
-    raw_g = str(GATE_MODE).strip().lower()
-    if raw_g not in ("off", "yolo") and not (raw_g.isdigit() and int(raw_g) >= 1):
-        console.print(f"[yellow]Unknown GATE_MODE={GATE_MODE!r}; using 'yolo'[/]")
-        gate_kind, stride_n = "yolo", None
-    log_mode = "stride" if gate_kind == "stride" else gate_kind
 
     _ensure_pytorch_cuda_kernels_work()
     _log_visible_torch_cuda_device()
@@ -2172,24 +1818,16 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     console.print("[bold]Models ready[/]")
     t0 = time.perf_counter()
     yolo = YoloDetector(conf_threshold=YOLO_CONFIDENCE)
-    y_rt = str(YOLO_RUNTIME).strip().lower()
-    if y_rt in ("pt", "pytorch", "ultralytics", ".pt"):
-        yolo_ready = f"PyTorch [dim]{_settings_asset_path(YOLO_MODEL_PATH)}[/]"
-    else:
-        yolo_ready = (
-            f"TensorRT [dim]{Path(YOLO_ENGINE_PATH).resolve()}[/]  "
-            f"max_batch={YOLO_TRT_BATCH_SIZE} dynamic={YOLO_TRT_DYNAMIC}"
-        )
+    yolo_ready = (
+        f"TensorRT [dim]{Path(YOLO_ENGINE_PATH).resolve()}[/]  "
+        f"max_batch={YOLO_TRT_BATCH_SIZE} dynamic={YOLO_TRT_DYNAMIC}"
+    )
     _log_model_ready("Scene YOLO", yolo_ready)
     lp_detector = LpDetector()
-    lp_rt = str(LP_RUNTIME).strip().lower()
-    if lp_rt in ("pt", "pytorch", "ultralytics", ".pt"):
-        lp_ready = f"PyTorch [dim]{_settings_asset_path(LP_MODEL_PATH)}[/]"
-    else:
-        lp_ready = (
-            f"TensorRT [dim]{Path(LP_ENGINE_PATH).resolve()}[/]  "
-            f"max_batch={LP_TRT_BATCH_SIZE} dynamic={LP_TRT_DYNAMIC}"
-        )
+    lp_ready = (
+        f"TensorRT [dim]{Path(LP_ENGINE_PATH).resolve()}[/]  "
+        f"max_batch={LP_TRT_BATCH_SIZE} dynamic={LP_TRT_DYNAMIC}"
+    )
     _log_model_ready("License-plate YOLO", lp_ready)
     ocr = Ocr()
     _log_model_ready("PaddleOCR", f"inference device={ocr.paddle_device}")
@@ -2214,12 +1852,17 @@ def run_pipeline(video_path: str, output_video: str) -> None:
         console.print(f"[red]Failed to open video:[/] {video_path}")
         sys.exit(3)
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
     if fps <= 0:
         console.print(f"[red]Invalid FPS:[/] {fps}")
         sys.exit(4)
 
-    chunk_frames = max(1, int(CHUNK_SECONDS * fps))
+    if fps < float(INPUT_VIDEO_FPS_MIN) or fps > float(INPUT_VIDEO_FPS_MAX):
+        console.print(
+            f"[yellow]Warning:[/] reported FPS {fps:.2f} is outside the nominal input range "
+            f"[{INPUT_VIDEO_FPS_MIN}, {INPUT_VIDEO_FPS_MAX}] — timing and stride semantics assume 10–60 fps."
+        )
+
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
@@ -2292,23 +1935,21 @@ def run_pipeline(video_path: str, output_video: str) -> None:
 
     out, sink_label = _open_output_video_sink(
         output_video,
-        fps=float(fps),
+        fps=fps,
         width=width,
         height=height,
     )
     out = _maybe_wrap_video_sink(out, queue_size=PIPELINE_WRITE_QUEUE_SIZE)
     _log_pipeline_run_configuration(
-        mode=log_mode,
         video_path=video_path,
         width=width,
         height=height,
-        fps=float(fps),
+        fps=fps,
         total_frames=total_frames,
-        chunk_frames=chunk_frames,
         output_video=output_video,
         sink_label=sink_label,
         trash=trash,
-        uniform_stride=stride_n if gate_kind == "stride" else None,
+        frame_stride=stride_n,
     )
     times.other_sec += time.perf_counter() - t_io
 
@@ -2316,66 +1957,22 @@ def run_pipeline(video_path: str, output_video: str) -> None:
     lp_detector.reset_inference_batch_stats()
 
     try:
-        if gate_kind == "yolo":
-            t_gate = time.perf_counter()
-            stride_gate = YoloStrideGate(
-                YoloStrideGateConfig(
-                    coarse_stride=YOLO_COARSE_STRIDE,
-                    dense_stride=YOLO_DENSE_STRIDE,
-                    dense_idle_miss_streak=YOLO_DENSE_IDLE_MISS_STREAK,
-                )
-            )
-            times.other_sec += time.perf_counter() - t_gate
-            _run_pipeline_yolo_gated(
-                cap=cap,
-                out=out,
-                fps=float(fps),
-                total_frames=total_frames,
-                yolo=yolo,
-                lp_detector=lp_detector,
-                ocr=ocr,
-                gate=stride_gate,
-                trash=trash,
-                times=times,
-                annots=annots,
-                peeing=peeing,
-                lp_cache=lp_cache,
-            )
-        elif gate_kind == "stride" and stride_n is not None:
-            t_gate = time.perf_counter()
-            times.other_sec += time.perf_counter() - t_gate
-            _run_pipeline_uniform_stride_batched(
-                cap=cap,
-                out=out,
-                fps=float(fps),
-                total_frames=total_frames,
-                yolo=yolo,
-                lp_detector=lp_detector,
-                ocr=ocr,
-                trash=trash,
-                times=times,
-                annots=annots,
-                peeing=peeing,
-                lp_cache=lp_cache,
-                stride=stride_n,
-                lp_batch=lp_batch,
-            )
-        else:
-            _run_pipeline_chunked(
-                cap=cap,
-                out=out,
-                fps=float(fps),
-                total_frames=total_frames,
-                chunk_frames=chunk_frames,
-                yolo=yolo,
-                lp_detector=lp_detector,
-                ocr=ocr,
-                trash=trash,
-                times=times,
-                annots=annots,
-                peeing=peeing,
-                lp_cache=lp_cache,
-            )
+        _run_pipeline_uniform_stride_batched(
+            cap=cap,
+            out=out,
+            fps=fps,
+            total_frames=total_frames,
+            yolo=yolo,
+            lp_detector=lp_detector,
+            ocr=ocr,
+            trash=trash,
+            times=times,
+            annots=annots,
+            peeing=peeing,
+            lp_cache=lp_cache,
+            stride=stride_n,
+            lp_batch=lp_batch,
+        )
 
         console.print(f"[green]Annotated video saved:[/] {output_video}")
 

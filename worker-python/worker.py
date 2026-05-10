@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Local video pipeline: YOLO (stride gate by default) → RF-DETR trash → license plate → OCR → annotated MP4.
+Local video pipeline: YOLO (uniform ``FRAME_SAMPLE_STRIDE``) → RF-DETR trash → license plate → OCR → annotated MP4.
 
 Examples (paths relative to worker-python/):
 
@@ -8,11 +8,9 @@ Examples (paths relative to worker-python/):
   python worker.py inputs/clip.mp4
   python worker.py inputs/clip.mp4 -o outputs/custom.mp4
 
-Gating (``settings.py`` only — no CLI overrides for gate or YOLO strides):
-  ``GATE_MODE`` may be ``off``, ``yolo``, or a positive integer string (``"1"``, ``"2"``, …).
-  Integer mode: scene YOLO only on every Nth frame, micro-batched (see ``pipelines.test_pipeline``).
-  ``yolo`` uses ``core/yolo_stride_gate.py`` (coarse/dense). RF-DETR still follows scene activity
-  on frames where YOLO ran (integer mode: sampled frames only).
+Scene YOLO sampling (``settings.py`` only — no CLI overrides): ``FRAME_SAMPLE_STRIDE`` runs scene YOLO on
+decoded frames where ``index % FRAME_SAMPLE_STRIDE == 0``. Inputs are expected at **10–60 FPS**
+nominal; other FPS values still run but log a warning (see ``pipelines.test_pipeline``).
 
   If PyTorch reports ``no kernel image`` on a very new GPU (e.g. Blackwell) but another GPU works,
   launch with a different visible GPU at the shell (e.g. ``CUDA_VISIBLE_DEVICES=1``) before
@@ -33,7 +31,7 @@ def default_output_path(video_path: str, outputs_dir: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run YOLO + license-plate detector + OCR on a video file (gating: settings.py only).",
+        description="Run YOLO + license-plate detector + OCR on a video file (stride from settings.py only).",
     )
     parser.add_argument(
         "video",

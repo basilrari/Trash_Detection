@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from core.types import Detection
+from models.types import Detection
 
 # Supervision / RF-DETR sometimes attach placeholder ``class_name`` strings instead of
 # dataset labels; never show these when we still have a meaningful head default.

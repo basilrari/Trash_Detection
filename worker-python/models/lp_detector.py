@@ -6,7 +6,7 @@ from ultralytics import YOLO
 
 from models.base import LicensePlateDetector
 from models.ultralytics_call_stats import UltralyticsCallStats
-from core.types import FrameData, LicensePlate
+from models.types import FrameData, LicensePlate
 
 
 def _worker_root() -> Path:
@@ -24,14 +24,12 @@ def _resolve_path(p: str | Path) -> Path:
 
 
 class LpDetector(LicensePlateDetector):
-    """License-plate YOLO: PyTorch ``.pt`` or TensorRT ``.engine`` (see ``settings.LP_RUNTIME``)."""
+    """License-plate YOLO via TensorRT ``.engine`` (Ultralytics ``YOLO`` wrapper)."""
 
-    def __init__(self, weights_path: str | None = None, plate_class_id: int = 0):
+    def __init__(self, *, engine_path: str | None = None, plate_class_id: int = 0):
         from settings import (
             LP_CONFIDENCE,
             LP_ENGINE_PATH,
-            LP_MODEL_PATH,
-            LP_RUNTIME,
             LP_TRT_BATCH_SIZE,
             LP_TRT_DYNAMIC,
             LP_TRT_IMAGE_SIZE,
@@ -39,30 +37,16 @@ class LpDetector(LicensePlateDetector):
 
         self.plate_class_id = plate_class_id
         self._conf = float(LP_CONFIDENCE)
-        mode = str(LP_RUNTIME).strip().lower()
-
-        if mode in ("pt", "pytorch", "ultralytics", ".pt"):
-            wp = weights_path or LP_MODEL_PATH
-            w = _resolve_path(wp)
-            if not w.is_file():
-                raise FileNotFoundError(f"LP YOLO weights not found: {w}")
-            self.model = YOLO(str(w))
-            self._use_engine = False
-            self._imgsz = 0
-            self._trt_batch = 1
-            self._dynamic = True
-        else:
-            self._imgsz = int(LP_TRT_IMAGE_SIZE)
-            self._trt_batch = max(1, int(LP_TRT_BATCH_SIZE))
-            self._dynamic = bool(LP_TRT_DYNAMIC)
-            eng = _resolve_path(LP_ENGINE_PATH)
-            if not eng.is_file():
-                raise FileNotFoundError(
-                    f"LP TensorRT engine not found: {eng}\n"
-                    "Set LP_ENGINE_PATH or use LP_RUNTIME=\"pt\" with LP_MODEL_PATH."
-                )
-            self.model = YOLO(str(eng))
-            self._use_engine = True
+        self._imgsz = int(LP_TRT_IMAGE_SIZE)
+        self._trt_batch = max(1, int(LP_TRT_BATCH_SIZE))
+        self._dynamic = bool(LP_TRT_DYNAMIC)
+        eng = _resolve_path(engine_path or LP_ENGINE_PATH)
+        if not eng.is_file():
+            raise FileNotFoundError(
+                f"LP TensorRT engine not found: {eng}\n"
+                "Set LP_ENGINE_PATH in settings.py."
+            )
+        self.model = YOLO(str(eng))
 
         self._call_stats_in = 0
         self._call_stats_launches = 0
@@ -89,17 +73,6 @@ class LpDetector(LicensePlateDetector):
 
         images = [f.image for f in frames]
         self._call_stats_in += len(images)
-
-        if not self._use_engine:
-            self._call_stats_launches += 1
-            results = self.model(
-                images,
-                classes=[self.plate_class_id],
-                conf=self._conf,
-            )
-            if not isinstance(results, list):
-                results = list(results)
-            return self._to_license_plates(results)
 
         B = self._trt_batch
         out_all: List[List[LicensePlate]] = []

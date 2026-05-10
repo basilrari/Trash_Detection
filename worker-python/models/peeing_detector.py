@@ -29,7 +29,7 @@ import cv2
 import numpy as np
 from mediapipe.tasks.python.components.containers.landmark import NormalizedLandmark
 
-from core.types import Detection
+from models.types import Detection
 
 logger = logging.getLogger(__name__)
 

@@ -2,10 +2,11 @@
 """
 Local video pipeline configuration.
 
-**Single source of truth:** edit the literals in this file. Nothing is read from the OS
-environment or ``.env`` for application settings.
+**Single source of truth:** edit the literals in this file. The app does not read the OS
+environment for these values.
 
-``python worker.py`` does not override ``settings``; change ``GATE_MODE`` and stride fields in this file.
+**Inputs:** production feeds are expected at **10–60 FPS** (nominal container FPS). Values outside
+that range still run but trigger a warning when opening the video (see ``run_pipeline``).
 """
 from pathlib import Path
 
@@ -16,6 +17,10 @@ OUTPUTS_DIR = "outputs"
 VIDEO_PATH = f"{INPUTS_DIR}/Test.mp4"
 OUTPUT_VIDEO = f"{OUTPUTS_DIR}/annotated.mp4"
 
+# Expected nominal FPS range from inputs (warning only if ``cv2`` reports outside).
+INPUT_VIDEO_FPS_MIN = 10
+INPUT_VIDEO_FPS_MAX = 60
+
 # --- Annotated output encoding (``pipelines.test_pipeline``) ---
 # OUTPUT_VIDEO_ENCODER: ``auto`` (try ``h264_nvenc`` via ffmpeg, else OpenCV ``mp4v``),
 # ``nvenc`` (ffmpeg only; fails fast if unavailable), ``mp4v`` (OpenCV only).
@@ -24,31 +29,25 @@ FFMPEG_PATH = "ffmpeg"
 NVENC_PRESET = "p4"
 NVENC_CQ = 28
 
-CHUNK_SECONDS = 5
 YOLO_CONFIDENCE = 0.5
 PLATE_CONFIDENCE = 0.5
 
 _w = Path(__file__).resolve().parent / "weights"
 
-# --- Scene YOLO: ``YOLO_RUNTIME`` ``"pt"`` (Ultralytics ``.pt``) or ``"engine"`` (TensorRT) ---
-YOLO_RUNTIME = "engine"
-YOLO_MODEL_PATH = str(_w / "yolo11x.pt")
+# --- Scene YOLO (TensorRT ``.engine`` only; Ultralytics ``YOLO`` wrapper) ---
 YOLO_ENGINE_PATH = str(_w / "yolo11x_dynamic_b8_fp16_tensorRT.engine")
 YOLO_TRT_BATCH_SIZE = 8
 YOLO_TRT_IMAGE_SIZE = 640
 YOLO_TRT_DYNAMIC = True
 
-# --- License-plate YOLO: ``LP_RUNTIME`` ``"pt"`` or ``"engine"`` ---
-LP_RUNTIME = "engine"
-LP_MODEL_PATH = str(_w / "bestlicense.pt")
+# --- License-plate YOLO (TensorRT ``.engine`` only) ---
 LP_ENGINE_PATH = str(_w / "lp_dynamic_b16_fp16_tensorRT.engine")
 LP_TRT_BATCH_SIZE = 16
 LP_TRT_IMAGE_SIZE = 640
 LP_TRT_DYNAMIC = True
 LP_CONFIDENCE = 0.25
 
-# Cross-frame LP batching (see ``pipelines/lp_batch_coordinator.py``). Jobs enqueue when frames
-# enter ``stash``; inference flushes at full batch, latency, or ordered emit (uniform-stride path).
+# Cross-frame LP batching (``pipelines/lp_batch_coordinator.py``; uniform-stride pipeline only).
 LP_BATCH_ENABLED = True
 LP_BATCH_MAX_CROPS = LP_TRT_BATCH_SIZE
 LP_BATCH_MAX_LATENCY_FRAMES = 0  # 0 = no latency-only flush (batch / emit / EOF only)
@@ -66,19 +65,14 @@ ANNOTATOR_SMART_POSITION = False
 OCR_MIN_PLATE_SIDE = 12
 OCR_MIN_VARIANCE_LAPLACIAN = 0.0  # >0 to skip very blurry crops (e.g. 30.0); 0 disables.
 
-# Scene YOLO micro-batch size in ``GATE_MODE=off`` chunk sub-batching (see ``test_pipeline``).
+# Batched scene-YOLO ``detect()`` calls: at most this many **sampled** frames per launch.
 YOLO_MICRO_BATCH_SIZE = 8
 
-# --- Gating (``core/yolo_stride_gate.py`` / ``pipelines.test_pipeline``) ---
-# GATE_MODE:
-#   ``"off"`` — time-chunk path: YOLO on every decoded frame (sub-batched by ``YOLO_MICRO_BATCH_SIZE``).
-#   ``"yolo"`` — coarse/dense stride gate (``YOLO_COARSE_STRIDE`` / ``YOLO_DENSE_STRIDE``).
-#   ``"1"``, ``"2"``, … — uniform scene-YOLO stride: run YOLO only on frames where ``index % N == 0``,
-#     micro-batched in windows of ``N * YOLO_MICRO_BATCH_SIZE`` reads; other frames reuse the last scene boxes.
-GATE_MODE = "3"
-YOLO_COARSE_STRIDE = 10
-YOLO_DENSE_STRIDE = 2
-YOLO_DENSE_IDLE_MISS_STREAK = 8
+# --- Frame sampling (uniform stride) ---
+# Scene YOLO runs on decoded frames where ``frame_index % FRAME_SAMPLE_STRIDE == 0``.
+# Other frames reuse the last sampled scene boxes (peeing carry, cached LP redraw).
+# With nominal FPS in [10, 60], stride ``N`` gives about ``FPS / N`` scene-YOLO samples per second.
+FRAME_SAMPLE_STRIDE = 3
 
 # --- RF-DETR trash / cigarette (TensorRT engines only) ---
 TRASH_ENGINE_PATH = str(_w / "trash_fp16_tensorRT.engine")
@@ -88,30 +82,24 @@ TRASH_CONFIDENCE = 0.4
 # Extra ``[TRT]`` timing lines from ``models/rfdetr_trt_trash.py``.
 RF_DETR_TRT_TIMING = False
 
-# RF-DETR preprocess: use CPU (NumPy + OpenCV) unless you set a CUDA opt-in value here:
+# RF-DETR preprocess: CPU (NumPy + OpenCV) unless CUDA opt-in:
 # ``"1"``, ``"true"``, ``"yes"``, ``"on"``, ``"cuda"``, ``"auto"`` (CUDA when available).
-# ``""``, ``"0"``, ``"cpu"``, ``"false"``, ``"off"``, ``"no"`` → CPU.
 RF_DETR_PREPROCESS_CUDA = "1"
 
-# Run the cigarette TRT head on 1/N RF-DETR batches only (1 = every batch). Saves ~half TRT when N=2 if heads dominate.
-# Benchmark wall time with RF-DETR TRT batch metrics in the pipeline summary; pair with rebuilding engines (larger batch) or YOLO/LP TensorRT separately if needed.
+# Run the cigarette TRT head on 1/N RF-DETR batches only (1 = every batch).
 RF_DETR_CIGARETTE_EVERY_N_BATCHES = 1
 
-# Max frames the oldest RF-DETR-queued real frame may wait before a padded tail flush (0 = only flush at full batch or EOF).
+# Max frames the oldest RF-DETR-queued frame may wait before a padded tail flush (0 = full batch or EOF).
 RF_DETR_MAX_QUEUE_LATENCY_FRAMES = 0
 
 # --- PaddleOCR (``models/ocr.py``) ---
-# ``""`` → auto (GPU if Paddle sees CUDA). Otherwise ``"cpu"``, ``"gpu"``, ``"gpu:0"``, etc.
 PADDLE_OCR_DEVICE = "gpu"
-# ``None`` → default isolation rule (Blackwell + GPU OCR). ``True`` / ``False`` to force.
 PADDLE_OCR_ISOLATE_PROCESS: bool | None = None
 
-# Re-run LP (+ downstream OCR) for a vehicle at most every N frames when the same vehicle is tracked (IoU match). 1 = every frame.
+# Re-run LP (+ downstream OCR) for a vehicle at most every N decoded frames (same track). 1 = every frame.
 LP_VEHICLE_LP_STRIDE = 3
 
-# Decode thread queue depth (0 = read frames synchronously in the main loop).
 PIPELINE_READ_AHEAD_QUEUE_SIZE = 8
-# Async video writer queue depth (0 = call ``write`` on the main thread).
 PIPELINE_WRITE_QUEUE_SIZE = 8
 
 # --- Peeing heuristic (MediaPipe Pose on YOLO person crops; always on) ---
