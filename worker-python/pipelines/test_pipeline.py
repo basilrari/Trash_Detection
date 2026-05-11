@@ -779,6 +779,391 @@ class PipelineStepTimes:
         console.print(f"  [bold]Wall clock total:   {wall_total_sec:8.2f} s[/]")
 
 
+def _pipeline_inference_seconds(times: PipelineStepTimes) -> float:
+    """Scene YOLO + RF-DETR + peeing + LP + OCR + annotate draw (excludes mux/write and setup I/O)."""
+
+    return (
+        times.yolo_sec
+        + times.trash_sec
+        + times.peeing_sec
+        + times.lp_sec
+        + times.ocr_sec
+        + times.annotate_draw_sec
+    )
+
+
+def _pipeline_encode_io_seconds(times: PipelineStepTimes) -> float:
+    return times.video_write_sec + times.other_sec
+
+
+@dataclass
+class PipelineModelBundle:
+    """Models loaded once for batch runs (call ``cleanup()`` when finished)."""
+
+    yolo: YoloDetector
+    lp_detector: LpDetector
+    ocr: Ocr
+    trash: TrashDetector
+    peeing: PeeingDetector
+    init_sec: float
+
+    def cleanup(self) -> None:
+        try:
+            self.peeing.close()
+        except Exception:
+            pass
+        try:
+            self.ocr.close()
+        except Exception:
+            pass
+
+
+@dataclass
+class VideoPipelineRecord:
+    """One row of metrics for batch manifests."""
+
+    input_path: str
+    output_path: str
+    success: bool
+    error: str | None
+    duration_sec: float
+    fps: float
+    width: int
+    height: int
+    total_frames: int
+    wall_sec: float
+    inference_sec: float
+    encode_io_sec: float
+    models_init_sec: float
+    times: PipelineStepTimes | None
+
+
+def load_pipeline_models() -> PipelineModelBundle:
+    """Load scene YOLO, LP, OCR, RF-DETR trash, and PeeingDetector once."""
+
+    _ensure_pytorch_cuda_kernels_work()
+    _log_visible_torch_cuda_device()
+
+    console.print("[bold]Models ready[/]")
+    t0 = time.perf_counter()
+    yolo = YoloDetector(conf_threshold=YOLO_CONFIDENCE)
+    yolo_ready = (
+        f"TensorRT [dim]{Path(YOLO_ENGINE_PATH).resolve()}[/]  "
+        f"max_batch={YOLO_TRT_BATCH_SIZE} dynamic={YOLO_TRT_DYNAMIC}"
+    )
+    _log_model_ready("Scene YOLO", yolo_ready)
+    lp_detector = LpDetector()
+    lp_ready = (
+        f"TensorRT [dim]{Path(LP_ENGINE_PATH).resolve()}[/]  "
+        f"max_batch={LP_TRT_BATCH_SIZE} dynamic={LP_TRT_DYNAMIC}"
+    )
+    _log_model_ready("License-plate YOLO", lp_ready)
+    ocr = Ocr()
+    _log_model_ready("PaddleOCR", f"inference device={ocr.paddle_device}")
+    trash = _load_trash_detector_required()
+    heads = getattr(trash, "_heads", None)
+    if heads:
+        w0 = heads[0][0]
+        _log_model_ready(
+            "RF-DETR TensorRT",
+            f"batch={w0.batch}  input {w0.height}×{w0.width}  "
+            f"{'CUDA preprocess' if w0.uses_cuda_preprocess() else 'CPU preprocess'}",
+        )
+    else:
+        _log_model_ready("RF-DETR", "loaded")
+    try:
+        peeing = PeeingDetector(
+            crop_margin=PEEING_CROP_MARGIN,
+            min_visibility=PEEING_MIN_VISIBILITY,
+            hand_groin_y_threshold=PEEING_HAND_GROIN_Y_THRESHOLD,
+            min_hits_per_second=PEEING_MIN_HITS_PER_SECOND,
+            seconds_required=PEEING_SECONDS_REQUIRED,
+            track_iou_threshold=PEEING_TRACK_IOU_THRESHOLD,
+            track_max_missed_seconds=PEEING_TRACK_MAX_MISSED_SECONDS,
+            pose_backend=PEEING_POSE_BACKEND,
+            model_path=PEEING_POSE_MODEL_PATH,
+            model_url=PEEING_POSE_MODEL_URL,
+            mediapipe_mode=PEEING_MEDIAPIPE_MODE,
+            mediapipe_delegate=PEEING_MEDIAPIPE_DELEGATE,
+            yolo_pose_model=PEEING_YOLO_POSE_MODEL,
+            yolo_pose_imgsz=PEEING_YOLO_POSE_IMGSZ,
+            yolo_pose_batch_size=PEEING_YOLO_POSE_BATCH_SIZE,
+            yolo_pose_trt_dynamic=PEEING_YOLO_POSE_TRT_DYNAMIC,
+            yolo_pose_device=PEEING_YOLO_POSE_DEVICE,
+            yolo_pose_trt_timing=PEEING_YOLO_POSE_TRT_TIMING,
+            yolo_pose_prefetch_debug=PEEING_YOLO_POSE_PREFETCH_DEBUG,
+            debug_timing=PEEING_DEBUG_TIMING,
+            max_pose_persons_per_frame=PEEING_MAX_POSE_PERSONS_PER_FRAME,
+        )
+    except Exception as exc:
+        console.print(
+            "[red]PeeingDetector failed to initialize (required).[/]\n"
+            "If pose_backend is [bold]yolo[/]: ensure ``pip install ultralytics torch`` and a pose "
+            "``PEEING_YOLO_POSE_MODEL`` TensorRT ``.engine`` path.\n"
+            "If pose_backend is [bold]mediapipe[/]: ``pip install mediapipe`` and the Tasks pose bundle.\n"
+            f"[dim]{exc}[/]"
+        )
+        raise SystemExit(2) from exc
+    _pee_ready = (
+        f"YOLO pose [dim]{Path(PEEING_YOLO_POSE_MODEL).expanduser().resolve()}[/]"
+        if PEEING_POSE_BACKEND == "yolo"
+        else f"MediaPipe pose [dim]{Path(PEEING_POSE_MODEL_PATH).expanduser().resolve()}[/]"
+    )
+    _log_model_ready(
+        "PeeingDetector",
+        _pee_ready,
+    )
+    if PEEING_POSE_BACKEND == "yolo":
+        _pee_hint_extra = (
+            f"YOLO pose TensorRT/default: [dim]{Path(PEEING_YOLO_POSE_MODEL).name}[/]  "
+            f"batch={PEEING_YOLO_POSE_BATCH_SIZE}  imgsz={PEEING_YOLO_POSE_IMGSZ}"
+        )
+        if PEEING_YOLO_POSE_DEVICE:
+            _pee_hint_extra += f"; device={PEEING_YOLO_POSE_DEVICE!r}"
+    else:
+        _pee_hint_extra = (
+            f"MediaPipe Tasks; mode [cyan]{PEEING_MEDIAPIPE_MODE}[/], "
+            f"delegate [cyan]{PEEING_MEDIAPIPE_DELEGATE}[/]"
+        )
+    console.print(
+        "[dim]Peeing hint:[/] standing + hand near groin; "
+        f"≥{PEEING_MIN_HITS_PER_SECOND} sampled pose hits per calendar second for "
+        f"{PEEING_SECONDS_REQUIRED} consecutive seconds; IoU person tracks; "
+        f"{_pee_hint_extra}."
+    )
+    t_init_done = time.perf_counter()
+    init_sec = t_init_done - t0
+    console.print(f"[dim]Model init wall time: {init_sec:.2f}s[/]")
+    return PipelineModelBundle(
+        yolo=yolo,
+        lp_detector=lp_detector,
+        ocr=ocr,
+        trash=trash,
+        peeing=peeing,
+        init_sec=init_sec,
+    )
+
+
+def run_pipeline_video(
+    bundle: PipelineModelBundle,
+    video_path: str,
+    output_video: str,
+    *,
+    per_video_times_init_sec: float,
+    models_init_sec: float,
+    abort_on_error: bool = True,
+) -> VideoPipelineRecord:
+    """Run the uniform-stride pipeline on one video using an existing model bundle.
+
+    Does **not** call ``bundle.cleanup()`` (caller closes models after the last video).
+    """
+
+    def _fail(
+        msg: str,
+        *,
+        wall_sec: float = 0.0,
+        duration_sec: float = 0.0,
+        fps: float = 0.0,
+        width: int = 0,
+        height: int = 0,
+        total_frames: int = 0,
+    ) -> VideoPipelineRecord:
+        console.print(f"[red]{msg}[/]")
+        if abort_on_error:
+            m = msg.lower()
+            if "not found" in m:
+                sys.exit(2)
+            if "invalid fps" in m:
+                sys.exit(4)
+            sys.exit(3)
+        return VideoPipelineRecord(
+            input_path=video_path,
+            output_path=output_video,
+            success=False,
+            error=msg,
+            duration_sec=duration_sec,
+            fps=fps,
+            width=width,
+            height=height,
+            total_frames=total_frames,
+            wall_sec=wall_sec,
+            inference_sec=0.0,
+            encode_io_sec=0.0,
+            models_init_sec=models_init_sec,
+            times=None,
+        )
+
+    wall_start_video = time.perf_counter()
+    times = PipelineStepTimes()
+    times.init_sec = per_video_times_init_sec
+
+    if not os.path.exists(video_path):
+        return _fail(f"Video not found: {video_path}", wall_sec=time.perf_counter() - wall_start_video)
+
+    t_io = time.perf_counter()
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return _fail(f"Failed to open video: {video_path}", wall_sec=time.perf_counter() - wall_start_video)
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS))
+    if fps <= 0:
+        try:
+            cap.release()
+        except Exception:
+            pass
+        return _fail(f"Invalid FPS: {fps}", wall_sec=time.perf_counter() - wall_start_video)
+
+    if fps < float(INPUT_VIDEO_FPS_MIN) or fps > float(INPUT_VIDEO_FPS_MAX):
+        console.print(
+            f"[yellow]Warning:[/] reported FPS {fps:.2f} is outside the nominal input range "
+            f"[{INPUT_VIDEO_FPS_MIN}, {INPUT_VIDEO_FPS_MAX}] — timing/stride math assumes {INPUT_VIDEO_FPS_MIN}–{INPUT_VIDEO_FPS_MAX} fps."
+        )
+
+    stride_n, stride_detail = _resolve_frame_sample_stride(fps)
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    duration_sec = (total_frames / fps) if fps > 0 else 0.0
+    console.print(
+        f"[cyan]Video capture[/] opened  {width}×{height} @ {fps:.2f} fps  ({total_frames} frames)"
+    )
+
+    cap = _maybe_wrap_capture(cap, queue_size=PIPELINE_READ_AHEAD_QUEUE_SIZE)
+
+    bundle.peeing.reset()
+
+    yolo = bundle.yolo
+    lp_detector = bundle.lp_detector
+    ocr = bundle.ocr
+    trash = bundle.trash
+    peeing = bundle.peeing
+
+    annots = _make_frame_annotators(width, height)
+    lp_cache = VehicleLpOcrCache(
+        LP_VEHICLE_LP_STRIDE,
+        lp_lock_refresh_stride=LP_LOCK_REFRESH_STRIDE,
+        ocr_lock_confidence=OCR_LOCK_CONFIDENCE,
+    )
+    lp_batch = LpBatchCoordinator(
+        lp_detector=lp_detector,
+        ocr=ocr,
+        cache=lp_cache,
+        times=times,
+        max_crops=max(1, int(LP_BATCH_MAX_CROPS)),
+        max_latency_frames=max(0, int(LP_BATCH_MAX_LATENCY_FRAMES)),
+        enabled=bool(LP_BATCH_ENABLED),
+    )
+
+    out_dir = os.path.dirname(os.path.abspath(output_video))
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    out, sink_label = _open_output_video_sink(
+        output_video,
+        fps=fps,
+        width=width,
+        height=height,
+    )
+    out = _maybe_wrap_video_sink(out, queue_size=PIPELINE_WRITE_QUEUE_SIZE)
+    _log_pipeline_run_configuration(
+        video_path=video_path,
+        width=width,
+        height=height,
+        fps=fps,
+        total_frames=total_frames,
+        output_video=output_video,
+        sink_label=sink_label,
+        trash=trash,
+        frame_stride=stride_n,
+        stride_detail=stride_detail,
+    )
+    times.other_sec += time.perf_counter() - t_io
+
+    yolo.reset_inference_batch_stats()
+    lp_detector.reset_inference_batch_stats()
+    peeing.reset_inference_batch_stats()
+
+    try:
+        _run_pipeline_uniform_stride_batched(
+            cap=cap,
+            out=out,
+            fps=fps,
+            total_frames=total_frames,
+            yolo=yolo,
+            lp_detector=lp_detector,
+            ocr=ocr,
+            trash=trash,
+            times=times,
+            annots=annots,
+            peeing=peeing,
+            lp_cache=lp_cache,
+            stride=stride_n,
+            lp_batch=lp_batch,
+        )
+
+        console.print(f"[green]Annotated video saved:[/] {output_video}")
+
+    finally:
+        try:
+            cap.release()
+        except Exception:
+            pass
+        try:
+            out.release()
+        except Exception:
+            pass
+
+    wall_sec = time.perf_counter() - wall_start_video
+    _ingest_ultralytics_pipeline_stats(times, yolo, lp_detector, peeing)
+    inf_sec = _pipeline_inference_seconds(times)
+    enc_sec = _pipeline_encode_io_seconds(times)
+
+    return VideoPipelineRecord(
+        input_path=video_path,
+        output_path=output_video,
+        success=True,
+        error=None,
+        duration_sec=duration_sec,
+        fps=fps,
+        width=width,
+        height=height,
+        total_frames=total_frames,
+        wall_sec=wall_sec,
+        inference_sec=inf_sec,
+        encode_io_sec=enc_sec,
+        models_init_sec=models_init_sec,
+        times=times,
+    )
+
+
+def run_pipeline(video_path: str, output_video: str) -> None:
+    """Process ``video_path`` and write annotated video to ``output_video``."""
+
+    wall_start = time.perf_counter()
+
+    if not os.path.exists(video_path):
+        console.print(f"[red]Video not found:[/] {video_path}")
+        sys.exit(2)
+
+    bundle = load_pipeline_models()
+    try:
+        rec = run_pipeline_video(
+            bundle,
+            video_path,
+            output_video,
+            per_video_times_init_sec=bundle.init_sec,
+            models_init_sec=bundle.init_sec,
+            abort_on_error=True,
+        )
+    finally:
+        bundle.cleanup()
+
+    wall_total = time.perf_counter() - wall_start
+    if rec.times is not None:
+        rec.times.print_summary(wall_total_sec=wall_total)
+
+
 def _ingest_ultralytics_pipeline_stats(
     times: PipelineStepTimes, yolo: YoloDetector, lp: LpDetector, peeing: PeeingDetector
 ) -> None:
@@ -1952,222 +2337,6 @@ def _run_pipeline_uniform_stride_batched(
             pbar.close()
         except Exception:
             pass
-
-
-def run_pipeline(video_path: str, output_video: str) -> None:
-    """Process ``video_path`` and write annotated video to ``output_video``."""
-    wall_start = time.perf_counter()
-    times = PipelineStepTimes()
-
-    if not os.path.exists(video_path):
-        console.print(f"[red]Video not found:[/] {video_path}")
-        sys.exit(2)
-
-    _ensure_pytorch_cuda_kernels_work()
-    _log_visible_torch_cuda_device()
-
-    console.print("[bold]Models ready[/]")
-    t0 = time.perf_counter()
-    yolo = YoloDetector(conf_threshold=YOLO_CONFIDENCE)
-    yolo_ready = (
-        f"TensorRT [dim]{Path(YOLO_ENGINE_PATH).resolve()}[/]  "
-        f"max_batch={YOLO_TRT_BATCH_SIZE} dynamic={YOLO_TRT_DYNAMIC}"
-    )
-    _log_model_ready("Scene YOLO", yolo_ready)
-    lp_detector = LpDetector()
-    lp_ready = (
-        f"TensorRT [dim]{Path(LP_ENGINE_PATH).resolve()}[/]  "
-        f"max_batch={LP_TRT_BATCH_SIZE} dynamic={LP_TRT_DYNAMIC}"
-    )
-    _log_model_ready("License-plate YOLO", lp_ready)
-    ocr = Ocr()
-    _log_model_ready("PaddleOCR", f"inference device={ocr.paddle_device}")
-    trash = _load_trash_detector_required()
-    heads = getattr(trash, "_heads", None)
-    if heads:
-        w0 = heads[0][0]
-        _log_model_ready(
-            "RF-DETR TensorRT",
-            f"batch={w0.batch}  input {w0.height}×{w0.width}  "
-            f"{'CUDA preprocess' if w0.uses_cuda_preprocess() else 'CPU preprocess'}",
-        )
-    else:
-        _log_model_ready("RF-DETR", "loaded")
-    t_init_done = time.perf_counter()
-    times.init_sec = t_init_done - t0
-    console.print(f"[dim]Model init wall time: {times.init_sec:.2f}s[/]")
-
-    t_io = time.perf_counter()
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        console.print(f"[red]Failed to open video:[/] {video_path}")
-        sys.exit(3)
-
-    fps = float(cap.get(cv2.CAP_PROP_FPS))
-    if fps <= 0:
-        console.print(f"[red]Invalid FPS:[/] {fps}")
-        sys.exit(4)
-
-    if fps < float(INPUT_VIDEO_FPS_MIN) or fps > float(INPUT_VIDEO_FPS_MAX):
-        console.print(
-            f"[yellow]Warning:[/] reported FPS {fps:.2f} is outside the nominal input range "
-            f"[{INPUT_VIDEO_FPS_MIN}, {INPUT_VIDEO_FPS_MAX}] — timing/stride math assumes {INPUT_VIDEO_FPS_MIN}–{INPUT_VIDEO_FPS_MAX} fps."
-        )
-
-    stride_n, stride_detail = _resolve_frame_sample_stride(fps)
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    console.print(
-        f"[cyan]Video capture[/] opened  {width}×{height} @ {fps:.2f} fps  ({total_frames} frames)"
-    )
-
-    cap = _maybe_wrap_capture(cap, queue_size=PIPELINE_READ_AHEAD_QUEUE_SIZE)
-
-    try:
-        peeing = PeeingDetector(
-            crop_margin=PEEING_CROP_MARGIN,
-            min_visibility=PEEING_MIN_VISIBILITY,
-            hand_groin_y_threshold=PEEING_HAND_GROIN_Y_THRESHOLD,
-            min_hits_per_second=PEEING_MIN_HITS_PER_SECOND,
-            seconds_required=PEEING_SECONDS_REQUIRED,
-            track_iou_threshold=PEEING_TRACK_IOU_THRESHOLD,
-            track_max_missed_seconds=PEEING_TRACK_MAX_MISSED_SECONDS,
-            pose_backend=PEEING_POSE_BACKEND,
-            model_path=PEEING_POSE_MODEL_PATH,
-            model_url=PEEING_POSE_MODEL_URL,
-            mediapipe_mode=PEEING_MEDIAPIPE_MODE,
-            mediapipe_delegate=PEEING_MEDIAPIPE_DELEGATE,
-            yolo_pose_model=PEEING_YOLO_POSE_MODEL,
-            yolo_pose_imgsz=PEEING_YOLO_POSE_IMGSZ,
-            yolo_pose_batch_size=PEEING_YOLO_POSE_BATCH_SIZE,
-            yolo_pose_trt_dynamic=PEEING_YOLO_POSE_TRT_DYNAMIC,
-            yolo_pose_device=PEEING_YOLO_POSE_DEVICE,
-            yolo_pose_trt_timing=PEEING_YOLO_POSE_TRT_TIMING,
-            yolo_pose_prefetch_debug=PEEING_YOLO_POSE_PREFETCH_DEBUG,
-            debug_timing=PEEING_DEBUG_TIMING,
-            max_pose_persons_per_frame=PEEING_MAX_POSE_PERSONS_PER_FRAME,
-        )
-    except Exception as exc:
-        console.print(
-            "[red]PeeingDetector failed to initialize (required).[/]\n"
-            "If pose_backend is [bold]yolo[/]: ensure ``pip install ultralytics torch`` and a pose "
-            "``PEEING_YOLO_POSE_MODEL`` TensorRT ``.engine`` path.\n"
-            "If pose_backend is [bold]mediapipe[/]: ``pip install mediapipe`` and the Tasks pose bundle.\n"
-            f"[dim]{exc}[/]"
-        )
-        raise SystemExit(2) from exc
-    _pee_ready = (
-        f"YOLO pose [dim]{Path(PEEING_YOLO_POSE_MODEL).expanduser().resolve()}[/]"
-        if PEEING_POSE_BACKEND == "yolo"
-        else f"MediaPipe pose [dim]{Path(PEEING_POSE_MODEL_PATH).expanduser().resolve()}[/]"
-    )
-    _log_model_ready(
-        "PeeingDetector",
-        _pee_ready,
-    )
-    if PEEING_POSE_BACKEND == "yolo":
-        _pee_hint_extra = (
-            f"YOLO pose TensorRT/default: [dim]{Path(PEEING_YOLO_POSE_MODEL).name}[/]  "
-            f"batch={PEEING_YOLO_POSE_BATCH_SIZE}  imgsz={PEEING_YOLO_POSE_IMGSZ}"
-        )
-        if PEEING_YOLO_POSE_DEVICE:
-            _pee_hint_extra += f"; device={PEEING_YOLO_POSE_DEVICE!r}"
-    else:
-        _pee_hint_extra = (
-            f"MediaPipe Tasks; mode [cyan]{PEEING_MEDIAPIPE_MODE}[/], "
-            f"delegate [cyan]{PEEING_MEDIAPIPE_DELEGATE}[/]"
-        )
-    console.print(
-        "[dim]Peeing hint:[/] standing + hand near groin; "
-        f"≥{PEEING_MIN_HITS_PER_SECOND} sampled pose hits per calendar second for "
-        f"{PEEING_SECONDS_REQUIRED} consecutive seconds; IoU person tracks; "
-        f"{_pee_hint_extra}."
-    )
-
-    annots = _make_frame_annotators(width, height)
-    lp_cache = VehicleLpOcrCache(
-        LP_VEHICLE_LP_STRIDE,
-        lp_lock_refresh_stride=LP_LOCK_REFRESH_STRIDE,
-        ocr_lock_confidence=OCR_LOCK_CONFIDENCE,
-    )
-    lp_batch = LpBatchCoordinator(
-        lp_detector=lp_detector,
-        ocr=ocr,
-        cache=lp_cache,
-        times=times,
-        max_crops=max(1, int(LP_BATCH_MAX_CROPS)),
-        max_latency_frames=max(0, int(LP_BATCH_MAX_LATENCY_FRAMES)),
-        enabled=bool(LP_BATCH_ENABLED),
-    )
-
-    out_dir = os.path.dirname(os.path.abspath(output_video))
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-
-    out, sink_label = _open_output_video_sink(
-        output_video,
-        fps=fps,
-        width=width,
-        height=height,
-    )
-    out = _maybe_wrap_video_sink(out, queue_size=PIPELINE_WRITE_QUEUE_SIZE)
-    _log_pipeline_run_configuration(
-        video_path=video_path,
-        width=width,
-        height=height,
-        fps=fps,
-        total_frames=total_frames,
-        output_video=output_video,
-        sink_label=sink_label,
-        trash=trash,
-        frame_stride=stride_n,
-        stride_detail=stride_detail,
-    )
-    times.other_sec += time.perf_counter() - t_io
-
-    yolo.reset_inference_batch_stats()
-    lp_detector.reset_inference_batch_stats()
-    peeing.reset_inference_batch_stats()
-
-    try:
-        _run_pipeline_uniform_stride_batched(
-            cap=cap,
-            out=out,
-            fps=fps,
-            total_frames=total_frames,
-            yolo=yolo,
-            lp_detector=lp_detector,
-            ocr=ocr,
-            trash=trash,
-            times=times,
-            annots=annots,
-            peeing=peeing,
-            lp_cache=lp_cache,
-            stride=stride_n,
-            lp_batch=lp_batch,
-        )
-
-        console.print(f"[green]Annotated video saved:[/] {output_video}")
-
-    finally:
-        try:
-            peeing.close()
-        except Exception:
-            pass
-        try:
-            cap.release()
-        except Exception:
-            pass
-        try:
-            out.release()
-        except Exception:
-            pass
-
-    wall_total = time.perf_counter() - wall_start
-    _ingest_ultralytics_pipeline_stats(times, yolo, lp_detector, peeing)
-    times.print_summary(wall_total_sec=wall_total)
 
 
 if __name__ == "__main__":
