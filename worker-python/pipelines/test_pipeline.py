@@ -15,7 +15,7 @@ Scene YOLO only on frames where ``frame_idx % stride == 0``, micro-batched with 
 Skipped frames reuse carried scene boxes for peeing and cached plate redraw.
 Production inputs are expected at **5–60 FPS** nominal (warning if the container reports otherwise).
 
-**Output video** — ``OUTPUT_VIDEO_ENCODER`` in ``settings.py`` (``auto``, ``nvenc``, ``mp4v``).
+**Output video** — ``OUTPUT_VIDEO_ENCODER`` in ``settings.py`` (``auto``/``nvenc`` require ffmpeg NVENC; ``mp4v`` is explicit CPU only).
 """
 
 from __future__ import annotations
@@ -73,13 +73,8 @@ from settings import (
     PEEING_DEBUG_TIMING,
     PEEING_HAND_GROIN_Y_THRESHOLD,
     PEEING_MAX_POSE_PERSONS_PER_FRAME,
-    PEEING_MEDIAPIPE_DELEGATE,
-    PEEING_MEDIAPIPE_MODE,
     PEEING_MIN_HITS_PER_SECOND,
     PEEING_MIN_VISIBILITY,
-    PEEING_POSE_BACKEND,
-    PEEING_POSE_MODEL_PATH,
-    PEEING_POSE_MODEL_URL,
     PEEING_SECONDS_REQUIRED,
     PEEING_TRACK_IOU_THRESHOLD,
     PEEING_TRACK_MAX_MISSED_SECONDS,
@@ -262,21 +257,15 @@ def _log_pipeline_run_configuration(
     console.print(f"  Output [dim]{Path(output_video).resolve()}[/]")
     console.print(f"  Writer [cyan]{sink_label}[/]")
     _pee_cfg = (
-        (
-            f"{Path(PEEING_YOLO_POSE_MODEL).expanduser().resolve()}  "
-            f"batch={PEEING_YOLO_POSE_BATCH_SIZE}  backend=yolo"
-        )
-        if PEEING_POSE_BACKEND == "yolo"
-        else f"{Path(PEEING_POSE_MODEL_PATH).expanduser().resolve()}  backend=mediapipe"
+        f"{Path(PEEING_YOLO_POSE_MODEL).expanduser().resolve()}  "
+        f"batch={PEEING_YOLO_POSE_BATCH_SIZE}  backend=yolo"
     )
     console.print(f"  Peeing [dim]{_pee_cfg}[/]")
-    if _trt_timing_enabled() or (
-        PEEING_POSE_BACKEND == "yolo" and bool(PEEING_YOLO_POSE_TRT_TIMING)
-    ):
+    if _trt_timing_enabled() or bool(PEEING_YOLO_POSE_TRT_TIMING):
         parts = []
         if _trt_timing_enabled():
             parts.append("RF-DETR ``[TRT]``")
-        if PEEING_POSE_BACKEND == "yolo" and bool(PEEING_YOLO_POSE_TRT_TIMING):
+        if bool(PEEING_YOLO_POSE_TRT_TIMING):
             parts.append("YOLO pose ``[pose-TRT]``")
         console.print(
             f"  [yellow]Verbose TRT timing is on[/] — expect extra lines: {', '.join(parts)}."
@@ -446,7 +435,7 @@ def _ffmpeg_nvenc_smoke_test(ffmpeg_bin: str) -> bool:
 
 
 class _Cv2Mp4vSink:
-    """OpenCV ``mp4v`` into MP4 (CPU MPEG-4 Part 2; portable fallback)."""
+    """OpenCV ``mp4v`` into MP4 (CPU MPEG-4 Part 2). Used only when ``OUTPUT_VIDEO_ENCODER=mp4v``."""
 
     def __init__(self, path: str, fps: float, width: int, height: int) -> None:
         self._w = cv2.VideoWriter(
@@ -553,60 +542,57 @@ def _open_output_video_sink(
     height: int,
     encoder_mode: str | None = None,
 ) -> tuple[VideoWriterSink, str]:
-    """Open a video sink: NVENC (ffmpeg) when allowed and available, else OpenCV ``mp4v``."""
+    """Open a video sink: ``auto``/``nvenc`` require working ffmpeg ``h264_nvenc``; ``mp4v`` is explicit CPU only."""
     mode = (encoder_mode or OUTPUT_VIDEO_ENCODER or "auto").strip().lower()
     p = FFMPEG_PATH.strip()
     ffmpeg_bin = shutil.which(p)
     if ffmpeg_bin is None and os.path.isabs(p) and os.path.isfile(p) and os.access(p, os.X_OK):
         ffmpeg_bin = p
 
-    want_nvenc = mode in ("auto", "nvenc")
-    nvenc_ok = bool(ffmpeg_bin and _ffmpeg_nvenc_smoke_test(ffmpeg_bin))
+    if mode == "mp4v":
+        sink_mp4v: VideoWriterSink = _Cv2Mp4vSink(output_path, fps, width, height)
+        return sink_mp4v, "OpenCV VideoWriter mp4v (CPU)"
 
-    if want_nvenc and nvenc_ok:
-        try:
-            sink: VideoWriterSink = _FfmpegNvencSink(
-                output_path,
-                fps,
-                width,
-                height,
-                ffmpeg_bin=ffmpeg_bin,
-                preset=NVENC_PRESET,
-                cq=NVENC_CQ,
-            )
-            return (
-                sink,
-                f"ffmpeg h264_nvenc (preset={NVENC_PRESET!r}, cq={NVENC_CQ})",
-            )
-        except Exception as exc:
-            if mode == "nvenc":
-                console.print(
-                    "[red]OUTPUT_VIDEO_ENCODER=nvenc but ffmpeg NVENC writer failed:[/]\n"
-                    f"  [dim]{type(exc).__name__}: {exc}[/]"
-                )
-                raise SystemExit(3) from exc
-            console.print(
-                f"[yellow]ffmpeg h264_nvenc failed ({type(exc).__name__}: {exc}); "
-                "falling back to OpenCV mp4v.[/]"
-            )
-
-    if mode == "nvenc" and not nvenc_ok:
+    if mode not in ("auto", "nvenc"):
         console.print(
-            "[red]OUTPUT_VIDEO_ENCODER=nvenc but h264_nvenc is not usable "
-            f"(ffmpeg={ffmpeg_bin!r}). Install ffmpeg with NVENC and a working NVIDIA driver.[/]"
+            f"[red]OUTPUT_VIDEO_ENCODER must be 'auto', 'nvenc', or 'mp4v'; got {mode!r}[/]"
         )
         raise SystemExit(3)
 
-    if mode == "auto" and want_nvenc and not nvenc_ok:
-        reason = (
-            "ffmpeg not on PATH"
-            if not ffmpeg_bin
-            else "h264_nvenc smoke test failed (driver / ffmpeg build?)"
+    if not ffmpeg_bin:
+        console.print(
+            "[red]OUTPUT_VIDEO_ENCODER requires ffmpeg on PATH (see FFMPEG_PATH in settings.py).[/]"
         )
-        console.print(f"[dim]Video encoder:[/] {reason}; using OpenCV mp4v.")
+        raise SystemExit(3)
 
-    sink2: VideoWriterSink = _Cv2Mp4vSink(output_path, fps, width, height)
-    return sink2, "OpenCV VideoWriter mp4v (CPU)"
+    if not _ffmpeg_nvenc_smoke_test(ffmpeg_bin):
+        console.print(
+            "[red]h264_nvenc smoke test failed (ffmpeg NVENC not usable on this host).[/]\n"
+            f"  ffmpeg={ffmpeg_bin!r}\n"
+            "  Install a GPU-enabled ffmpeg build and a working NVIDIA driver, or set OUTPUT_VIDEO_ENCODER='mp4v' explicitly for CPU encoding."
+        )
+        raise SystemExit(3)
+
+    try:
+        sink: VideoWriterSink = _FfmpegNvencSink(
+            output_path,
+            fps,
+            width,
+            height,
+            ffmpeg_bin=ffmpeg_bin,
+            preset=NVENC_PRESET,
+            cq=NVENC_CQ,
+        )
+        return (
+            sink,
+            f"ffmpeg h264_nvenc (preset={NVENC_PRESET!r}, cq={NVENC_CQ})",
+        )
+    except Exception as exc:
+        console.print(
+            "[red]ffmpeg h264_nvenc writer failed (no fallback).[/]\n"
+            f"  [dim]{type(exc).__name__}: {exc}[/]"
+        )
+        raise SystemExit(3) from exc
 
 
 @dataclass
@@ -880,11 +866,6 @@ def load_pipeline_models() -> PipelineModelBundle:
             seconds_required=PEEING_SECONDS_REQUIRED,
             track_iou_threshold=PEEING_TRACK_IOU_THRESHOLD,
             track_max_missed_seconds=PEEING_TRACK_MAX_MISSED_SECONDS,
-            pose_backend=PEEING_POSE_BACKEND,
-            model_path=PEEING_POSE_MODEL_PATH,
-            model_url=PEEING_POSE_MODEL_URL,
-            mediapipe_mode=PEEING_MEDIAPIPE_MODE,
-            mediapipe_delegate=PEEING_MEDIAPIPE_DELEGATE,
             yolo_pose_model=PEEING_YOLO_POSE_MODEL,
             yolo_pose_imgsz=PEEING_YOLO_POSE_IMGSZ,
             yolo_pose_batch_size=PEEING_YOLO_POSE_BATCH_SIZE,
@@ -898,33 +879,22 @@ def load_pipeline_models() -> PipelineModelBundle:
     except Exception as exc:
         console.print(
             "[red]PeeingDetector failed to initialize (required).[/]\n"
-            "If pose_backend is [bold]yolo[/]: ensure ``pip install ultralytics torch`` and a pose "
+            "Ensure ``pip install ultralytics torch`` and a pose "
             "``PEEING_YOLO_POSE_MODEL`` TensorRT ``.engine`` path.\n"
-            "If pose_backend is [bold]mediapipe[/]: ``pip install mediapipe`` and the Tasks pose bundle.\n"
             f"[dim]{exc}[/]"
         )
         raise SystemExit(2) from exc
-    _pee_ready = (
-        f"YOLO pose [dim]{Path(PEEING_YOLO_POSE_MODEL).expanduser().resolve()}[/]"
-        if PEEING_POSE_BACKEND == "yolo"
-        else f"MediaPipe pose [dim]{Path(PEEING_POSE_MODEL_PATH).expanduser().resolve()}[/]"
-    )
+    _pee_ready = f"YOLO pose [dim]{Path(PEEING_YOLO_POSE_MODEL).expanduser().resolve()}[/]"
     _log_model_ready(
         "PeeingDetector",
         _pee_ready,
     )
-    if PEEING_POSE_BACKEND == "yolo":
-        _pee_hint_extra = (
-            f"YOLO pose TensorRT/default: [dim]{Path(PEEING_YOLO_POSE_MODEL).name}[/]  "
-            f"batch={PEEING_YOLO_POSE_BATCH_SIZE}  imgsz={PEEING_YOLO_POSE_IMGSZ}"
-        )
-        if PEEING_YOLO_POSE_DEVICE:
-            _pee_hint_extra += f"; device={PEEING_YOLO_POSE_DEVICE!r}"
-    else:
-        _pee_hint_extra = (
-            f"MediaPipe Tasks; mode [cyan]{PEEING_MEDIAPIPE_MODE}[/], "
-            f"delegate [cyan]{PEEING_MEDIAPIPE_DELEGATE}[/]"
-        )
+    _pee_hint_extra = (
+        f"YOLO pose TensorRT/default: [dim]{Path(PEEING_YOLO_POSE_MODEL).name}[/]  "
+        f"batch={PEEING_YOLO_POSE_BATCH_SIZE}  imgsz={PEEING_YOLO_POSE_IMGSZ}"
+    )
+    if PEEING_YOLO_POSE_DEVICE:
+        _pee_hint_extra += f"; device={PEEING_YOLO_POSE_DEVICE!r}"
     console.print(
         "[dim]Peeing hint:[/] standing + hand near groin; "
         f"≥{PEEING_MIN_HITS_PER_SECOND} sampled pose hits per calendar second for "
@@ -2254,11 +2224,7 @@ def _run_pipeline_uniform_stride_batched(
                 times.yolo_sec += time.perf_counter() - t_y
 
             pose_prefetch_by_idx: dict[int, list[bool | None]] = {}
-            if (
-                PEEING_POSE_BACKEND == "yolo"
-                and PEEING_YOLO_POSE_CROSS_FRAME_BATCH
-                and sampled_fds
-            ):
+            if PEEING_YOLO_POSE_CROSS_FRAME_BATCH and sampled_fds:
                 pref_items = [
                     (i, img, scene_by_idx[i])
                     for (i, img) in window
@@ -2283,11 +2249,7 @@ def _run_pipeline_uniform_stride_batched(
                 t_p = time.perf_counter()
                 ts = i / fps
                 pre_hits: list[bool | None] | None = None
-                if (
-                    run_yolo
-                    and PEEING_POSE_BACKEND == "yolo"
-                    and PEEING_YOLO_POSE_CROSS_FRAME_BATCH
-                ):
+                if run_yolo and PEEING_YOLO_POSE_CROSS_FRAME_BATCH:
                     pre_hits = pose_prefetch_by_idx.get(i)
                 pstate = peeing.update(
                     img,

@@ -50,7 +50,6 @@ def main() -> None:
     try:
         with patch("ultralytics.YOLO", return_value=MagicMock()):
             peeing = PeeingDetector(
-                pose_backend="yolo",
                 yolo_pose_model=engine_path,
                 yolo_pose_batch_size=8,
             )

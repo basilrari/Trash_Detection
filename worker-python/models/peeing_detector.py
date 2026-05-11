@@ -1,7 +1,7 @@
-"""Peeing cue from pose on scene-YOLO person crops (YOLO pose or MediaPipe Tasks).
+"""Peeing cue from pose on scene-YOLO person crops (YOLO pose only).
 
 **Frame rule:** standing (hips above knees) and either wrist within ``hand_groin_y_threshold``
-(normalized crop Y) of mid-groin — same thresholds for both backends (COCO vs BlazePose indices).
+(normalized crop Y) of mid-groin (COCO keypoints).
 
 **Temporal rule (stride-aware):** scene YOLO (and thus pose) runs only on stride-sampled frames.
 Per calendar second of video time, each **tracked** person counts sampled frames and pose-hits.
@@ -11,16 +11,13 @@ After ``seconds_required`` consecutive positive seconds, that person is **confir
 Uses detections already passed from the pipeline (no second scene-YOLO call).
 
 **YOLO pose:** runtime is a **batched** Ultralytics **TensorRT** ``.engine`` only (fixed batch, FP16 typical).
-**MediaPipe:** Tasks bundle ``pose_landmarker_*.task``; GPU uses TFLite/EGL.
 """
 
 from __future__ import annotations
 
-import logging
 import math
 import sys
 import time
-import urllib.request
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -30,21 +27,7 @@ import cv2
 import numpy as np
 
 from models.types import Detection
-from models.ultralytics_call_stats import UltralyticsCallStats, empty_ultralytics_call_stats
-
-logger = logging.getLogger(__name__)
-
-
-class BlazePoseLandmark(IntEnum):
-    """BlazePose 33-point indices for MediaPipe :class:`PoseLandmarker` (Tasks API)."""
-
-    LEFT_HIP = 23
-    RIGHT_HIP = 24
-    LEFT_KNEE = 25
-    RIGHT_KNEE = 26
-    LEFT_WRIST = 15
-    RIGHT_WRIST = 16
-
+from models.ultralytics_call_stats import UltralyticsCallStats
 
 class Coco17Landmark(IntEnum):
     """COCO 17 keypoints (Ultralytics YOLO pose)."""
@@ -57,8 +40,7 @@ class Coco17Landmark(IntEnum):
     RIGHT_KNEE = 14
 
 
-PoseBackend = Literal["mediapipe", "yolo"]
-MediaPipeMode = Literal["image", "video"]
+PoseBackend = Literal["yolo"]
 
 PERSON_LABELS = ("person",)
 
@@ -80,31 +62,6 @@ class PeeingState:
     edge_exit: bool
     mark_bboxes: Tuple[Tuple[float, float, float, float], ...]
     mark_bboxes_suspected: Tuple[Tuple[float, float, float, float], ...]
-
-
-def _mediapipe_wheel_supports_delegate_flag() -> bool:
-    """True if this ``mediapipe`` install passes ``BaseOptions.delegate`` into native code."""
-    from mediapipe.tasks.python.core import base_options_c as boc
-
-    fields = [f[0] for f in getattr(boc.BaseOptionsC, "_fields_", [])]
-    return "delegate" in fields
-
-
-def _ensure_pose_model_file(*, model_path: str, model_url: str) -> str:
-    p = Path(model_path)
-    if p.is_file() and p.stat().st_size > 0:
-        return str(p.resolve())
-    p.parent.mkdir(parents=True, exist_ok=True)
-    logger.info("Downloading pose landmarker model to %s", p)
-    tmp = p.with_suffix(p.suffix + ".part")
-    try:
-        urllib.request.urlretrieve(model_url, tmp)  # noqa: S310
-        tmp.replace(p)
-    except Exception:
-        if tmp.is_file():
-            tmp.unlink(missing_ok=True)
-        raise
-    return str(p.resolve())
 
 
 def _worker_root() -> Path:
@@ -147,7 +104,6 @@ class _PersonTrack:
     hits_in_bucket: int = 0
     consecutive_good_seconds: int = 0
     latched_confirm: bool = False
-    last_pose_timestamp_ms: int = -1
 
 
 class PeeingDetector:
@@ -162,12 +118,6 @@ class PeeingDetector:
         track_iou_threshold: float = 0.35,
         track_max_missed_seconds: float = 3.0,
         min_crop_side: int = 48,
-        pose_backend: PoseBackend = "yolo",
-        # MediaPipe-only
-        model_path: str | None = None,
-        model_url: str | None = None,
-        mediapipe_mode: MediaPipeMode = "image",
-        mediapipe_delegate: str = "auto",
         # YOLO pose-only (Ultralytics TensorRT ``.engine``; CUDA when torch sees a GPU unless overridden)
         yolo_pose_model: str | None = None,
         yolo_pose_imgsz: int = 640,
@@ -187,18 +137,6 @@ class PeeingDetector:
         self.track_iou_threshold = float(track_iou_threshold)
         self.track_max_missed_seconds = float(max(0.5, track_max_missed_seconds))
         self.min_crop_side = int(min_crop_side)
-
-        backend = str(pose_backend).strip().lower()
-        if backend not in ("mediapipe", "yolo"):
-            raise ValueError(f"pose_backend must be 'mediapipe' or 'yolo', got {pose_backend!r}")
-        self._pose_backend: PoseBackend = backend  # type: ignore[assignment]
-
-        mode = str(mediapipe_mode).strip().lower()
-        if mode not in ("image", "video"):
-            raise ValueError(
-                f"mediapipe_mode must be 'image' or 'video', got {mediapipe_mode!r}"
-            )
-        self._mediapipe_mode: MediaPipeMode = mode  # type: ignore[assignment]
 
         self.max_pose_persons_per_frame = (
             int(max_pose_persons_per_frame)
@@ -230,18 +168,9 @@ class PeeingDetector:
         self._dbg_pose_prefetch_frames = 0
         self._dbg_pose_prefetch_crops = 0
         self._dbg_pose_prefetch_unused_hits = 0
-        self._yolo_pose_trt_timing = bool(yolo_pose_trt_timing) and self._pose_backend == "yolo"
-        self._yolo_pose_prefetch_debug = bool(yolo_pose_prefetch_debug) and self._pose_backend == "yolo"
+        self._yolo_pose_trt_timing = bool(yolo_pose_trt_timing)
+        self._yolo_pose_prefetch_debug = bool(yolo_pose_prefetch_debug)
         self._pose_runtime_tag = ""
-
-        self._landmarker: Any = None
-        self._video_lms: Dict[int, Any] = {}
-        self._pose_delegate: Any | None = None
-        self._mp_image_mod: Any = None
-        self._mp_base_options_mod: Any = None
-        self._VisionTaskRunningMode: Any = None
-        self._PoseLandmarkerOptions: Any = None
-        self._PoseLandmarker: Any = None
 
         self._yolo_pose: Any = None
         self._yolo_pose_imgsz = max(32, int(yolo_pose_imgsz))
@@ -250,206 +179,55 @@ class PeeingDetector:
 
         import torch
 
-        if self._pose_backend == "yolo":
-            from ultralytics import YOLO
+        from ultralytics import YOLO
 
-            spec = yolo_pose_model
-            if not spec or not str(spec).strip():
-                raise ValueError("yolo_pose_model is required when pose_backend is 'yolo'")
-            wp = _resolve_model_path(str(spec).strip())
-            if wp.suffix.lower() != ".engine":
-                raise ValueError(
-                    f"YOLO pose requires a TensorRT .engine file; got: {wp}\n"
-                    "Set PEEING_YOLO_POSE_MODEL to a fixed-batch pose engine path."
-                )
-            if not wp.is_file():
-                raise FileNotFoundError(
-                    f"YOLO pose TensorRT engine not found: {wp}\n"
-                    "Place the pose .engine under worker-python/weights/ or pass an absolute path."
-                )
-            wp = wp.resolve()
-            self._yolo_pose_batch_size = max(1, int(yolo_pose_batch_size))
-            self._yolo_pose_trt_dynamic = bool(yolo_pose_trt_dynamic)
+        spec = yolo_pose_model
+        if not spec or not str(spec).strip():
+            raise ValueError("yolo_pose_model is required")
+        wp = _resolve_model_path(str(spec).strip())
+        if wp.suffix.lower() != ".engine":
+            raise ValueError(
+                f"YOLO pose requires a TensorRT .engine file; got: {wp}\n"
+                "Set PEEING_YOLO_POSE_MODEL to a fixed-batch pose engine path."
+            )
+        if not wp.is_file():
+            raise FileNotFoundError(
+                f"YOLO pose TensorRT engine not found: {wp}\n"
+                "Place the pose .engine under worker-python/weights/ or pass an absolute path."
+            )
+        wp = wp.resolve()
+        self._yolo_pose_batch_size = max(1, int(yolo_pose_batch_size))
+        self._yolo_pose_trt_dynamic = bool(yolo_pose_trt_dynamic)
 
-            self._yolo_pose = YOLO(str(wp))
-            if yolo_pose_device is None:
-                dev = "cuda:0" if torch.cuda.is_available() else "cpu"
-            else:
-                dev = str(yolo_pose_device).strip()
-            self._yolo_pose_device = dev
-            self._delegate_label = "cuda" if dev.startswith("cuda") else "cpu"
-            if dev.startswith("cuda") and not torch.cuda.is_available():
-                print(
-                    "[peeing] YOLO pose device requests CUDA but torch.cuda.is_available() is False — "
-                    "running on CPU.",
-                    file=sys.stderr,
+        self._yolo_pose = YOLO(str(wp))
+        if yolo_pose_device is None:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "YOLO pose requires CUDA when PEEING_YOLO_POSE_DEVICE is None (defaults to cuda:0). "
+                    "Use a CUDA-capable machine or set PEEING_YOLO_POSE_DEVICE explicitly."
                 )
-                self._yolo_pose_device = "cpu"
-                self._delegate_label = "cpu"
-            self._pose_runtime_tag = (
-                f"yolo:trt:b{self._yolo_pose_batch_size}:dyn{int(self._yolo_pose_trt_dynamic)}:"
-                f"{self._yolo_pose_device}"
-            )
-            print(
-                f"[peeing] YOLO pose weights={wp}  device={self._yolo_pose_device}  "
-                f"batch={self._yolo_pose_batch_size}  trt_dynamic={self._yolo_pose_trt_dynamic}  (trt)",
-                file=sys.stderr,
-            )
+            dev = "cuda:0"
         else:
-            self._init_mediapipe(
-                model_path=model_path,
-                model_url=model_url,
-                mediapipe_delegate=mediapipe_delegate,
+            dev = str(yolo_pose_device).strip()
+        if dev.startswith("cuda") and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"PEEING_YOLO_POSE_DEVICE is {dev!r} but torch.cuda.is_available() is False."
             )
+        self._yolo_pose_device = dev
+        self._delegate_label = "cuda" if dev.startswith("cuda") else "cpu"
+        self._pose_runtime_tag = (
+            f"yolo:trt:b{self._yolo_pose_batch_size}:dyn{int(self._yolo_pose_trt_dynamic)}:"
+            f"{self._yolo_pose_device}"
+        )
+        print(
+            f"[peeing] YOLO pose weights={wp}  device={self._yolo_pose_device}  "
+            f"batch={self._yolo_pose_batch_size}  trt_dynamic={self._yolo_pose_trt_dynamic}  (trt)",
+            file=sys.stderr,
+        )
 
         self._tracks: List[_PersonTrack] = []
         self._next_id = 1
         self._had_any_confirmed = False
-
-    def _init_mediapipe(
-        self,
-        *,
-        model_path: str | None,
-        model_url: str | None,
-        mediapipe_delegate: str,
-    ) -> None:
-        from mediapipe.tasks.python.core import base_options as mp_base_options
-        from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
-            VisionTaskRunningMode,
-        )
-        from mediapipe.tasks.python.vision.pose_landmarker import (
-            PoseLandmarker,
-            PoseLandmarkerOptions,
-        )
-        from mediapipe.tasks.python.vision.core import image as mp_image
-
-        self._mp_image_mod = mp_image
-        self._mp_base_options_mod = mp_base_options
-        self._VisionTaskRunningMode = VisionTaskRunningMode
-        self._PoseLandmarkerOptions = PoseLandmarkerOptions
-        self._PoseLandmarker = PoseLandmarker
-
-        cache_dir = Path.home() / ".cache" / "trash_detection_worker"
-        default_path = cache_dir / "pose_landmarker_lite.task"
-        default_url = (
-            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-            "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
-        )
-        resolved = _ensure_pose_model_file(
-            model_path=model_path or str(default_path),
-            model_url=model_url or default_url,
-        )
-
-        BO = mp_base_options.BaseOptions
-        ctypes_gpu = _mediapipe_wheel_supports_delegate_flag()
-        pref = str(mediapipe_delegate).strip().lower()
-        if pref not in ("cpu", "gpu", "auto"):
-            raise ValueError(
-                "mediapipe_delegate must be 'cpu', 'gpu', or 'auto', "
-                f"got {mediapipe_delegate!r}"
-            )
-
-        def base_opts(delegate_val: Any | None) -> Any:
-            if delegate_val is None:
-                return BO(model_asset_path=resolved)
-            return BO(model_asset_path=resolved, delegate=delegate_val)
-
-        def try_create_image(gpu: bool) -> Any:
-            del_val = BO.Delegate.GPU if gpu else None
-            opts = PoseLandmarkerOptions(
-                base_options=base_opts(del_val),
-                running_mode=VisionTaskRunningMode.IMAGE,
-            )
-            return PoseLandmarker.create_from_options(opts)
-
-        def try_create_probe(gpu: bool) -> Any:
-            return try_create_image(gpu)
-
-        want_try_gpu = pref in ("gpu", "auto") and ctypes_gpu
-        if pref in ("gpu", "auto") and not ctypes_gpu:
-            print(
-                "[peeing] This mediapipe wheel does not expose ``delegate`` in BaseOptions C API — "
-                "GPU cannot be enabled. Install a newer mediapipe (e.g. pip install -U mediapipe). "
-                "Docs: https://ai.google.dev/edge/api/mediapipe/python/mp/tasks/BaseOptions",
-                file=sys.stderr,
-            )
-            if pref == "gpu":
-                raise RuntimeError(
-                    "mediapipe_delegate=gpu requires a mediapipe build with GPU delegate support."
-                )
-
-        if self._mediapipe_mode == "image":
-            if pref == "cpu" or not want_try_gpu:
-                self._landmarker = try_create_image(False)
-                self._pose_delegate = None
-                self._delegate_label = "cpu"
-            else:
-                try:
-                    self._landmarker = try_create_image(True)
-                    self._pose_delegate = BO.Delegate.GPU
-                    self._delegate_label = "gpu"
-                except BaseException as exc:
-                    print(
-                        "[peeing] MediaPipe GPU PoseLandmarker failed; falling back to CPU. "
-                        f"{type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
-                    self._landmarker = try_create_image(False)
-                    self._pose_delegate = None
-                    self._delegate_label = "cpu_fallback"
-        else:
-            if pref == "cpu" or not want_try_gpu:
-                probe = try_create_probe(False)
-                probe.close()
-                self._pose_delegate = None
-                self._delegate_label = "cpu"
-            else:
-                try:
-                    probe = try_create_probe(True)
-                    probe.close()
-                    self._pose_delegate = BO.Delegate.GPU
-                    self._delegate_label = "gpu"
-                except BaseException as exc:
-                    print(
-                        "[peeing] MediaPipe GPU PoseLandmarker probe failed; using CPU. "
-                        f"{type(exc).__name__}: {exc}",
-                        file=sys.stderr,
-                    )
-                    probe = try_create_probe(False)
-                    probe.close()
-                    self._pose_delegate = None
-                    self._delegate_label = "cpu_fallback"
-
-        del BO
-
-        self._resolved_model_path = resolved
-        self._pose_runtime_tag = f"mediapipe:{self._mediapipe_mode}:{self._delegate_label}"
-
-        if self._delegate_label == "gpu":
-            print(
-                "[peeing] MediaPipe Tasks delegate: GPU (TensorFlow Lite GPU delegate / EGL-GL path on Linux — "
-                "not PyTorch CUDA). If you see SIGSEGV or EGL warnings, set mediapipe_delegate to cpu "
-                "(native crashes are not catchable in Python).",
-                file=sys.stderr,
-            )
-
-    def _pose_base_options(self) -> Any:
-        BO = self._mp_base_options_mod.BaseOptions
-        if self._pose_delegate is None:
-            return BO(model_asset_path=self._resolved_model_path)
-        return BO(model_asset_path=self._resolved_model_path, delegate=self._pose_delegate)
-
-    def _make_video_landmarker(self) -> Any:
-        opts = self._PoseLandmarkerOptions(
-            base_options=self._pose_base_options(),
-            running_mode=self._VisionTaskRunningMode.VIDEO,
-        )
-        return self._PoseLandmarker.create_from_options(opts)
-
-    def _dispose_track_landmarker(self, track_id: int) -> None:
-        lm = self._video_lms.pop(track_id, None)
-        if lm is not None:
-            lm.close()
 
     def close(self) -> None:
         self._emit_debug_timing_report()
@@ -459,16 +237,8 @@ class PeeingDetector:
                 tr.bucket_sec = None
                 tr.samples_in_bucket = 0
                 tr.hits_in_bucket = 0
-        lm = getattr(self, "_landmarker", None)
-        if lm is not None:
-            lm.close()
-            self._landmarker = None
-        for tid in list(self._video_lms.keys()):
-            self._dispose_track_landmarker(tid)
 
     def reset(self) -> None:
-        for tid in list(self._video_lms.keys()):
-            self._dispose_track_landmarker(tid)
         self._tracks.clear()
         self._next_id = 1
         self._had_any_confirmed = False
@@ -499,8 +269,6 @@ class PeeingDetector:
 
     def get_inference_batch_stats(self) -> UltralyticsCallStats:
         """Cumulative pose-crop batching stats (YOLO backend only)."""
-        if self._pose_backend != "yolo":
-            return empty_ultralytics_call_stats()
         return UltralyticsCallStats(
             self._dbg_pose_batch_in,
             self._dbg_pose_batch_launches,
@@ -529,7 +297,6 @@ class PeeingDetector:
             f"crop_too_small={self._dbg_crop_skips_small}  "
             f"hit_cap_skips={self._dbg_hit_cap_skips}  "
             f"gate_max_person_drop={self._dbg_gate_skipped_max_person}  "
-            f"pose_backend={self._pose_backend}  "
             f"pose_runtime={self._pose_runtime_tag}  "
             f"pose_batch_launches={self._dbg_pose_batch_launches}  "
             f"pose_batch_in={self._dbg_pose_batch_in}  "
@@ -553,9 +320,8 @@ class PeeingDetector:
         n = float(self._timing_n)
         ms = {k: 1000.0 * v / n for k, v in self._timing_sums.items()}
         total_ms = sum(ms.values())
-        label = "YOLO pose" if self._pose_backend == "yolo" else "MediaPipe pose"
         msg = (
-            f"[peeing] {label} timing (avg ms over {self._timing_n} crops): "
+            f"[peeing] YOLO pose timing (avg ms over {self._timing_n} crops): "
             f"bgr_to_rgb+contiguous={ms['to_rgb']:.2f}  "
             f"mp_Image()={ms['wrap_image']:.2f}  "
             f"detect()={ms['detect']:.2f}  "
@@ -588,47 +354,6 @@ class PeeingDetector:
             return None
         return xi1, yi1, xi2, yi2
 
-    def _lm_vis(self, lm) -> float:
-        v = getattr(lm, "visibility", None)
-        if v is None:
-            return 1.0
-        return float(v)
-
-    def _is_standing(self, lms: list, PL: type[BlazePoseLandmark]) -> bool:
-        lh = lms[PL.LEFT_HIP.value]
-        rh = lms[PL.RIGHT_HIP.value]
-        lk = lms[PL.LEFT_KNEE.value]
-        rk = lms[PL.RIGHT_KNEE.value]
-
-        def ok(lm) -> bool:
-            return self._lm_vis(lm) >= self.min_visibility
-
-        if not (ok(lh) and ok(rh) and ok(lk) and ok(rk)):
-            return False
-        if lh.y is None or rh.y is None or lk.y is None or rk.y is None:
-            return False
-        return bool(float(lh.y) < float(lk.y) and float(rh.y) < float(rk.y))
-
-    def _hand_near_groin(self, lms: list, PL: type[BlazePoseLandmark]) -> bool:
-        lh = lms[PL.LEFT_HIP.value]
-        rh = lms[PL.RIGHT_HIP.value]
-        lw = lms[PL.LEFT_WRIST.value]
-        rw = lms[PL.RIGHT_WRIST.value]
-
-        def ok(lm) -> bool:
-            return self._lm_vis(lm) >= self.min_visibility
-
-        if not ok(lh) or not ok(rh) or lh.y is None or rh.y is None:
-            return False
-        groin_y = (float(lh.y) + float(rh.y)) * 0.5
-        thr = self.hand_groin_y_threshold
-        for w in (lw, rw):
-            if not ok(w) or w.y is None:
-                continue
-            if abs(float(w.y) - groin_y) < thr:
-                return True
-        return False
-
     def _is_standing_coco(self, xyn: np.ndarray, conf: np.ndarray) -> bool:
         L = Coco17Landmark
         idxs = (L.LEFT_HIP, L.RIGHT_HIP, L.LEFT_KNEE, L.RIGHT_KNEE)
@@ -653,65 +378,6 @@ class PeeingDetector:
             if abs(float(xyn[wi, 1]) - groin_y) < thr:
                 return True
         return False
-
-    def _infer_pose_on_crop(
-        self,
-        crop_bgr: np.ndarray,
-        tr: _PersonTrack,
-        timestamp_sec: float,
-    ) -> bool:
-        if crop_bgr.size == 0 or crop_bgr.shape[0] < 16 or crop_bgr.shape[1] < 16:
-            return False
-
-        if self._pose_backend == "yolo":
-            return self._infer_yolo_pose_batch([crop_bgr])[0]
-
-        # --- MediaPipe ---
-        landmarker: Any
-        if self._mediapipe_mode == "image":
-            landmarker = self._landmarker
-        else:
-            landmarker = self._video_lms.get(tr.track_id)
-            if landmarker is None:
-                landmarker = self._make_video_landmarker()
-                self._video_lms[tr.track_id] = landmarker
-
-        dbg = self._debug_timing
-        t0 = time.perf_counter()
-        rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-        if not rgb.flags["C_CONTIGUOUS"]:
-            rgb = np.ascontiguousarray(rgb)
-        t1 = time.perf_counter()
-        mp_image = self._mp_image_mod.Image(self._mp_image_mod.ImageFormat.SRGB, rgb)
-        t2 = time.perf_counter()
-        if self._mediapipe_mode == "video":
-            ts_ms = int(timestamp_sec * 1000)
-            if ts_ms <= tr.last_pose_timestamp_ms:
-                ts_ms = tr.last_pose_timestamp_ms + 1
-            tr.last_pose_timestamp_ms = ts_ms
-            result = landmarker.detect_for_video(mp_image, ts_ms)
-        else:
-            result = landmarker.detect(mp_image)
-        t3 = time.perf_counter()
-        if not result.pose_landmarks:
-            if dbg:
-                self._timing_n += 1
-                self._timing_sums["to_rgb"] += t1 - t0
-                self._timing_sums["wrap_image"] += t2 - t1
-                self._timing_sums["detect"] += t3 - t2
-                self._timing_sums["heuristic"] += 0.0
-            return False
-        lms = list(result.pose_landmarks[0])
-        PL = BlazePoseLandmark
-        ok = self._is_standing(lms, PL) and self._hand_near_groin(lms, PL)
-        t4 = time.perf_counter()
-        if dbg:
-            self._timing_n += 1
-            self._timing_sums["to_rgb"] += t1 - t0
-            self._timing_sums["wrap_image"] += t2 - t1
-            self._timing_sums["detect"] += t3 - t2
-            self._timing_sums["heuristic"] += t4 - t3
-        return ok
 
     def _yolo_pose_hit_from_result(self, r: Any) -> bool:
         boxes = r.boxes
@@ -797,8 +463,6 @@ class PeeingDetector:
         for tr in self._tracks:
             if timestamp_sec - tr.last_sample_ts <= self.track_max_missed_seconds:
                 alive.append(tr)
-            else:
-                self._dispose_track_landmarker(tr.track_id)
         self._tracks = alive
 
     def _score_progress(self) -> float:
@@ -866,7 +530,7 @@ class PeeingDetector:
         Returns ``frame_idx -> list`` aligned to :meth:`_gated_pose_persons` ordering (same as
         :meth:`update`). Entries are ``None`` when the crop was invalid (too small after clamp).
         """
-        if self._pose_backend != "yolo" or not items:
+        if not items:
             return {}
         self._dbg_pose_prefetch_windows += 1
         self._dbg_pose_prefetch_frames += len(items)
@@ -960,14 +624,12 @@ class PeeingDetector:
         self._dbg_person_rows_total += len(persons)
 
         use_prefetch = (
-            self._pose_backend == "yolo"
-            and precomputed_yolo_pose_hits is not None
+            precomputed_yolo_pose_hits is not None
             and len(precomputed_yolo_pose_hits) == len(persons)
         )
 
         used_track_ids: set[int] = set()
         frame_any_hit = False
-        use_mp_video = self._pose_backend == "mediapipe" and self._mediapipe_mode == "video"
         yolo_pose_work: List[Tuple[_PersonTrack, np.ndarray]] = []
 
         for j, d in enumerate(persons):
@@ -994,8 +656,6 @@ class PeeingDetector:
                 )
                 self._next_id += 1
                 self._tracks.append(tr)
-                if use_mp_video:
-                    self._video_lms[tr.track_id] = self._make_video_landmarker()
 
             self._advance_bucket(tr, sec)
             tr.samples_in_bucket += 1
@@ -1018,25 +678,19 @@ class PeeingDetector:
             x1, y1, x2, y2 = box
             crop = frame_bgr[y1:y2, x1:x2]
             self._dbg_pose_calls += 1
-            if self._pose_backend == "yolo":
-                pc: Optional[bool] = (
-                    precomputed_yolo_pose_hits[j]
-                    if use_prefetch and precomputed_yolo_pose_hits is not None
-                    else None
-                )
-                if pc is not None:
-                    if pc:
-                        tr.hits_in_bucket += 1
-                        frame_any_hit = True
-                else:
-                    yolo_pose_work.append((tr, crop))
-            else:
-                hit = self._infer_pose_on_crop(crop, tr, ts)
-                if hit:
+            pc: Optional[bool] = (
+                precomputed_yolo_pose_hits[j]
+                if use_prefetch and precomputed_yolo_pose_hits is not None
+                else None
+            )
+            if pc is not None:
+                if pc:
                     tr.hits_in_bucket += 1
                     frame_any_hit = True
+            else:
+                yolo_pose_work.append((tr, crop))
 
-        if self._pose_backend == "yolo" and yolo_pose_work:
+        if yolo_pose_work:
             B = self._yolo_pose_batch_size
             for start in range(0, len(yolo_pose_work), B):
                 batch = yolo_pose_work[start : start + B]

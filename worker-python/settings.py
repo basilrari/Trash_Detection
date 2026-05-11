@@ -22,8 +22,8 @@ INPUT_VIDEO_FPS_MIN = 5
 INPUT_VIDEO_FPS_MAX = 60
 
 # --- Annotated output encoding (``pipelines.test_pipeline``) ---
-# OUTPUT_VIDEO_ENCODER: ``auto`` (try ``h264_nvenc`` via ffmpeg, else OpenCV ``mp4v``),
-# ``nvenc`` (ffmpeg only; fails fast if unavailable), ``mp4v`` (OpenCV only).
+# ``auto`` / ``nvenc``: require working ffmpeg ``h264_nvenc`` (no silent CPU fallback).
+# ``mp4v``: explicit OpenCV CPU writer only.
 OUTPUT_VIDEO_ENCODER = "auto"
 FFMPEG_PATH = "ffmpeg"
 NVENC_PRESET = "p4"
@@ -89,8 +89,8 @@ TRASH_CONFIDENCE = 0.4
 # Extra ``[TRT]`` timing lines from ``models/rfdetr_trt_trash.py``.
 RF_DETR_TRT_TIMING = False
 
-# RF-DETR preprocess: CPU (NumPy + OpenCV) unless CUDA opt-in:
-# ``"1"``, ``"true"``, ``"yes"``, ``"on"``, ``"cuda"``, ``"auto"`` (CUDA when available).
+# RF-DETR preprocess: CPU (NumPy + OpenCV) unless CUDA opt-in (requires PyTorch CUDA; **no CPU fallback**):
+# ``"1"``, ``"true"``, ``"yes"``, ``"on"``, ``"cuda"``, ``"auto"``.
 RF_DETR_PREPROCESS_CUDA = "1"
 
 # Run the cigarette TRT head on 1/N RF-DETR batches only (1 = every batch).
@@ -101,7 +101,8 @@ RF_DETR_MAX_QUEUE_LATENCY_FRAMES = 0
 
 # --- PaddleOCR (``models/ocr.py``) ---
 PADDLE_OCR_DEVICE = "gpu"
-PADDLE_OCR_ISOLATE_PROCESS: bool | None = None
+# PaddleOCR subprocess isolation (``spawn``). Must be explicit ``True`` or ``False`` (no heuristic).
+PADDLE_OCR_ISOLATE_PROCESS: bool = False
 
 # Re-run LP (+ downstream OCR) for a vehicle at most every N decoded frames (same track). 1 = every frame.
 LP_VEHICLE_LP_STRIDE = 3
@@ -121,24 +122,13 @@ PEEING_MIN_HITS_PER_SECOND = 3
 PEEING_TRACK_IOU_THRESHOLD = 0.35
 PEEING_TRACK_MAX_MISSED_SECONDS = 3.0
 
-# Pose model backend: ``yolo`` (Ultralytics COCO keypoints; default TensorRT ``.engine`` + batching) or ``mediapipe``.
-PEEING_POSE_BACKEND: str = "yolo"  # ``yolo`` | ``mediapipe``
-
-# MediaPipe Tasks backend: ``image`` (single ``detect()`` per crop) or ``video``
-# (one ``PoseLandmarker`` per IoU track, ``detect_for_video()`` — may reduce work when tracking is stable).
-PEEING_MEDIAPIPE_MODE: str = "video"  # ``image`` | ``video``
-
-# TensorFlow Lite GPU delegate (MediaPipe only): ``cpu``, ``gpu``, or ``auto``.
-# Not PyTorch CUDA. On some Linux + NVIDIA stacks the TFLite GPU / EGL path can **SIGSEGV during init**.
-PEEING_MEDIAPIPE_DELEGATE: str = "cpu"
-
 # YOLO pose: **TensorRT .engine only** (fixed batch, under ``weights/``). No PyTorch checkpoint path.
 PEEING_YOLO_POSE_MODEL = str(_w / "yolo11n-pose_b8_fp16.engine")
 PEEING_YOLO_POSE_BATCH_SIZE = 8
 # ``False``: pad short batches to ``PEEING_YOLO_POSE_BATCH_SIZE`` (matches static TRT export).
 PEEING_YOLO_POSE_TRT_DYNAMIC = False
 PEEING_YOLO_POSE_IMGSZ = 640
-PEEING_YOLO_POSE_DEVICE: str | None = None  # ``None`` → cuda:0 if available, else cpu
+PEEING_YOLO_POSE_DEVICE: str | None = None  # ``None`` → cuda:0 (requires CUDA; no CPU fallback)
 # Per-batch stderr lines from ``PeeingDetector`` (``[pose-TRT] …``): real crops, dummy padding, slack, ms.
 PEEING_YOLO_POSE_TRT_TIMING = False
 # Batch YOLO pose crops across all stride-sampled frames in each pipeline read window (before per-frame peeing updates).
@@ -152,10 +142,3 @@ PEEING_MAX_POSE_PERSONS_PER_FRAME: int | None = None
 # Log average per-step pose latency + call counters at PeeingDetector shutdown (stderr).
 PEEING_DEBUG_TIMING = True
 
-PEEING_POSE_MODEL_PATH = str(
-    Path.home() / ".cache" / "trash_detection_worker" / "pose_landmarker_lite.task"
-)
-PEEING_POSE_MODEL_URL = (
-    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
-    "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
-)

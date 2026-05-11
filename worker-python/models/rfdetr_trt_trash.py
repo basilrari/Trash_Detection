@@ -6,8 +6,8 @@ Requires ``tensorrt`` and ``pycuda`` on the inference machine.
 Configure ``RF_DETR_TRT_TIMING`` and ``RF_DETR_PREPROCESS_CUDA`` in ``settings.py`` (not env).
 
 **Default:** NumPy + OpenCV **CPU** preprocess unless ``RF_DETR_PREPROCESS_CUDA`` in settings is
-``"1"`` / ``"true"`` / ``"cuda"`` / ``auto`` (PyTorch CUDA when a GPU exists). ``""`` / ``"cpu"`` /
-``"0"`` / ``false`` / ``off`` → CPU.
+``"1"`` / ``"true"`` / ``"yes"`` / ``"on"`` / ``"cuda"`` / ``"auto"`` (requires PyTorch CUDA at runtime; **no CPU fallback**).
+``""`` / ``"cpu"`` / ``"0"`` / ``"false"`` / ``"off"`` → CPU.
 
 Inputs are **letterboxed**: the full frame is scaled (uniform ``cv2.resize`` / bilinear) to fit
 inside the engine H×W, centered on a zero canvas (aspect ratio preserved).
@@ -19,7 +19,6 @@ import logging
 import os
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, List, Tuple, Union
 
@@ -79,7 +78,7 @@ def _post_process(
     eng_h: int,
     topk: int = 300,
 ) -> list[dict[str, np.ndarray]]:
-    """CPU fallback post-process (same math as :func:`_post_process_gpu`).
+    """CPU post-process (same math as :func:`_post_process_gpu`).
 
     ``target_sizes`` is ``(B, 2)`` ``(img_h, img_w)`` per frame (original RGB shape).
     ``box_offsets`` is ``(B, 4)`` ``(ox, oy, gain_x, gain_y)`` such that engine-normalized
@@ -237,19 +236,19 @@ class TensorRTEngineWrapper:
 
         self._torch_stream: torch.cuda.Stream | None = None
         self._torch_out: dict[str, torch.Tensor] = {}
-        # GPU post (D2D + torch on ExternalStream) is only safe on the thread that owns this
-        # PyCUDA ``Stream`` (created here). ``ThreadPoolExecutor`` workers must use D2H + CPU post.
+        # GPU post (D2D + torch on ExternalStream) is only valid on the thread that owns this PyCUDA stream.
         self._gpu_post_ready = bool(torch.cuda.is_available())
         if self._gpu_post_ready:
             try:
                 self._torch_stream = torch.cuda.ExternalStream(self.stream.handle)
-            except Exception:
-                logger.warning(
-                    "Could not wrap PyCUDA stream for PyTorch; falling back to D2H + CPU post.",
-                    exc_info=True,
-                )
-                self._torch_stream = None
-                self._gpu_post_ready = False
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to wrap the TensorRT PyCUDA stream for PyTorch GPU postprocess "
+                    "(no silent CPU fallback)."
+                ) from exc
+        else:
+            self._torch_stream = None
+            self._gpu_post_ready = False
 
         if self._gpu_post_ready and self._torch_stream is not None:
             dev = torch.device("cuda", torch.cuda.current_device())
@@ -266,6 +265,11 @@ class TensorRTEngineWrapper:
         idt = np.dtype(self.bindings[self.input_name]["dtype"])
         self._torch_in_dtype = torch.float16 if idt == np.dtype(np.float16) else torch.float32
         self._want_cuda_preprocess = _preprocess_use_cuda()
+        if self._want_cuda_preprocess and not torch.cuda.is_available():
+            raise RuntimeError(
+                "RF_DETR_PREPROCESS_CUDA requests CUDA preprocess, but torch.cuda.is_available() is False. "
+                "Use a CUDA-capable machine or set RF_DETR_PREPROCESS_CUDA to off (cpu/0/false)."
+            )
         self._mean_t: torch.Tensor | None = None
         self._std_t: torch.Tensor | None = None
 
@@ -532,7 +536,7 @@ class TensorRTEngineWrapper:
                 self.cuda.memcpy_dtoh_async(buf["host"], buf["device"], self.stream)
 
     def _infer_raw_numpy_outputs(self, batch_nchw: Union[np.ndarray, torch.Tensor]) -> list[np.ndarray]:
-        """D2H to pagelocked host + one stream sync (fallback path)."""
+        """D2H to pagelocked host + one stream sync (used when GPU torch decode is disabled)."""
         self._infer_raw_async(batch_nchw)
         self.stream.synchronize()
         outputs: list[np.ndarray] = []
@@ -691,8 +695,8 @@ class RfDetrTrtTrashDetector(TrashDetector):
     Each batch is **preprocessed once** on the trash head: **letterboxed** (uniform resize to fit
     engine H×W, centered on a zero canvas) so the full frame is preserved; CPU (default) or
     PyTorch CUDA when ``settings.RF_DETR_PREPROCESS_CUDA`` opts in (``"1"`` / ``"cuda"`` / ``"auto"`` /
-    ``True``). Both heads then run ``decode_batch_nchw`` on that shared tensor **in parallel**
-    (two threads; one TRT forward + post per head).
+    ``True``); CUDA preprocess requires a CUDA-capable runtime (**no silent CPU fallback**). Both heads
+    then run ``decode_batch_nchw`` **sequentially on the main thread** so GPU torch decode stays valid.
     """
 
     def __init__(
@@ -724,11 +728,6 @@ class RfDetrTrtTrashDetector(TrashDetector):
         if w0.uses_cuda_preprocess():
             logger.info(
                 "RF-DETR preprocess: PyTorch CUDA (settings.RF_DETR_PREPROCESS_CUDA enabled)."
-            )
-        elif w0._want_cuda_preprocess:
-            logger.info(
-                "RF-DETR preprocess: settings.RF_DETR_PREPROCESS_CUDA requests CUDA, "
-                "but CUDA is unavailable — using NumPy + OpenCV CPU."
             )
 
     @property
@@ -773,24 +772,17 @@ class RfDetrTrtTrashDetector(TrashDetector):
             if len(self._heads) > 1:
                 parts: list[list[dict[str, Any]] | None] = [None] * len(self._heads)
                 if run_cigarette:
-                    with ThreadPoolExecutor(max_workers=len(self._heads)) as ex:
-                        futures: dict[Future, int] = {}
-                        for hi in range(len(self._heads)):
-                            label = self._heads[hi][1]
-                            fut = ex.submit(
-                                self._heads[hi][0].decode_batch_nchw,
-                                batch_nchw,
-                                sizes,
-                                box_offsets,
-                                valid,
-                                top_n=50,
-                                preprocess_ms=preprocess_ms if hi == 0 else None,
-                                timing_label=label,
-                            )
-                            futures[fut] = hi
-                        for fut in as_completed(futures):
-                            hi = futures[fut]
-                            parts[hi] = fut.result()
+                    for hi in range(len(self._heads)):
+                        head, label = self._heads[hi]
+                        parts[hi] = head.decode_batch_nchw(
+                            batch_nchw,
+                            sizes,
+                            box_offsets,
+                            valid,
+                            top_n=50,
+                            preprocess_ms=preprocess_ms if hi == 0 else None,
+                            timing_label=label,
+                        )
                 else:
                     parts[0] = self._heads[0][0].decode_batch_nchw(
                         batch_nchw,
