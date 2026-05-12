@@ -4,7 +4,8 @@
 (normalized crop Y) of mid-groin (COCO keypoints).
 
 **Temporal rule (stride-aware):** scene YOLO (and thus pose) runs only on stride-sampled frames.
-Per calendar second of video time, each **tracked** person counts sampled frames and pose-hits.
+Per calendar second of video time, each **tracked** person counts sampled frames and pose-hits
+only after a **bbox stillness** gate (no accumulation while the person is moving).
 A second counts as **positive** when hits ≥ ``min_hits_per_second`` (default 3 of ~5 samples).
 After ``seconds_required`` consecutive positive seconds, that person is **confirmed** peeing.
 
@@ -28,6 +29,8 @@ import numpy as np
 
 from models.types import Detection
 from models.ultralytics_call_stats import UltralyticsCallStats
+from models.peeing_motorcycle_gate import person_seated_on_motorcycle
+from models.peeing_stillness import bbox_is_still, iou_xyxy
 
 class Coco17Landmark(IntEnum):
     """COCO 17 keypoints (Ultralytics YOLO pose)."""
@@ -79,21 +82,6 @@ def _resolve_model_path(p: str) -> Path:
     return pp
 
 
-def _iou_xyxy(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
-    inter = iw * ih
-    if inter <= 0:
-        return 0.0
-    aa = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    ba = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    union = aa + ba - inter
-    return float(inter / union) if union > 0 else 0.0
-
-
 @dataclass
 class _PersonTrack:
     track_id: int
@@ -104,6 +92,9 @@ class _PersonTrack:
     hits_in_bucket: int = 0
     consecutive_good_seconds: int = 0
     latched_confirm: bool = False
+    still_prev_bbox: Optional[Tuple[float, float, float, float]] = None
+    stationary_seconds: float = 0.0
+    stationary_ready: bool = False
 
 
 class PeeingDetector:
@@ -114,10 +105,14 @@ class PeeingDetector:
         min_visibility: float = 0.45,
         hand_groin_y_threshold: float = 0.1,
         min_hits_per_second: int = 3,
-        seconds_required: int = 10,
+        seconds_required: int = 5,
         track_iou_threshold: float = 0.35,
         track_max_missed_seconds: float = 3.0,
         min_crop_side: int = 48,
+        still_seconds_required: float = 1.0,
+        still_max_center_motion: float = 0.035,
+        still_max_size_change: float = 0.12,
+        still_min_iou: float = 0.65,
         # YOLO pose-only (Ultralytics TensorRT ``.engine``; CUDA when torch sees a GPU unless overridden)
         yolo_pose_model: str | None = None,
         yolo_pose_imgsz: int = 640,
@@ -128,6 +123,12 @@ class PeeingDetector:
         yolo_pose_prefetch_debug: bool = False,
         debug_timing: bool = False,
         max_pose_persons_per_frame: int | None = None,
+        motorcycle_exclusion_enabled: bool = True,
+        motorcycle_labels: Tuple[str, ...] = ("motorcycle", "motorbike"),
+        motorcycle_bbox_expand_x: float = 0.15,
+        motorcycle_bbox_expand_y: float = 0.10,
+        motorcycle_lower_body_fraction: float = 0.60,
+        motorcycle_lower_overlap_threshold: float = 0.10,
     ) -> None:
         self.crop_margin = float(crop_margin)
         self.min_visibility = float(min_visibility)
@@ -137,6 +138,10 @@ class PeeingDetector:
         self.track_iou_threshold = float(track_iou_threshold)
         self.track_max_missed_seconds = float(max(0.5, track_max_missed_seconds))
         self.min_crop_side = int(min_crop_side)
+        self.still_seconds_required = float(max(0.0, still_seconds_required))
+        self.still_max_center_motion = float(still_max_center_motion)
+        self.still_max_size_change = float(still_max_size_change)
+        self.still_min_iou = float(still_min_iou)
 
         self.max_pose_persons_per_frame = (
             int(max_pose_persons_per_frame)
@@ -145,6 +150,13 @@ class PeeingDetector:
         )
         if self.max_pose_persons_per_frame is not None and self.max_pose_persons_per_frame < 1:
             raise ValueError("max_pose_persons_per_frame must be >= 1 when set")
+
+        self._motorcycle_exclusion_enabled = bool(motorcycle_exclusion_enabled)
+        self._motorcycle_labels = tuple(str(x) for x in motorcycle_labels)
+        self._motorcycle_expand_x = float(motorcycle_bbox_expand_x)
+        self._motorcycle_expand_y = float(motorcycle_bbox_expand_y)
+        self._motorcycle_lower_body_fraction = float(motorcycle_lower_body_fraction)
+        self._motorcycle_overlap_threshold = float(motorcycle_lower_overlap_threshold)
 
         self._debug_timing = bool(debug_timing)
         self._timing_n = 0
@@ -160,6 +172,7 @@ class PeeingDetector:
         self._dbg_crop_skips_small = 0
         self._dbg_hit_cap_skips = 0
         self._dbg_gate_skipped_max_person = 0
+        self._dbg_gate_skipped_motorcycle = 0
         self._dbg_pose_batch_launches = 0
         self._dbg_pose_batch_in = 0
         self._dbg_pose_batch_padded = 0
@@ -168,6 +181,9 @@ class PeeingDetector:
         self._dbg_pose_prefetch_frames = 0
         self._dbg_pose_prefetch_crops = 0
         self._dbg_pose_prefetch_unused_hits = 0
+        self._dbg_still_not_ready_person_rows = 0
+        self._dbg_motion_resets = 0
+        self._dbg_pose_hits_ignored_not_still = 0
         self._yolo_pose_trt_timing = bool(yolo_pose_trt_timing)
         self._yolo_pose_prefetch_debug = bool(yolo_pose_prefetch_debug)
         self._pose_runtime_tag = ""
@@ -251,6 +267,7 @@ class PeeingDetector:
         self._dbg_crop_skips_small = 0
         self._dbg_hit_cap_skips = 0
         self._dbg_gate_skipped_max_person = 0
+        self._dbg_gate_skipped_motorcycle = 0
         self._dbg_pose_batch_launches = 0
         self._dbg_pose_batch_in = 0
         self._dbg_pose_batch_padded = 0
@@ -259,6 +276,52 @@ class PeeingDetector:
         self._dbg_pose_prefetch_frames = 0
         self._dbg_pose_prefetch_crops = 0
         self._dbg_pose_prefetch_unused_hits = 0
+        self._dbg_still_not_ready_person_rows = 0
+        self._dbg_motion_resets = 0
+        self._dbg_pose_hits_ignored_not_still = 0
+
+    def _bbox_still(
+        self, prev: Tuple[float, float, float, float], bbox: Tuple[float, float, float, float]
+    ) -> bool:
+        return bbox_is_still(
+            prev,
+            bbox,
+            min_iou=self.still_min_iou,
+            max_center_motion_norm=self.still_max_center_motion,
+            max_size_change=self.still_max_size_change,
+        )
+
+    def _update_stillness(
+        self,
+        tr: _PersonTrack,
+        ref_prev: Optional[Tuple[float, float, float, float]],
+        bbox: Tuple[float, float, float, float],
+        dt_sample: float,
+    ) -> None:
+        """Update per-track bbox stillness; reset peeing streak on motion (unless latched)."""
+        if tr.latched_confirm:
+            tr.still_prev_bbox = bbox
+            return
+
+        if ref_prev is None:
+            tr.still_prev_bbox = bbox
+            tr.stationary_seconds = 0.0
+            tr.stationary_ready = False
+            return
+
+        if not self._bbox_still(ref_prev, bbox):
+            self._dbg_motion_resets += 1
+            tr.stationary_seconds = 0.0
+            tr.stationary_ready = False
+            tr.consecutive_good_seconds = 0
+            tr.hits_in_bucket = 0
+            tr.still_prev_bbox = bbox
+            return
+
+        tr.stationary_seconds += max(0.0, float(dt_sample))
+        tr.still_prev_bbox = bbox
+        if tr.stationary_seconds >= self.still_seconds_required:
+            tr.stationary_ready = True
 
     def reset_inference_batch_stats(self) -> None:
         """Clear YOLO pose batch counters (call at pipeline start, like scene YOLO / LP)."""
@@ -297,6 +360,7 @@ class PeeingDetector:
             f"crop_too_small={self._dbg_crop_skips_small}  "
             f"hit_cap_skips={self._dbg_hit_cap_skips}  "
             f"gate_max_person_drop={self._dbg_gate_skipped_max_person}  "
+            f"gate_motorcycle_drop={self._dbg_gate_skipped_motorcycle}  "
             f"pose_runtime={self._pose_runtime_tag}  "
             f"pose_batch_launches={self._dbg_pose_batch_launches}  "
             f"pose_batch_in={self._dbg_pose_batch_in}  "
@@ -305,7 +369,10 @@ class PeeingDetector:
             f"pose_prefetch_windows={self._dbg_pose_prefetch_windows}  "
             f"pose_prefetch_frames={self._dbg_pose_prefetch_frames}  "
             f"pose_prefetch_crops={self._dbg_pose_prefetch_crops}  "
-            f"pose_prefetch_unused_hits={self._dbg_pose_prefetch_unused_hits}",
+            f"pose_prefetch_unused_hits={self._dbg_pose_prefetch_unused_hits}  "
+            f"still_not_ready_person_rows={self._dbg_still_not_ready_person_rows}  "
+            f"motion_resets={self._dbg_motion_resets}  "
+            f"pose_hits_ignored_not_still={self._dbg_pose_hits_ignored_not_still}",
             file=sys.stderr,
         )
         if self._timing_n <= 0 and self._dbg_pose_calls <= 0:
@@ -329,6 +396,19 @@ class PeeingDetector:
             f"sum={total_ms:.2f}"
         )
         print(msg, file=sys.stderr)
+
+    def _motorcycle_bboxes(
+        self, detections: Sequence[Detection], yolo_conf: float
+    ) -> List[Tuple[float, float, float, float]]:
+        if not self._motorcycle_exclusion_enabled:
+            return []
+        out: List[Tuple[float, float, float, float]] = []
+        labels = self._motorcycle_labels
+        for d in detections:
+            if d.label not in labels or d.confidence < yolo_conf:
+                continue
+            out.append(d.bbox)
+        return out
 
     def _person_detections(
         self, detections: Sequence[Detection], yolo_conf: float
@@ -508,7 +588,24 @@ class PeeingDetector:
             self._person_detections(detections, yolo_conf),
             key=lambda d: -d.confidence,
         )
-        gated = list(persons_raw)
+        moto_bbs = self._motorcycle_bboxes(detections, yolo_conf)
+        if self._motorcycle_exclusion_enabled and moto_bbs:
+            gated: List[Detection] = []
+            for p in persons_raw:
+                if person_seated_on_motorcycle(
+                    p.bbox,
+                    moto_bbs,
+                    expand_x=self._motorcycle_expand_x,
+                    expand_y=self._motorcycle_expand_y,
+                    lower_body_fraction=self._motorcycle_lower_body_fraction,
+                    overlap_threshold=self._motorcycle_overlap_threshold,
+                ):
+                    if record_gate_debug:
+                        self._dbg_gate_skipped_motorcycle += 1
+                    continue
+                gated.append(p)
+        else:
+            gated = list(persons_raw)
 
         if (
             self.max_pose_persons_per_frame is not None
@@ -599,7 +696,9 @@ class PeeingDetector:
             mark_s = tuple(
                 t.bbox
                 for t in self._tracks
-                if not t.latched_confirm and t.consecutive_good_seconds > 0
+                if not t.latched_confirm
+                and t.stationary_ready
+                and t.consecutive_good_seconds > 0
             )
             status: PeeingDisplayStatus = "confirmed" if active else "suspected"
             prog = self._score_progress()
@@ -639,15 +738,18 @@ class PeeingDetector:
             for tr in self._tracks:
                 if tr.track_id in used_track_ids:
                     continue
-                iou = _iou_xyxy(tr.bbox, bbox)
+                iou = iou_xyxy(tr.bbox, bbox)
                 if iou > best_iou:
                     best_iou = iou
                     best_tr = tr
             if best_tr is not None and best_iou >= self.track_iou_threshold:
                 tr = best_tr
                 used_track_ids.add(tr.track_id)
+                dt_sample = max(0.0, ts - tr.last_sample_ts)
+                ref_prev = tr.still_prev_bbox if tr.still_prev_bbox is not None else tr.bbox
                 tr.bbox = bbox
                 tr.last_sample_ts = ts
+                self._update_stillness(tr, ref_prev, bbox, dt_sample)
             else:
                 tr = _PersonTrack(
                     track_id=self._next_id,
@@ -656,9 +758,13 @@ class PeeingDetector:
                 )
                 self._next_id += 1
                 self._tracks.append(tr)
+                self._update_stillness(tr, None, bbox, 0.0)
 
             self._advance_bucket(tr, sec)
             tr.samples_in_bucket += 1
+
+            if not tr.latched_confirm and not tr.stationary_ready:
+                self._dbg_still_not_ready_person_rows += 1
 
             if tr.hits_in_bucket >= self.min_hits_per_second:
                 if (
@@ -685,8 +791,11 @@ class PeeingDetector:
             )
             if pc is not None:
                 if pc:
-                    tr.hits_in_bucket += 1
-                    frame_any_hit = True
+                    if tr.stationary_ready:
+                        tr.hits_in_bucket += 1
+                        frame_any_hit = True
+                    else:
+                        self._dbg_pose_hits_ignored_not_still += 1
             else:
                 yolo_pose_work.append((tr, crop))
 
@@ -698,8 +807,11 @@ class PeeingDetector:
                 hits = self._infer_yolo_pose_batch(crops)
                 for (tr, _), hit in zip(batch, hits):
                     if hit:
-                        tr.hits_in_bucket += 1
-                        frame_any_hit = True
+                        if tr.stationary_ready:
+                            tr.hits_in_bucket += 1
+                            frame_any_hit = True
+                        else:
+                            self._dbg_pose_hits_ignored_not_still += 1
 
         active = any(t.latched_confirm for t in self._tracks)
         self._had_any_confirmed = active
@@ -708,7 +820,9 @@ class PeeingDetector:
         mark_s = tuple(
             t.bbox
             for t in self._tracks
-            if not t.latched_confirm and t.consecutive_good_seconds > 0
+            if not t.latched_confirm
+            and t.stationary_ready
+            and t.consecutive_good_seconds > 0
         )
 
         edge_enter = active and not prev_active

@@ -102,7 +102,7 @@ RF_DETR_MAX_QUEUE_LATENCY_FRAMES = 0
 # --- PaddleOCR (``models/ocr.py``) ---
 PADDLE_OCR_DEVICE = "gpu"
 # PaddleOCR subprocess isolation (``spawn``). Must be explicit ``True`` or ``False`` (no heuristic).
-PADDLE_OCR_ISOLATE_PROCESS: bool = False
+PADDLE_OCR_ISOLATE_PROCESS: bool = True
 
 # Re-run LP (+ downstream OCR) for a vehicle at most every N decoded frames (same track). 1 = every frame.
 LP_VEHICLE_LP_STRIDE = 3
@@ -111,16 +111,31 @@ PIPELINE_READ_AHEAD_QUEUE_SIZE = 8
 PIPELINE_WRITE_QUEUE_SIZE = 8
 
 # --- Peeing heuristic (pose on scene-YOLO person crops; stride-sampled; IoU tracks) ---
-# Standing + wrist near mid-groin (normalized Y). Temporal rule uses **calendar seconds**:
-# ≥ ``PEEING_MIN_HITS_PER_SECOND`` pose hits among sampled frames in that second, repeated
+# Standing + wrist near mid-groin (normalized Y). **Stillness gate:** pose hits count only after
+# the scene-YOLO bbox has been stable for ``PEEING_STILL_SECONDS_REQUIRED`` seconds (motion resets
+# the peeing streak). Temporal rule uses **calendar seconds**:
+# ≥ ``PEEING_MIN_HITS_PER_SECOND`` gated pose hits among sampled frames in that second, repeated
 # ``PEEING_SECONDS_REQUIRED`` consecutive seconds → per-person confirmation (IoU tracking).
 PEEING_CROP_MARGIN = 0.12
 PEEING_MIN_VISIBILITY = 0.45
 PEEING_HAND_GROIN_Y_THRESHOLD = 0.1
-PEEING_SECONDS_REQUIRED = 10
+PEEING_SECONDS_REQUIRED = 5
 PEEING_MIN_HITS_PER_SECOND = 3
 PEEING_TRACK_IOU_THRESHOLD = 0.35
 PEEING_TRACK_MAX_MISSED_SECONDS = 3.0
+PEEING_STILL_SECONDS_REQUIRED = 1.0
+PEEING_STILL_MAX_CENTER_MOTION = 0.035
+PEEING_STILL_MAX_SIZE_CHANGE = 0.12
+PEEING_STILL_MIN_IOU = 0.65
+
+# Exclude scene-YOLO ``person`` rows that look seated on a ``motorcycle`` / ``motorbike`` before
+# YOLO pose (reduces false peeing when a rider’s posture matches the groin heuristic).
+PEEING_MOTORCYCLE_EXCLUSION_ENABLED = True
+PEEING_MOTORCYCLE_LABELS = ("motorcycle", "motorbike")
+PEEING_MOTORCYCLE_BBOX_EXPAND_X = 0.15
+PEEING_MOTORCYCLE_BBOX_EXPAND_Y = 0.10
+PEEING_MOTORCYCLE_LOWER_BODY_FRACTION = 0.60
+PEEING_MOTORCYCLE_LOWER_OVERLAP_THRESHOLD = 0.10
 
 # YOLO pose: **TensorRT .engine only** (fixed batch, under ``weights/``). No PyTorch checkpoint path.
 PEEING_YOLO_POSE_MODEL = str(_w / "yolo11n-pose_b8_fp16.engine")

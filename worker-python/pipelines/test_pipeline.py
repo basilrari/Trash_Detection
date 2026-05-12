@@ -75,7 +75,17 @@ from settings import (
     PEEING_MAX_POSE_PERSONS_PER_FRAME,
     PEEING_MIN_HITS_PER_SECOND,
     PEEING_MIN_VISIBILITY,
+    PEEING_MOTORCYCLE_BBOX_EXPAND_X,
+    PEEING_MOTORCYCLE_BBOX_EXPAND_Y,
+    PEEING_MOTORCYCLE_EXCLUSION_ENABLED,
+    PEEING_MOTORCYCLE_LABELS,
+    PEEING_MOTORCYCLE_LOWER_BODY_FRACTION,
+    PEEING_MOTORCYCLE_LOWER_OVERLAP_THRESHOLD,
     PEEING_SECONDS_REQUIRED,
+    PEEING_STILL_MAX_CENTER_MOTION,
+    PEEING_STILL_MAX_SIZE_CHANGE,
+    PEEING_STILL_MIN_IOU,
+    PEEING_STILL_SECONDS_REQUIRED,
     PEEING_TRACK_IOU_THRESHOLD,
     PEEING_TRACK_MAX_MISSED_SECONDS,
     PEEING_YOLO_POSE_BATCH_SIZE,
@@ -258,7 +268,12 @@ def _log_pipeline_run_configuration(
     console.print(f"  Writer [cyan]{sink_label}[/]")
     _pee_cfg = (
         f"{Path(PEEING_YOLO_POSE_MODEL).expanduser().resolve()}  "
-        f"batch={PEEING_YOLO_POSE_BATCH_SIZE}  backend=yolo"
+        f"batch={PEEING_YOLO_POSE_BATCH_SIZE}  backend=yolo  "
+        f"still_s>={PEEING_STILL_SECONDS_REQUIRED}  "
+        f"still_iou>={PEEING_STILL_MIN_IOU}  "
+        f"still_center<={PEEING_STILL_MAX_CENTER_MOTION}  "
+        f"still_sizeDelta<={PEEING_STILL_MAX_SIZE_CHANGE}  "
+        f"confirm_s={PEEING_SECONDS_REQUIRED}"
     )
     console.print(f"  Peeing [dim]{_pee_cfg}[/]")
     if _trt_timing_enabled() or bool(PEEING_YOLO_POSE_TRT_TIMING):
@@ -866,6 +881,10 @@ def load_pipeline_models() -> PipelineModelBundle:
             seconds_required=PEEING_SECONDS_REQUIRED,
             track_iou_threshold=PEEING_TRACK_IOU_THRESHOLD,
             track_max_missed_seconds=PEEING_TRACK_MAX_MISSED_SECONDS,
+            still_seconds_required=PEEING_STILL_SECONDS_REQUIRED,
+            still_max_center_motion=PEEING_STILL_MAX_CENTER_MOTION,
+            still_max_size_change=PEEING_STILL_MAX_SIZE_CHANGE,
+            still_min_iou=PEEING_STILL_MIN_IOU,
             yolo_pose_model=PEEING_YOLO_POSE_MODEL,
             yolo_pose_imgsz=PEEING_YOLO_POSE_IMGSZ,
             yolo_pose_batch_size=PEEING_YOLO_POSE_BATCH_SIZE,
@@ -875,6 +894,12 @@ def load_pipeline_models() -> PipelineModelBundle:
             yolo_pose_prefetch_debug=PEEING_YOLO_POSE_PREFETCH_DEBUG,
             debug_timing=PEEING_DEBUG_TIMING,
             max_pose_persons_per_frame=PEEING_MAX_POSE_PERSONS_PER_FRAME,
+            motorcycle_exclusion_enabled=PEEING_MOTORCYCLE_EXCLUSION_ENABLED,
+            motorcycle_labels=PEEING_MOTORCYCLE_LABELS,
+            motorcycle_bbox_expand_x=PEEING_MOTORCYCLE_BBOX_EXPAND_X,
+            motorcycle_bbox_expand_y=PEEING_MOTORCYCLE_BBOX_EXPAND_Y,
+            motorcycle_lower_body_fraction=PEEING_MOTORCYCLE_LOWER_BODY_FRACTION,
+            motorcycle_lower_overlap_threshold=PEEING_MOTORCYCLE_LOWER_OVERLAP_THRESHOLD,
         )
     except Exception as exc:
         console.print(
