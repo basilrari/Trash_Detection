@@ -49,6 +49,8 @@ class LpBatchCoordinator:
         self.lp_queue_flushes: int = 0
         self.lp_latency_flushes: int = 0
         self.lp_emit_flushes: int = 0
+        self.lp_flush_queue_full: int = 0
+        self.lp_flush_eof_rounds: int = 0
 
     @property
     def enabled(self) -> bool:
@@ -88,6 +90,7 @@ class LpBatchCoordinator:
         if not self._enabled:
             return
         while len(self._q) >= self._max_crops:
+            self.lp_flush_queue_full += 1
             self._flush_first_n(self._max_crops)
         if self._max_lat > 0 and self._q:
             oldest = self._q[0].frame_idx
@@ -116,6 +119,7 @@ class LpBatchCoordinator:
             return
         while self._q:
             n = min(len(self._q), self._max_crops)
+            self.lp_flush_eof_rounds += 1
             self._flush_first_n(n)
 
     def _flush_first_n(self, n: int) -> None:

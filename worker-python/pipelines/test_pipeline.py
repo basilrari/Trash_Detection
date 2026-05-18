@@ -41,7 +41,7 @@ from rich.console import Console
 from models.base import TrashDetector
 from models.yolo_detector import YoloDetector
 from models.lp_detector import LpDetector
-from models.ocr import Ocr
+from models.ocr import Ocr, OcrRecognizeStats
 from models.peeing_detector import PeeingDetector, PeeingState
 from models.rfdetr_trt_trash import _trt_timing_enabled
 from models.types import Detection, FrameData, LicensePlate
@@ -648,6 +648,12 @@ class PipelineStepTimes:
     lp_coordinator_batches: int = 0
     lp_coordinator_latency_events: int = 0
     lp_coordinator_emit_barriers: int = 0
+    lp_coordinator_queue_full_flushes: int = 0
+    lp_coordinator_eof_rounds: int = 0
+    ocr_recognize_calls: int = 0
+    ocr_plates_submitted: int = 0
+    ocr_locked_reuse_skips: int = 0
+    ocr_prefilter_skipped_plates: int = 0
 
     def print_summary(self, *, wall_total_sec: float) -> None:
         ann = (
@@ -772,9 +778,29 @@ class PipelineStepTimes:
             console.print(
                 f"  [dim]LP cross-frame:[/] coordinator_batches={self.lp_coordinator_batches}  "
                 f"latency_flushes={self.lp_coordinator_latency_events}  "
-                f"emit_barriers={self.lp_coordinator_emit_barriers}"
+                f"emit_barriers={self.lp_coordinator_emit_barriers}  "
+                f"queue_full_flushes={self.lp_coordinator_queue_full_flushes}  "
+                f"eof_rounds={self.lp_coordinator_eof_rounds}"
             )
         console.print(f"  OCR:                  {self.ocr_sec:8.2f} s")
+        if (
+            self.ocr_recognize_calls > 0
+            or self.ocr_locked_reuse_skips > 0
+            or self.ocr_prefilter_skipped_plates > 0
+        ):
+            avg_ms = (
+                (self.ocr_sec / self.ocr_recognize_calls) * 1000.0
+                if self.ocr_recognize_calls > 0
+                else 0.0
+            )
+            console.print(
+                "  [dim]OCR detail:[/] "
+                f"recognize_calls={self.ocr_recognize_calls}  "
+                f"plates_submitted={self.ocr_plates_submitted}  "
+                f"locked_reuse_skips={self.ocr_locked_reuse_skips}  "
+                f"prefilter_skipped={self.ocr_prefilter_skipped_plates}  "
+                f"avg_ms/call={avg_ms:.1f}"
+            )
         console.print(f"  Video write:          {self.video_write_sec:8.2f} s")
         console.print(f"  [dim]Sum (inference): {inf:8.2f} s[/]")
         console.print(f"  [bold]Wall clock total:   {wall_total_sec:8.2f} s[/]")
@@ -1390,6 +1416,7 @@ class VehicleLpOcrCache:
                     (tid, frame_idx, float(plate.confidence), (gx1, gy1, gx2, gy2))
                 )
             else:
+                times.ocr_locked_reuse_skips += 1
                 label_str = (
                     f"{str(tr.get('ocr_text', '')).strip()} "
                     f"{float(tr.get('ocr_conf', 0.0)):.2f}"
@@ -1402,13 +1429,17 @@ class VehicleLpOcrCache:
 
         ocr_out: list[tuple[str, float]] = []
         if ocr_crops:
+            ocr_st = OcrRecognizeStats()
             t_ocr = time.perf_counter()
             try:
-                ocr_out = ocr.recognize(ocr_crops)
+                ocr_out = ocr.recognize(ocr_crops, stats=ocr_st)
             except Exception as e:
                 console.print(f"[yellow]OCR error:[/] {str(e)}")
                 ocr_out = [("", 0.0)] * len(ocr_crops)
             times.ocr_sec += time.perf_counter() - t_ocr
+            times.ocr_recognize_calls += 1
+            times.ocr_plates_submitted += len(ocr_crops)
+            times.ocr_prefilter_skipped_plates += ocr_st.prefilter_skipped
             if len(ocr_out) != len(ocr_crops):
                 ocr_out = list(ocr_out) + [("", 0.0)] * max(0, len(ocr_crops) - len(ocr_out))
                 ocr_out = ocr_out[: len(ocr_crops)]
@@ -1656,6 +1687,7 @@ class VehicleLpOcrCache:
                         (tid, j, float(plate.confidence), (gx1, gy1, gx2, gy2))
                     )
                 else:
+                    times.ocr_locked_reuse_skips += 1
                     label_str = (
                         f"{str(tr.get('ocr_text', '')).strip()} "
                         f"{float(tr.get('ocr_conf', 0.0)):.2f}"
@@ -1668,13 +1700,17 @@ class VehicleLpOcrCache:
 
             ocr_out: list[tuple[str, float]] = []
             if ocr_crops:
+                ocr_st = OcrRecognizeStats()
                 t_ocr = time.perf_counter()
                 try:
-                    ocr_out = ocr.recognize(ocr_crops)
+                    ocr_out = ocr.recognize(ocr_crops, stats=ocr_st)
                 except Exception as e:
                     console.print(f"[yellow]OCR error:[/] {str(e)}")
                     ocr_out = [("", 0.0)] * len(ocr_crops)
                 times.ocr_sec += time.perf_counter() - t_ocr
+                times.ocr_recognize_calls += 1
+                times.ocr_plates_submitted += len(ocr_crops)
+                times.ocr_prefilter_skipped_plates += ocr_st.prefilter_skipped
                 if len(ocr_out) != len(ocr_crops):
                     ocr_out = list(ocr_out) + [("", 0.0)] * max(0, len(ocr_crops) - len(ocr_out))
                     ocr_out = ocr_out[: len(ocr_crops)]
@@ -2003,11 +2039,16 @@ def _annotate_yolo_lp_ocr(
 
     t_ocr = time.perf_counter()
     try:
-        ocr_out = ocr.recognize(ocr_crops)
+        ocr_st = OcrRecognizeStats()
+        ocr_out = ocr.recognize(ocr_crops, stats=ocr_st)
     except Exception as e:
         console.print(f"[yellow]OCR error:[/] {str(e)}")
         ocr_out = [("", 0.0)] * len(ocr_crops)
+        ocr_st = OcrRecognizeStats()
     times.ocr_sec += time.perf_counter() - t_ocr
+    times.ocr_recognize_calls += 1
+    times.ocr_plates_submitted += len(ocr_crops)
+    times.ocr_prefilter_skipped_plates += ocr_st.prefilter_skipped
     if len(ocr_out) != len(ocr_crops):
         ocr_out = list(ocr_out) + [("", 0.0)] * max(0, len(ocr_crops) - len(ocr_out))
         ocr_out = ocr_out[: len(ocr_crops)]
@@ -2317,6 +2358,8 @@ def _run_pipeline_uniform_stride_batched(
             times.lp_coordinator_batches = lp_batch.lp_queue_flushes
             times.lp_coordinator_latency_events = lp_batch.lp_latency_flushes
             times.lp_coordinator_emit_barriers = lp_batch.lp_emit_flushes
+            times.lp_coordinator_queue_full_flushes = lp_batch.lp_flush_queue_full
+            times.lp_coordinator_eof_rounds = lp_batch.lp_flush_eof_rounds
 
         pbar.close()
     finally:

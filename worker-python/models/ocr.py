@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import queue
 import threading
+from dataclasses import dataclass
 from typing import Any, List, Tuple
 
 import cv2
@@ -13,6 +14,13 @@ import numpy as np
 from models.base import OCRModel
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class OcrRecognizeStats:
+    """Optional counters filled by :meth:`Ocr.recognize` (prefilter skips only)."""
+
+    prefilter_skipped: int = 0
 
 
 def _resolve_paddle_ocr_device() -> str:
@@ -124,7 +132,11 @@ def _pick_best_text_score(res: Any) -> tuple[str, float]:
     return (best_text, best_score)
 
 
-def _recognize_with_backend(ocr: Any, crops: List[np.ndarray]) -> List[Tuple[str, float]]:
+def _recognize_with_backend(
+    ocr: Any,
+    crops: List[np.ndarray],
+    stats: OcrRecognizeStats | None = None,
+) -> List[Tuple[str, float]]:
     """Run PaddleOCR on all valid crops in one ``predict([...])`` call (no silent per-crop fallback)."""
     n = len(crops)
     outputs: List[Tuple[str, float]] = [("", 0.0)] * n
@@ -134,6 +146,8 @@ def _recognize_with_backend(ocr: Any, crops: List[np.ndarray]) -> List[Tuple[str
         if crop is None or crop.size == 0:
             continue
         if _ocr_crop_too_small_or_blurry(crop):
+            if stats is not None:
+                stats.prefilter_skipped += 1
             continue
         try:
             images.append(_prep_image(crop))
@@ -170,9 +184,9 @@ def _ocr_worker_main(lang: str, device: str, req_q: Any, resp_q: Any) -> None:
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
         )
-        resp_q.put(("__ready__", None, None))
+        resp_q.put(("__ready__", None, None, 0))
     except Exception as exc:
-        resp_q.put(("__fatal__", None, f"{type(exc).__name__}: {exc}"))
+        resp_q.put(("__fatal__", None, f"{type(exc).__name__}: {exc}", 0))
         return
 
     while True:
@@ -181,10 +195,13 @@ def _ocr_worker_main(lang: str, device: str, req_q: Any, resp_q: Any) -> None:
             break
         req_id, crops = item
         try:
-            out = _recognize_with_backend(ocr, crops)
-            resp_q.put((req_id, out, None))
+            st = OcrRecognizeStats()
+            out = _recognize_with_backend(ocr, crops, st)
+            resp_q.put((req_id, out, None, st.prefilter_skipped))
         except Exception as exc:
-            resp_q.put((req_id, [("", 0.0)] * len(crops), f"{type(exc).__name__}: {exc}"))
+            resp_q.put(
+                (req_id, [("", 0.0)] * len(crops), f"{type(exc).__name__}: {exc}", 0)
+            )
 
 
 class Ocr(OCRModel):
@@ -232,7 +249,7 @@ class Ocr(OCRModel):
         )
         proc.start()
         try:
-            tag, _, err = resp_q.get(timeout=180.0)
+            tag, _, err, _pre = resp_q.get(timeout=180.0)
         except queue.Empty as exc:
             proc.terminate()
             proc.join(timeout=2.0)
@@ -288,12 +305,17 @@ class Ocr(OCRModel):
         except Exception:
             pass
 
-    def recognize(self, crops: List[np.ndarray]) -> List[Tuple[str, float]]:
+    def recognize(
+        self,
+        crops: List[np.ndarray],
+        *,
+        stats: OcrRecognizeStats | None = None,
+    ) -> List[Tuple[str, float]]:
         if not crops:
             return []
         if not self._isolate:
             assert self._ocr is not None
-            return _recognize_with_backend(self._ocr, crops)
+            return _recognize_with_backend(self._ocr, crops, stats)
 
         proc = self._proc
         req_q = self._req_q
@@ -306,7 +328,7 @@ class Ocr(OCRModel):
             self._next_req_id += 1
             req_q.put((req_id, crops))
             try:
-                rid, out, err = resp_q.get(timeout=180.0)
+                rid, out, err, pre_skip = resp_q.get(timeout=180.0)
             except queue.Empty as exc:
                 raise RuntimeError("PaddleOCR worker timed out.") from exc
 
@@ -318,4 +340,6 @@ class Ocr(OCRModel):
             raise RuntimeError(
                 f"PaddleOCR worker returned malformed output (expected {len(crops)} items)."
             )
+        if stats is not None:
+            stats.prefilter_skipped += int(pre_skip)
         return out

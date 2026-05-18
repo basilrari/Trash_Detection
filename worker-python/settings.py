@@ -50,19 +50,22 @@ LP_CONFIDENCE = 0.25
 # Cross-frame LP batching (``pipelines/lp_batch_coordinator.py``; uniform-stride pipeline only).
 LP_BATCH_ENABLED = True
 LP_BATCH_MAX_CROPS = LP_TRT_BATCH_SIZE
-LP_BATCH_MAX_LATENCY_FRAMES = 0  # 0 = no latency-only flush (batch / emit / EOF only)
+# >0: ``LpBatchCoordinator.after_enqueue`` may flush up to ``LP_BATCH_MAX_CROPS`` when the oldest
+# queued crop is this many **decoded frames** behind the current frame (fills LP batches sooner;
+# trades slightly later LP/OCR overlay vs fewer partial launches).
+LP_BATCH_MAX_LATENCY_FRAMES = 4
 
 # Plate / OCR lock-in (``VehicleLpOcrCache`` in ``pipelines/test_pipeline``).
 # OCR text confidence at/above this locks the best text and skips future OCR while the LP box location matches.
 OCR_LOCK_CONFIDENCE = 0.90
-LP_LOCK_REFRESH_STRIDE = 10
+LP_LOCK_REFRESH_STRIDE = 20
 
 # LabelAnnotator ``smart_position`` adds layout work; set False for faster drawing.
 ANNOTATOR_SMART_POSITION = False
 
 # --- OCR prefilter (``models/ocr.py``) ---
 OCR_MIN_PLATE_SIDE = 12
-OCR_MIN_VARIANCE_LAPLACIAN = 0.0  # >0 to skip very blurry crops (e.g. 30.0); 0 disables.
+OCR_MIN_VARIANCE_LAPLACIAN = 30.0  # >0 to skip very blurry crops before PaddleOCR; 0 disables.
 
 # Batched scene-YOLO ``detect()`` calls: at most this many **sampled** frames per launch.
 YOLO_MICRO_BATCH_SIZE = 8
@@ -78,7 +81,7 @@ YOLO_MICRO_BATCH_SIZE = 8
 # When FPS does not divide evenly, the realized rate is approximate but stays near the target.
 #
 # **Override:** set ``FRAME_SAMPLE_STRIDE_OVERRIDE`` to an integer ≥ 1 to skip automatic stride.
-SCENE_YOLO_TARGET_FRAMES_PER_SECOND = 5
+SCENE_YOLO_TARGET_FRAMES_PER_SECOND = 4
 FRAME_SAMPLE_STRIDE_OVERRIDE: int | None = None  # e.g. ``3`` for fixed stride; ``None`` = automatic
 
 # --- RF-DETR trash / cigarette (TensorRT engines only) ---
@@ -94,7 +97,7 @@ RF_DETR_TRT_TIMING = False
 RF_DETR_PREPROCESS_CUDA = "1"
 
 # Run the cigarette TRT head on 1/N RF-DETR batches only (1 = every batch).
-RF_DETR_CIGARETTE_EVERY_N_BATCHES = 1
+RF_DETR_CIGARETTE_EVERY_N_BATCHES = 2
 
 # Max frames the oldest RF-DETR-queued frame may wait before a padded tail flush (0 = full batch or EOF).
 RF_DETR_MAX_QUEUE_LATENCY_FRAMES = 0
@@ -105,7 +108,7 @@ PADDLE_OCR_DEVICE = "gpu"
 PADDLE_OCR_ISOLATE_PROCESS: bool = True
 
 # Re-run LP (+ downstream OCR) for a vehicle at most every N decoded frames (same track). 1 = every frame.
-LP_VEHICLE_LP_STRIDE = 3
+LP_VEHICLE_LP_STRIDE = 5
 
 PIPELINE_READ_AHEAD_QUEUE_SIZE = 8
 PIPELINE_WRITE_QUEUE_SIZE = 8
