@@ -26,10 +26,10 @@ INPUT_VIDEO_FPS_MAX = 60
 # ``mp4v``: explicit OpenCV CPU writer only.
 OUTPUT_VIDEO_ENCODER = "auto"
 FFMPEG_PATH = "ffmpeg"
-NVENC_PRESET = "p4"
+NVENC_PRESET = "p1"
 NVENC_CQ = 28
 
-YOLO_CONFIDENCE = 0.5
+YOLO_CONFIDENCE = 0.4
 PLATE_CONFIDENCE = 0.5
 
 _w = Path(__file__).resolve().parent / "weights"
@@ -114,21 +114,22 @@ PIPELINE_READ_AHEAD_QUEUE_SIZE = 8
 PIPELINE_WRITE_QUEUE_SIZE = 8
 
 # --- Peeing heuristic (pose on scene-YOLO person crops; stride-sampled; IoU tracks) ---
-# Standing + wrist near mid-groin (normalized Y). **Stillness gate:** pose hits count only after
+# Standing on **either** side (hip above knee on L or R). Groin: wrist near mid-groin when both
+# hips visible, else same-side hip vs wrist (normalized Y). **Stillness gate:** pose hits count only after
 # the scene-YOLO bbox has been stable for ``PEEING_STILL_SECONDS_REQUIRED`` seconds (motion resets
 # the peeing streak). Temporal rule uses **calendar seconds**:
 # ≥ ``PEEING_MIN_HITS_PER_SECOND`` gated pose hits among sampled frames in that second, repeated
 # ``PEEING_SECONDS_REQUIRED`` consecutive seconds → per-person confirmation (IoU tracking).
 PEEING_CROP_MARGIN = 0.12
 PEEING_MIN_VISIBILITY = 0.45
-PEEING_HAND_GROIN_Y_THRESHOLD = 0.1
-PEEING_SECONDS_REQUIRED = 5
+PEEING_HAND_GROIN_Y_THRESHOLD = 0.09
+PEEING_SECONDS_REQUIRED = 10
 PEEING_MIN_HITS_PER_SECOND = 3
 PEEING_TRACK_IOU_THRESHOLD = 0.35
 PEEING_TRACK_MAX_MISSED_SECONDS = 3.0
 PEEING_STILL_SECONDS_REQUIRED = 1.0
-PEEING_STILL_MAX_CENTER_MOTION = 0.035
-PEEING_STILL_MAX_SIZE_CHANGE = 0.12
+PEEING_STILL_MAX_CENTER_MOTION = 0.08
+PEEING_STILL_MAX_SIZE_CHANGE = 0.20
 PEEING_STILL_MIN_IOU = 0.65
 
 # Exclude scene-YOLO ``person`` rows that look seated on a ``motorcycle`` / ``motorbike`` before
@@ -156,6 +157,10 @@ PEEING_YOLO_POSE_PREFETCH_DEBUG = False
 
 # Limit expensive pose crops per sampled frame (after sorting by YOLO confidence). ``None`` = no limit.
 PEEING_MAX_POSE_PERSONS_PER_FRAME: int | None = None
+
+# With pose viz enabled, hold the last skeleton overlay on stride-skipped frames (inference still strided).
+# Set ``False`` to draw pose only on sampled frames.
+PEEING_PERSIST_POSE_VIZ = True
 
 # Log average per-step pose latency + call counters at PeeingDetector shutdown (stderr).
 PEEING_DEBUG_TIMING = True

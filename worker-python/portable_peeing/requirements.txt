@@ -1,0 +1,8 @@
+# portable_peeing — scene YOLO TRT + YOLO pose TRT + video I/O
+opencv-python-headless>=4.8.0
+numpy>=1.24.0,<2.4
+tqdm>=4.66.0
+rich>=13.0.0
+ultralytics>=8.3.0
+torch  # install a CUDA wheel matching your GPU from https://pytorch.org/get-started/locally/
+# TensorRT .engine files: NVIDIA driver + TensorRT build compatible with your Ultralytics export.

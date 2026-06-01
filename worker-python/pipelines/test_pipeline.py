@@ -21,16 +21,13 @@ Production inputs are expected at **5–60 FPS** nominal (warning if the contain
 from __future__ import annotations
 
 import os
-import queue
 import re
-import shutil
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Protocol, Sequence
+from typing import Any, List, Sequence
 
 import cv2
 import numpy as np
@@ -50,8 +47,6 @@ from settings import (
     ANNOTATOR_SMART_POSITION,
     CIGARETTE_ENGINE_PATH,
     FFMPEG_PATH,
-    FRAME_SAMPLE_STRIDE_OVERRIDE,
-    SCENE_YOLO_TARGET_FRAMES_PER_SECOND,
     INPUT_VIDEO_FPS_MAX,
     INPUT_VIDEO_FPS_MIN,
     LP_BATCH_ENABLED,
@@ -73,6 +68,7 @@ from settings import (
     PEEING_DEBUG_TIMING,
     PEEING_HAND_GROIN_Y_THRESHOLD,
     PEEING_MAX_POSE_PERSONS_PER_FRAME,
+    PEEING_PERSIST_POSE_VIZ,
     PEEING_MIN_HITS_PER_SECOND,
     PEEING_MIN_VISIBILITY,
     PEEING_MOTORCYCLE_BBOX_EXPAND_X,
@@ -116,92 +112,26 @@ from settings import (
 
 console = Console()
 
-
-def _ensure_pytorch_cuda_kernels_work() -> None:
-    """Fail fast if PyTorch cannot execute on ``cuda:0`` (common on very new GPUs / wheel mismatch).
-
-    Ultralytics (scene YOLO + license-plate YOLO) uses PyTorch CUDA. Without this check,
-    a typical failure is ``cudaErrorNoKernelImageForDevice`` mid-run, then Paddle teardown aborts.
-    """
-    try:
-        import torch
-    except ImportError:
-        return
-    if not torch.cuda.is_available():
-        return
-    try:
-        x = torch.randn(32, 32, device="cuda", dtype=torch.float32)
-        _ = x @ x
-        torch.cuda.synchronize()
-    except Exception as exc:
-        cap = torch.cuda.get_device_capability(0)
-        name = torch.cuda.get_device_name(0)
-        n = int(torch.cuda.device_count())
-        if n > 1:
-            multi = (
-                "\n  [bold]If you have a second GPU[/] (e.g. Ampere/Ada), pin this process to it:\n"
-                "    CUDA_VISIBLE_DEVICES=1 python worker.py ...\n"
-            )
-        else:
-            multi = (
-                "\n  Install a PyTorch build that includes kernels for this GPU "
-                "(see https://pytorch.org/get-started/locally/ ), or use a supported GPU.\n"
-            )
-        console.print(
-            "[red]PyTorch cannot run CUDA kernels on the current default GPU.[/]\n"
-            f"  cuda:0  name={name!r}  capability=sm_{cap[0]}{cap[1]}\n"
-            "  Scene YOLO and LP YOLO require working torch CUDA.\n"
-            f"{multi}"
-            f"  [dim]{type(exc).__name__}: {exc}[/]"
-        )
-        raise SystemExit(2) from exc
-
-
-def _log_visible_torch_cuda_device() -> None:
-    """Log which GPU this process uses as ``torch.cuda:0`` (after ``CUDA_VISIBLE_DEVICES`` remap)."""
-    try:
-        import torch
-    except ImportError:
-        return
-    if not torch.cuda.is_available():
-        console.print("[cyan]CUDA[/] torch: not available (CPU)")
-        return
-    cap = torch.cuda.get_device_capability(0)
-    name = torch.cuda.get_device_name(0)
-    vis = os.environ.get("CUDA_VISIBLE_DEVICES", "(unset)")
-    console.print(
-        f"[cyan]CUDA[/] CUDA_VISIBLE_DEVICES={vis}  →  torch cuda:0 = {name!r}  "
-        f"capability sm_{cap[0]}{cap[1]}"
-    )
-
-
-def _worker_weights_dir() -> Path:
-    """``worker-python/weights`` (same base as default YOLO/LP weights)."""
-    return Path(__file__).resolve().parents[1] / "weights"
-
-
-def _log_model_ready(title: str, detail: str) -> None:
-    console.print(f"  [green]OK[/] [bold]{title}[/]  [dim]— {detail}[/]")
-
-
-def _resolve_frame_sample_stride(fps: float) -> tuple[int, str]:
-    """Pick decoded-frame stride: optional fixed override, else ~``fps/target`` frames sampled per second."""
-    if FRAME_SAMPLE_STRIDE_OVERRIDE is not None:
-        n = max(1, int(FRAME_SAMPLE_STRIDE_OVERRIDE))
-        return n, f"fixed ``FRAME_SAMPLE_STRIDE_OVERRIDE={n}``"
-    target = float(SCENE_YOLO_TARGET_FRAMES_PER_SECOND)
-    if target <= 0:
-        target = 5.0
-    lo = float(INPUT_VIDEO_FPS_MIN)
-    hi = float(INPUT_VIDEO_FPS_MAX)
-    fps_clamped = min(max(float(fps), lo), hi)
-    n = max(1, int(round(fps_clamped / target)))
-    approx_per_sec = fps_clamped / float(n)
-    return n, (
-        f"automatic: reported FPS={fps:.3f}; clamp [{lo:.0f},{hi:.0f}] → {fps_clamped:.2f}; "
-        f"``SCENE_YOLO_TARGET_FRAMES_PER_SECOND={target:g}`` → stride={n} "
-        f"(~{approx_per_sec:.2f} scene-YOLO frames/s of video)"
-    )
+from pipelines.cuda_bootstrap import (
+    _ensure_pytorch_cuda_kernels_work,
+    _log_visible_torch_cuda_device,
+    _log_model_ready,
+)
+from pipelines.frame_stride import _resolve_frame_sample_stride
+from pipelines.peeing_shared import (
+    PERSON_LABELS,
+    VEHICLE_LABELS,
+    _draw_peeing_overlay,
+    _filter_scene_detections,
+    _is_scene_detection,
+)
+from pipelines.video_io import (
+    VideoWriterSink,
+    _maybe_wrap_capture,
+    _maybe_wrap_video_sink,
+    _open_output_video_sink,
+    _ReadAheadVideoCapture,
+)
 
 
 def _log_pipeline_run_configuration(
@@ -307,307 +237,6 @@ def _log_pipeline_run_configuration(
         f"  LP batch  enabled={LP_BATCH_ENABLED}  max_crops={LP_BATCH_MAX_CROPS}  "
         f"max_latency_frames={LP_BATCH_MAX_LATENCY_FRAMES}"
     )
-
-
-class VideoWriterSink(Protocol):
-    """Common surface for OpenCV ``VideoWriter`` and ffmpeg-backed writers."""
-
-    def write(self, frame: np.ndarray) -> None: ...
-
-    def release(self) -> None: ...
-
-
-class _AsyncVideoWriterSink:
-    """Bounded queue + background thread so NVENC/ffmpeg ``write`` does not stall inference."""
-
-    def __init__(self, inner: VideoWriterSink, max_queue: int) -> None:
-        self._inner = inner
-        qsize = max(1, int(max_queue))
-        self._q: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=qsize)
-        self._thr = threading.Thread(
-            target=self._loop, name="pipeline-async-video-writer", daemon=True
-        )
-        self._thr.start()
-
-    def _loop(self) -> None:
-        while True:
-            item = self._q.get()
-            if item is None:
-                break
-            self._inner.write(item)
-
-    def write(self, frame: np.ndarray) -> None:
-        self._q.put(frame)
-
-    def release(self) -> None:
-        self._q.put(None)
-        self._thr.join(timeout=600.0)
-        self._inner.release()
-
-
-class _ReadAheadVideoCapture:
-    """Decode thread with a bounded queue ahead of the processing loop."""
-
-    def __init__(self, cap: cv2.VideoCapture, max_queue: int) -> None:
-        self._cap = cap
-        qsize = max(1, int(max_queue))
-        self._q: queue.Queue[tuple[bool, np.ndarray] | None] = queue.Queue(maxsize=qsize)
-
-        def worker() -> None:
-            """Push ``(ret, frame)`` for every read; after EOF push ``None`` so ``read()`` never blocks forever."""
-            try:
-                while True:
-                    ret, frame = self._cap.read()
-                    self._q.put((ret, frame))
-                    if not ret:
-                        break
-            finally:
-                try:
-                    self._q.put(None, timeout=5.0)
-                except Exception:
-                    try:
-                        self._q.put_nowait(None)
-                    except Exception:
-                        pass
-
-        self._stream_ended = False
-        self._thr = threading.Thread(target=worker, name="pipeline-read-ahead", daemon=True)
-        self._thr.start()
-
-    def read(self) -> tuple[bool, np.ndarray]:
-        if self._stream_ended:
-            return False, np.array([], dtype=np.uint8)
-        item = self._q.get()
-        if item is None:
-            self._stream_ended = True
-            return False, np.array([], dtype=np.uint8)
-        return item
-
-    def get(self, prop: int) -> float:
-        return float(self._cap.get(prop))
-
-    def release(self) -> None:
-        try:
-            if self._thr.is_alive():
-                self._thr.join(timeout=30.0)
-        except Exception:
-            pass
-        try:
-            self._cap.release()
-        except Exception:
-            pass
-
-    def isOpened(self) -> bool:
-        return bool(self._cap.isOpened())
-
-
-def _maybe_wrap_video_sink(sink: VideoWriterSink, *, queue_size: int) -> VideoWriterSink:
-    if queue_size <= 0:
-        return sink
-    return _AsyncVideoWriterSink(sink, queue_size)
-
-
-def _maybe_wrap_capture(cap: cv2.VideoCapture, *, queue_size: int) -> cv2.VideoCapture | _ReadAheadVideoCapture:
-    if queue_size <= 0:
-        return cap
-    return _ReadAheadVideoCapture(cap, queue_size)
-
-
-def _ffmpeg_nvenc_smoke_test(ffmpeg_bin: str) -> bool:
-    """Return True if ``ffmpeg`` can run one frame through ``h264_nvenc`` (driver + build).
-
-    Uses 256×256 frames: NVENC rejects very small sizes (e.g. 16×16) with
-    ``Frame Dimension less than the minimum supported value`` even when the encoder exists.
-    """
-    cmd = [
-        ffmpeg_bin,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        "color=c=black:s=256x256:d=0.04",
-        "-frames:v",
-        "1",
-        "-c:v",
-        "h264_nvenc",
-        "-f",
-        "null",
-        "-",
-    ]
-    try:
-        r = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=20,
-            stdin=subprocess.DEVNULL,
-            check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return False
-    return r.returncode == 0
-
-
-class _Cv2Mp4vSink:
-    """OpenCV ``mp4v`` into MP4 (CPU MPEG-4 Part 2). Used only when ``OUTPUT_VIDEO_ENCODER=mp4v``."""
-
-    def __init__(self, path: str, fps: float, width: int, height: int) -> None:
-        self._w = cv2.VideoWriter(
-            path,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (width, height),
-        )
-        if not self._w.isOpened():
-            raise RuntimeError(f"OpenCV VideoWriter failed to open: {path!r}")
-
-    def write(self, frame: np.ndarray) -> None:
-        self._w.write(frame)
-
-    def release(self) -> None:
-        self._w.release()
-
-
-class _FfmpegNvencSink:
-    """Stream raw BGR frames into ``ffmpeg`` ``h264_nvenc`` (GPU encoder, usually much faster)."""
-
-    def __init__(
-        self,
-        path: str,
-        fps: float,
-        width: int,
-        height: int,
-        *,
-        ffmpeg_bin: str,
-        preset: str,
-        cq: int,
-    ) -> None:
-        self._width = int(width)
-        self._height = int(height)
-        cmd = [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            "bgr24",
-            "-video_size",
-            f"{self._width}x{self._height}",
-            "-framerate",
-            str(fps),
-            "-i",
-            "-",
-            "-an",
-            "-c:v",
-            "h264_nvenc",
-            "-preset",
-            preset,
-            "-rc",
-            "vbr",
-            "-cq",
-            str(int(cq)),
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            path,
-        ]
-        self._proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        if self._proc.stdin is None:
-            self._proc.kill()
-            raise RuntimeError("ffmpeg did not provide a stdin pipe")
-
-    def write(self, frame: np.ndarray) -> None:
-        if frame.shape[0] != self._height or frame.shape[1] != self._width:
-            raise ValueError(
-                f"Frame shape {frame.shape[:2]} does not match encoder {self._height}x{self._width}"
-            )
-        if frame.dtype != np.uint8:
-            frame = frame.astype(np.uint8, copy=False)
-        if not frame.flags["C_CONTIGUOUS"]:
-            frame = np.ascontiguousarray(frame)
-        assert self._proc.stdin is not None
-        self._proc.stdin.write(frame.tobytes())
-
-    def release(self) -> None:
-        if self._proc.stdin is not None:
-            try:
-                self._proc.stdin.close()
-            except BrokenPipeError:
-                pass
-            self._proc.stdin = None
-        rc = self._proc.wait()
-        if rc != 0:
-            raise RuntimeError(f"ffmpeg exited with code {rc} while finishing {self._proc.args!r}")
-
-
-def _open_output_video_sink(
-    output_path: str,
-    *,
-    fps: float,
-    width: int,
-    height: int,
-    encoder_mode: str | None = None,
-) -> tuple[VideoWriterSink, str]:
-    """Open a video sink: ``auto``/``nvenc`` require working ffmpeg ``h264_nvenc``; ``mp4v`` is explicit CPU only."""
-    mode = (encoder_mode or OUTPUT_VIDEO_ENCODER or "auto").strip().lower()
-    p = FFMPEG_PATH.strip()
-    ffmpeg_bin = shutil.which(p)
-    if ffmpeg_bin is None and os.path.isabs(p) and os.path.isfile(p) and os.access(p, os.X_OK):
-        ffmpeg_bin = p
-
-    if mode == "mp4v":
-        sink_mp4v: VideoWriterSink = _Cv2Mp4vSink(output_path, fps, width, height)
-        return sink_mp4v, "OpenCV VideoWriter mp4v (CPU)"
-
-    if mode not in ("auto", "nvenc"):
-        console.print(
-            f"[red]OUTPUT_VIDEO_ENCODER must be 'auto', 'nvenc', or 'mp4v'; got {mode!r}[/]"
-        )
-        raise SystemExit(3)
-
-    if not ffmpeg_bin:
-        console.print(
-            "[red]OUTPUT_VIDEO_ENCODER requires ffmpeg on PATH (see FFMPEG_PATH in settings.py).[/]"
-        )
-        raise SystemExit(3)
-
-    if not _ffmpeg_nvenc_smoke_test(ffmpeg_bin):
-        console.print(
-            "[red]h264_nvenc smoke test failed (ffmpeg NVENC not usable on this host).[/]\n"
-            f"  ffmpeg={ffmpeg_bin!r}\n"
-            "  Install a GPU-enabled ffmpeg build and a working NVIDIA driver, or set OUTPUT_VIDEO_ENCODER='mp4v' explicitly for CPU encoding."
-        )
-        raise SystemExit(3)
-
-    try:
-        sink: VideoWriterSink = _FfmpegNvencSink(
-            output_path,
-            fps,
-            width,
-            height,
-            ffmpeg_bin=ffmpeg_bin,
-            preset=NVENC_PRESET,
-            cq=NVENC_CQ,
-        )
-        return (
-            sink,
-            f"ffmpeg h264_nvenc (preset={NVENC_PRESET!r}, cq={NVENC_CQ})",
-        )
-    except Exception as exc:
-        console.print(
-            "[red]ffmpeg h264_nvenc writer failed (no fallback).[/]\n"
-            f"  [dim]{type(exc).__name__}: {exc}[/]"
-        )
-        raise SystemExit(3) from exc
 
 
 @dataclass
@@ -926,6 +555,7 @@ def load_pipeline_models() -> PipelineModelBundle:
             motorcycle_bbox_expand_y=PEEING_MOTORCYCLE_BBOX_EXPAND_Y,
             motorcycle_lower_body_fraction=PEEING_MOTORCYCLE_LOWER_BODY_FRACTION,
             motorcycle_lower_overlap_threshold=PEEING_MOTORCYCLE_LOWER_OVERLAP_THRESHOLD,
+            persist_pose_viz=PEEING_PERSIST_POSE_VIZ,
         )
     except Exception as exc:
         console.print(
@@ -1208,20 +838,6 @@ def _ingest_ultralytics_pipeline_stats(
     times.peeing_pose_prefetch_frames = pf
     times.peeing_pose_prefetch_crops = pc
     times.peeing_pose_prefetch_unused_hits = pu
-
-
-# Match Ultralytics COCO names for YOLO ``classes=[0,2,3,5,7]`` (person + road vehicles).
-VEHICLE_LABELS = ("car", "truck", "bus", "motorcycle", "motorbike", "vehicle")
-PERSON_LABELS = ("person",)
-
-
-def _is_scene_detection(d: Detection) -> bool:
-    """YOLO is restricted to person + vehicles; keep this aligned with ``YoloDetector.classes``."""
-    return d.label in PERSON_LABELS or d.label in VEHICLE_LABELS
-
-
-def _filter_scene_detections(detections: Sequence[Detection]) -> List[Detection]:
-    return [d for d in detections if _is_scene_detection(d)]
 
 
 def normalize_plate_text(raw: str) -> str:
@@ -2074,18 +1690,6 @@ def _annotate_yolo_lp_ocr(
         p_dets = sv.Detections(xyxy=p_xyxy, confidence=p_conf, class_id=p_cls)
         annots.plate_label.annotate(frame, p_dets, labels=plate_label_strs)
     times.annotate_draw_sec += time.perf_counter() - t_plate
-
-
-def _draw_peeing_overlay(frame: np.ndarray, state: PeeingState) -> None:
-    """Thick red boxes only for confirmed peeing (latched), on sampled frames."""
-    if not state.sampled:
-        return
-    red_bgr = (0, 0, 255)
-    thick = 6
-    for x1, y1, x2, y2 in state.mark_bboxes:
-        p1 = (int(round(x1)), int(round(y1)))
-        p2 = (int(round(x2)), int(round(y2)))
-        cv2.rectangle(frame, p1, p2, red_bgr, thick)
 
 
 def _annotate_frame(

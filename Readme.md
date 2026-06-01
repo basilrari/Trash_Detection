@@ -34,6 +34,29 @@ python worker.py inputs/myvideo.mp4 -o outputs/custom.mp4
 python worker.py --help
 ```
 
+### Minimal peeing pipeline (scene YOLO + peeing only)
+
+The smallest stack that preserves **the same peeing logic** as `worker.py`: **scene YOLO** (person + road vehicles for motorcycle gating) and **PeeingDetector** (pose TRT, stillness, temporal confirmation). There is **no** RF-DETR (trash/cigarette), **no** license-plate YOLO, and **no** OCR.
+
+Two equivalent CLIs (same code path):
+
+```bash
+python peeing_worker.py inputs/myvideo.mp4
+python peeing_worker.py inputs/myvideo.mp4 -o outputs/my_peeing.mp4
+
+python minimal_peeing_worker.py inputs/myvideo.mp4 -o outputs/my_peeing.mp4
+python peeing_worker.py --help
+
+# Batch all videos under ``inputs/long_test`` (one model load, summary + events CSVs)
+python scripts/batch_long_test_peeing.py
+python scripts/batch_long_test_peeing.py --dry-run
+```
+
+- Default input when omitted: **`VIDEO_PATH`** in `settings.py`.
+- Default output when `-o` is omitted: **`outputs/<stem>_peeing_annotated.<ext>`** (so the full pipeline’s `OUTPUT_VIDEO` default is not overwritten).
+- Core implementation: `pipelines/peeing_pipeline.py` (`run_peeing_pipeline`, `load_peeing_only_models`). Shared helpers used by both full and peeing-only runs: `pipelines/video_io.py`, `pipelines/cuda_bootstrap.py`, `pipelines/frame_stride.py`, `pipelines/peeing_shared.py` (peeing-only does **not** import `test_pipeline`, so Trash/LP/OCR modules are not loaded).
+- End-of-run timing lines are labeled **peeing-only** (no RF-DETR, LP, or OCR rows).
+
 ### Scene YOLO stride (automatic + optional override)
 
 **Scene YOLO** runs only on decoded frames where `frame_index % stride == 0`. The effective **stride** is:
@@ -82,11 +105,20 @@ python -m pipelines.test_pipeline
 
 - `inputs/` — drop test / production clips here (tracked empty via `.gitkeep`; media files are gitignored)
 - `outputs/` — annotated videos written here by default
-- `worker.py` — CLI entrypoint
+- `worker.py` — CLI entrypoint (full pipeline)
+- `peeing_worker.py` / `minimal_peeing_worker.py` — CLI entrypoints (scene YOLO + peeing only; same behavior)
+- `scripts/batch_long_test_peeing.py` — batch minimal peeing + timing/events CSVs for `inputs/long_test`
+- `scripts/fn_groin_tune.py` — sweep / visualize hand-to-groin threshold on `inputs/FN1.mp4` … `FN3.mp4`
 - `settings.py` — default video paths, stride, confidence thresholds, encoder options (edit literals in file)
 - `pipelines/test_pipeline.py` — `run_pipeline(video_path, output_video)`
+- `pipelines/peeing_pipeline.py` — `run_peeing_pipeline` (scene YOLO + peeing only)
+- `pipelines/video_io.py`, `pipelines/cuda_bootstrap.py`, `pipelines/frame_stride.py`, `pipelines/peeing_shared.py` — shared video I/O, CUDA check, stride, scene filter / peeing overlay
 - `models/` — shared **`types.py`**, YOLO, LP detector, OCR, RF-DETR TensorRT (`rfdetr_trt_trash.py`, `trash_detector.py` helpers); `base.py` interfaces
 - `weights/` — scene/LP **TensorRT** ``.engine`` files and RF-DETR engines per `settings.py`; optional archival `.pth` can live under `weights/old models/` (see `.gitignore`)
+
+## Marlin-2B (optional, separate tool)
+
+Local Marlin-2B experiments: **[Marlin2b-VLM](https://github.com/basilrari/Marlin2b-VLM)** (also under `marlin2b-local/`). Uses conda env `marlin2b` — not part of the detection worker.
 
 ## Model weights and GPU
 

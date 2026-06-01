@@ -32,6 +32,8 @@ worker-python/weights/**
 # Local media in inputs/ and generated videos in outputs/ (folders tracked via .gitkeep)
 worker-python/inputs/*
 !worker-python/inputs/.gitkeep
+!worker-python/inputs/long_test/
+!worker-python/inputs/long_test/.gitkeep
 worker-python/outputs/*
 !worker-python/outputs/.gitkeep
 
@@ -63,3 +65,7 @@ worker-python/*.bin
 EnvironmentalLitterDetection/
 temp_rfdetr_conversion/
 temp_yolo_lp_trt_conversion/
+# marlin2b-local is published; ignore only large/local artifacts
+marlin2b-local/weights/
+marlin2b-local/results/
+marlin2b-local/__pycache__/

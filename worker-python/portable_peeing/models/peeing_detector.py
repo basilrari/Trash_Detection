@@ -1,18 +1,15 @@
-"""Peeing cue from pose on scene-YOLO person crops (YOLO pose only).
+"""Peeing cue from pose on **external** person boxes (DFINE, etc.) + YOLO pose TRT.
 
-**Frame rule:** standing on **either** side (that side's hip above knee, both visible) and wrist
-within ``hand_groin_y_threshold`` (normalized crop Y) of mid-groin or same-side hip when one
-hip is missing (COCO keypoints).
+**Inputs:** caller supplies ``list[Detection]`` per frame (see ``models.detection_contract``).
+This class does **not** run a scene detector — only **YOLO pose** on person crops.
 
-**Temporal rule (stride-aware):** scene YOLO (and thus pose) runs only on stride-sampled frames.
-Per calendar second of video time, each **tracked** person counts sampled frames and pose-hits
-only after a **bbox stillness** gate (no accumulation while the person is moving).
-A second counts as **positive** when hits ≥ ``min_hits_per_second`` (default 3 of ~5 samples).
-After ``seconds_required`` consecutive positive seconds, that person is **confirmed** peeing.
+**Frame rule:** standing on **either** side and wrist within ``hand_groin_y_threshold`` (normalized
+crop Y) of mid-groin or same-side hip when one hip is missing.
 
-Uses detections already passed from the pipeline (no second scene-YOLO call).
+**Temporal rule (stride-aware):** pose runs when ``update(..., run_yolo=True)`` (stride-sampled frames).
+Stillness + calendar-second buckets + ``seconds_required`` consecutive positive seconds.
 
-**YOLO pose:** runtime is a **batched** Ultralytics **TensorRT** ``.engine`` only (fixed batch, FP16 typical).
+**YOLO pose:** batched Ultralytics TensorRT ``.engine`` (``PEEING_YOLO_POSE_MODEL``).
 """
 
 from __future__ import annotations
@@ -215,19 +212,22 @@ class PeeingDetector:
         if not spec or not str(spec).strip():
             raise ValueError("yolo_pose_model is required")
         wp = _resolve_model_path(str(spec).strip())
-        if wp.suffix.lower() != ".engine":
+        suffix = wp.suffix.lower()
+        if suffix not in (".engine", ".pt"):
             raise ValueError(
-                f"YOLO pose requires a TensorRT .engine file; got: {wp}\n"
-                "Set PEEING_YOLO_POSE_MODEL to a fixed-batch pose engine path."
+                f"YOLO pose requires a TensorRT .engine or Ultralytics .pt file; got: {wp}\n"
+                "Set PEEING_YOLO_POSE_MODEL to a pose engine or yolo11n-pose.pt path."
             )
         if not wp.is_file():
             raise FileNotFoundError(
-                f"YOLO pose TensorRT engine not found: {wp}\n"
-                "Place the pose .engine under worker-python/weights/ or pass an absolute path."
+                f"YOLO pose weights not found: {wp}\n"
+                "Place pose weights under portable_peeing/weights/ or pass an absolute path."
             )
         wp = wp.resolve()
         self._yolo_pose_batch_size = max(1, int(yolo_pose_batch_size))
-        self._yolo_pose_trt_dynamic = bool(yolo_pose_trt_dynamic)
+        use_pt = suffix == ".pt"
+        # Static TRT engines need fixed batch padding; PyTorch weights use dynamic batching.
+        self._yolo_pose_trt_dynamic = True if use_pt else bool(yolo_pose_trt_dynamic)
 
         self._yolo_pose = YOLO(str(wp))
         if yolo_pose_device is None:
@@ -245,13 +245,14 @@ class PeeingDetector:
             )
         self._yolo_pose_device = dev
         self._delegate_label = "cuda" if dev.startswith("cuda") else "cpu"
+        backend = "pt" if use_pt else "trt"
         self._pose_runtime_tag = (
-            f"yolo:trt:b{self._yolo_pose_batch_size}:dyn{int(self._yolo_pose_trt_dynamic)}:"
+            f"yolo:{backend}:b{self._yolo_pose_batch_size}:dyn{int(self._yolo_pose_trt_dynamic)}:"
             f"{self._yolo_pose_device}"
         )
         print(
             f"[peeing] YOLO pose weights={wp}  device={self._yolo_pose_device}  "
-            f"batch={self._yolo_pose_batch_size}  trt_dynamic={self._yolo_pose_trt_dynamic}  (trt)",
+            f"batch={self._yolo_pose_batch_size}  trt_dynamic={self._yolo_pose_trt_dynamic}  ({backend})",
             file=sys.stderr,
         )
 
@@ -676,7 +677,7 @@ class PeeingDetector:
 
     def _score_progress(self) -> float:
         if not self._tracks:
-                return 0.0
+            return 0.0
         return max(
             min(1.0, t.consecutive_good_seconds / float(self.seconds_required))
             for t in self._tracks
@@ -767,17 +768,17 @@ class PeeingDetector:
 
         for frame_idx, frame_bgr, dets in items:
             persons = self._gated_pose_persons(dets, yolo_conf, record_gate_debug=False)
-        h, w = frame_bgr.shape[:2]
+            h, w = frame_bgr.shape[:2]
             row: List[Optional[bool]] = [None] * len(persons)
             out_map[frame_idx] = row
             if self._collect_pose_viz:
                 self._prefetch_pose_details_by_frame[frame_idx] = [None] * len(persons)
             for j, d in enumerate(persons):
-            box = self._clamp_crop(d.bbox, w, h)
-            if box is None:
-                continue
-            x1, y1, x2, y2 = box
-            crop = frame_bgr[y1:y2, x1:x2]
+                box = self._clamp_crop(d.bbox, w, h)
+                if box is None:
+                    continue
+                x1, y1, x2, y2 = box
+                crop = frame_bgr[y1:y2, x1:x2]
                 all_crops.append(crop)
                 placements.append((frame_idx, j))
 
@@ -817,6 +818,23 @@ class PeeingDetector:
         frame_index: Optional[int] = None,
         precomputed_yolo_pose_hits: Sequence[Optional[bool]] | None = None,
     ) -> PeeingState:
+        """Advance peeing state for one video frame.
+
+        Args:
+            frame_bgr: Full-resolution BGR image (same space as ``detections`` bboxes).
+            detections: Scene outputs for this frame from your detector (e.g. DFINE). **Must**
+                include ``label=="person"`` rows **and** ``motorcycle`` / ``motorbike`` rows in the
+                same list (see ``detection_contract.merge_person_and_motorcycle_detections``).
+                Person-only lists break the seated-rider gate.
+            run_yolo: ``True`` on stride-sampled frames (run pose on person crops). ``False`` on
+                other frames when reusing the last detection list (tracks only).
+            yolo_conf: Minimum ``Detection.confidence`` for person / motorcycle rows (use
+                ``PEEING_DETECTION_CONFIDENCE`` from settings).
+            timestamp_sec: Time in seconds from video start (for calendar-second buckets).
+            frame_index: Decoded frame index; required for cross-frame pose prefetch viz.
+            precomputed_yolo_pose_hits: Optional pose hit flags aligned to gated persons
+                (from ``prefetch_yolo_pose_hits_for_window``).
+        """
         h, w = frame_bgr.shape[:2]
         empty_lm: Tuple[Tuple[Any, ...], ...] = tuple()
         ts = float(timestamp_sec)
@@ -981,7 +999,7 @@ class PeeingDetector:
                         if tr.stationary_ready:
                             tr.hits_in_bucket += 1
                             frame_any_hit = True
-        else:
+                        else:
                             self._dbg_pose_hits_ignored_not_still += 1
                     if self._collect_pose_viz:
                         viz = self._make_pose_person_viz(
