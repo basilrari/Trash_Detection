@@ -111,7 +111,6 @@ class PeeingDetector:
         seconds_required: int = 5,
         track_iou_threshold: float = 0.35,
         track_max_missed_seconds: float = 3.0,
-        min_crop_side: int = 48,
         still_seconds_required: float = 1.0,
         still_max_center_motion: float = 0.035,
         still_max_size_change: float = 0.12,
@@ -142,7 +141,6 @@ class PeeingDetector:
         self.seconds_required = max(1, int(seconds_required))
         self.track_iou_threshold = float(track_iou_threshold)
         self.track_max_missed_seconds = float(max(0.5, track_max_missed_seconds))
-        self.min_crop_side = int(min_crop_side)
         self.still_seconds_required = float(max(0.0, still_seconds_required))
         self.still_max_center_motion = float(still_max_center_motion)
         self.still_max_size_change = float(still_max_size_change)
@@ -466,7 +464,7 @@ class PeeingDetector:
         yi1 = int(max(0, np.floor(y1 - pad_y)))
         xi2 = int(min(w, np.ceil(x2 + pad_x)))
         yi2 = int(min(h, np.ceil(y2 + pad_y)))
-        if xi2 - xi1 < self.min_crop_side or yi2 - yi1 < self.min_crop_side:
+        if xi2 <= xi1 or yi2 <= yi1:
             return None
         return xi1, yi1, xi2, yi2
 
@@ -767,17 +765,17 @@ class PeeingDetector:
 
         for frame_idx, frame_bgr, dets in items:
             persons = self._gated_pose_persons(dets, yolo_conf, record_gate_debug=False)
-        h, w = frame_bgr.shape[:2]
+            h, w = frame_bgr.shape[:2]
             row: List[Optional[bool]] = [None] * len(persons)
             out_map[frame_idx] = row
             if self._collect_pose_viz:
                 self._prefetch_pose_details_by_frame[frame_idx] = [None] * len(persons)
             for j, d in enumerate(persons):
-            box = self._clamp_crop(d.bbox, w, h)
-            if box is None:
-                continue
-            x1, y1, x2, y2 = box
-            crop = frame_bgr[y1:y2, x1:x2]
+                box = self._clamp_crop(d.bbox, w, h)
+                if box is None:
+                    continue
+                x1, y1, x2, y2 = box
+                crop = frame_bgr[y1:y2, x1:x2]
                 all_crops.append(crop)
                 placements.append((frame_idx, j))
 
@@ -981,7 +979,7 @@ class PeeingDetector:
                         if tr.stationary_ready:
                             tr.hits_in_bucket += 1
                             frame_any_hit = True
-        else:
+                        else:
                             self._dbg_pose_hits_ignored_not_still += 1
                     if self._collect_pose_viz:
                         viz = self._make_pose_person_viz(

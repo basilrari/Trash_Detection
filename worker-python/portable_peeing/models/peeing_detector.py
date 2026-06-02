@@ -108,7 +108,6 @@ class PeeingDetector:
         seconds_required: int = 5,
         track_iou_threshold: float = 0.35,
         track_max_missed_seconds: float = 3.0,
-        min_crop_side: int = 48,
         still_seconds_required: float = 1.0,
         still_max_center_motion: float = 0.035,
         still_max_size_change: float = 0.12,
@@ -139,7 +138,6 @@ class PeeingDetector:
         self.seconds_required = max(1, int(seconds_required))
         self.track_iou_threshold = float(track_iou_threshold)
         self.track_max_missed_seconds = float(max(0.5, track_max_missed_seconds))
-        self.min_crop_side = int(min_crop_side)
         self.still_seconds_required = float(max(0.0, still_seconds_required))
         self.still_max_center_motion = float(still_max_center_motion)
         self.still_max_size_change = float(still_max_size_change)
@@ -467,7 +465,7 @@ class PeeingDetector:
         yi1 = int(max(0, np.floor(y1 - pad_y)))
         xi2 = int(min(w, np.ceil(x2 + pad_x)))
         yi2 = int(min(h, np.ceil(y2 + pad_y)))
-        if xi2 - xi1 < self.min_crop_side or yi2 - yi1 < self.min_crop_side:
+        if xi2 <= xi1 or yi2 <= yi1:
             return None
         return xi1, yi1, xi2, yi2
 
